@@ -1,0 +1,19 @@
+# Hydruxiom - 3D Tag Space Explorer
+# Standalone app extracted from HydrusForHydrus
+
+# UI
+pyside6>=6.10.0
+pyqtgraph>=0.13.0
+PyOpenGL>=3.1.7
+pillow>=10.0.0
+
+# ML pipeline
+numpy>=1.24.0
+scipy>=1.10.0
+umap-learn>=0.5.0
+scikit-learn>=1.3.0
+matplotlib>=3.7.0
+
+# Hydrus integration
+hydrus-api==4.0.0
+requests>=2.31.0

@@ -1,0 +1,27 @@
+# Prevent folder-scanning crashes on large/generated dirs
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.cache/
+node_modules/
+build/
+dist/
+*.egg-info/
+
+# Data / artifacts
+*.db
+*.sqlite
+*.npz
+sessions/
+*.log
+
+# Sensitive: contains Hydrus API keys + local paths
+clients.json
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

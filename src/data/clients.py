@@ -1,0 +1,116 @@
+"""Hydrus client configuration.
+
+Clients are defined in a JSON file (``clients.json``) at the project root,
+NOT in an external SQLite DB. Each entry holds the API URL, API key, and the
+local DB / files / thumbs directories used by direct-DB mode and the media
+viewer.
+
+Shape of clients.json::
+
+    {
+      "HE": {
+        "label": "HE",
+        "api_url": "http://127.0.0.1:<port>/",
+        "api_key": "<64-char hex>",
+        "db_dir": "<path to Hydrus client db folder>",
+        "files_dir": "<path to files>",
+        "thumbs_dir": "<path to thumbs>"
+      },
+      ...
+    }
+
+NOTE: clients.json contains API keys and local paths. It is gitignored.
+"""
+
+import json
+import os
+from typing import Dict, List, Optional
+
+# Project root = parent of src/
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CLIENTS_FILE = os.path.join(_PROJECT_ROOT, "clients.json")
+
+
+def clients_file_path() -> str:
+    """Return the absolute path to clients.json."""
+    return CLIENTS_FILE
+
+
+def load_clients(path: Optional[str] = None) -> Dict[str, dict]:
+    """Load all client configs from the JSON file.
+
+    Args:
+        path: Optional override path (defaults to the project clients.json).
+
+    Returns:
+        dict: client_id -> config dict. Empty dict if the file is missing.
+    """
+    p = path or CLIENTS_FILE
+    if not os.path.exists(p):
+        print(f"[Clients] No clients file at {p}")
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[Clients] Error reading {p}: {e}")
+        return {}
+
+
+def save_clients(clients: Dict[str, dict], path: Optional[str] = None) -> bool:
+    """Write client configs back to the JSON file (atomic)."""
+    p = path or CLIENTS_FILE
+    try:
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(clients, f, indent=2)
+        os.replace(tmp, p)
+        return True
+    except Exception as e:
+        print(f"[Clients] Error saving {p}: {e}")
+        return False
+
+
+def client_ids() -> List[str]:
+    """Return the list of configured client IDs (insertion order)."""
+    return list(load_clients().keys())
+
+
+def get_client_config(client_id: str) -> Optional[dict]:
+    """Return the config dict for a client, or None if not configured."""
+    return load_clients().get(client_id)
+
+
+def get_client_db_dir(client_id: str) -> Optional[str]:
+    """Return the Hydrus DB directory for a client (direct-DB mode).
+
+    Returns None if the client is unknown or has no valid db_dir.
+    """
+    cfg = get_client_config(client_id)
+    if not cfg:
+        return None
+    db_dir = (cfg.get("db_dir") or "").strip()
+    if not db_dir:
+        return None
+    return db_dir
+
+
+def connect_to_client(client_id: str):
+    """Create a Hydrus API client for the given ID.
+
+    Args:
+        client_id: Client ID (e.g. "HE").
+
+    Returns:
+        hydrus_api.Client instance.
+
+    Raises:
+        KeyError: if the client is not configured.
+    """
+    cfg = get_client_config(client_id)
+    if not cfg:
+        raise KeyError(f"Client '{client_id}' not found in clients.json")
+
+    import hydrus_api
+    return hydrus_api.Client(access_key=cfg["api_key"], api_url=cfg["api_url"])
