@@ -660,7 +660,7 @@ class TagMap3DTab(QWidget):
             if client_idx >= 0:
                 self.client_combo.setCurrentIndex(client_idx)
             self.chunk_size_spin.setValue(settings.get("chunk_size", 500))
-            self.max_files_spin.setValue(settings.get("max_files", 4096))
+            self.max_files_spin.setValue(settings.get("max_files", 20000))
             # Populate tag services dynamically for the selected client, then
             # restore the saved tag service selection.
             self._populate_tag_services(self.client_combo.currentText())
@@ -1642,194 +1642,40 @@ class TagMap3DTab(QWidget):
                     super().mousePressEvent(event)
                 
                 def handle_right_click(self, event: QMouseEvent):
-                    """Handle right-click by picking the node under cursor."""
-                    scatter = self.parent_tab.gl_scatter
-                    if scatter is None:
-                        return
-                    
+                    """Handle right-click by picking the node under cursor (vectorized)."""
                     try:
-                        import numpy as np
-                        from PySide6.QtGui import QMatrix4x4, QVector4D
-                        
-                        click_pos = event.pos()
-                        
-                        if scatter.pos is None or len(scatter.pos) == 0:
-                            return
-                        
-                        positions = scatter.pos if isinstance(scatter.pos, np.ndarray) else np.array(scatter.pos)
-                        
-                        view_matrix = self.viewMatrix()
-                        proj_matrix = self.currentProjection()
-                        mvp_matrix = proj_matrix * view_matrix
-                        
-                        width = self.width()
-                        height = self.height()
-                        
-                        closest_idx = None
-                        closest_dist = float('inf')
-                        pick_threshold = 20.0
-                        
-                        for i in range(len(positions)):
-                            pos = positions[i]
-                            vec = QVector4D(pos[0], pos[1], pos[2], 1.0)
-                            clip_pos = mvp_matrix.map(vec)
-                            
-                            if clip_pos.w() == 0:
-                                continue
-                            
-                            ndc_x = clip_pos.x() / clip_pos.w()
-                            ndc_y = clip_pos.y() / clip_pos.w()
-                            ndc_z = clip_pos.z() / clip_pos.w()
-                            if ndc_z < 0 or ndc_z > 1:
-                                continue
-                            
-                            screen_x = (ndc_x * 0.5 + 0.5) * width
-                            screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * height
-                            
-                            dx = screen_x - click_pos.x()
-                            dy = screen_y - click_pos.y()
-                            dist = (dx*dx + dy*dy) ** 0.5
-                            
-                            if isinstance(scatter.size, np.ndarray) and i < len(scatter.size):
-                                node_size = scatter.size[i]
-                            else:
-                                node_size = scatter.size if isinstance(scatter.size, (int, float)) else 10
-                            
-                            effective_threshold = pick_threshold + node_size
-                            
-                            if dist < effective_threshold and dist < closest_dist:
-                                closest_dist = dist
-                                closest_idx = i
-                        
+                        closest_idx = self.parent_tab.pick_nearest_point(self, event.pos())
                         if closest_idx is not None:
                             self.parent_tab.show_node_info(closest_idx)
-                            
                     except Exception as e:
                         print(f"Error in right-click handling: {e}")
                         import traceback
                         traceback.print_exc()
                 
                 def handle_cluster_selection(self, event: QMouseEvent):
-                    """Handle left-click to select all nodes in the same cluster."""
-                    scatter = self.parent_tab.gl_scatter
-                    if scatter is None:
-                        return
-                    
+                    """Handle left-click to select all nodes in the same cluster (vectorized)."""
                     try:
-                        import numpy as np
-                        from PySide6.QtGui import QMatrix4x4, QVector4D
-                        
-                        click_pos = event.pos()
-                        
-                        if scatter.pos is None or len(scatter.pos) == 0:
-                            return
-                        
-                        positions = scatter.pos if isinstance(scatter.pos, np.ndarray) else np.array(scatter.pos)
-                        
-                        view_matrix = self.viewMatrix()
-                        proj_matrix = self.currentProjection()
-                        mvp_matrix = proj_matrix * view_matrix
-                        
-                        width = self.width()
-                        height = self.height()
-                        
-                        closest_idx = None
-                        closest_dist = float('inf')
-                        pick_threshold = 20.0
-                        
-                        for i in range(len(positions)):
-                            pos = positions[i]
-                            vec = QVector4D(pos[0], pos[1], pos[2], 1.0)
-                            clip_pos = mvp_matrix.map(vec)
-                            
-                            if clip_pos.w() == 0:
-                                continue
-                            
-                            ndc_x = clip_pos.x() / clip_pos.w()
-                            ndc_y = clip_pos.y() / clip_pos.w()
-                            ndc_z = clip_pos.z() / clip_pos.w()
-                            if ndc_z < 0 or ndc_z > 1:
-                                continue
-                            
-                            screen_x = (ndc_x * 0.5 + 0.5) * width
-                            screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * height
-                            
-                            dx = screen_x - click_pos.x()
-                            dy = screen_y - click_pos.y()
-                            dist = (dx*dx + dy*dy) ** 0.5
-                            
-                            if dist < pick_threshold and dist < closest_dist:
-                                closest_dist = dist
-                                closest_idx = i
-                        
+                        closest_idx = self.parent_tab.pick_nearest_point(self, event.pos())
                         if closest_idx is not None:
                             self.parent_tab.show_cluster_info(closest_idx)
-                            
                     except Exception as e:
                         print(f"Error in cluster selection: {e}")
                         import traceback
                         traceback.print_exc()
                 
                 def handle_set_camera_center(self, event: QMouseEvent):
-                    """Handle right-click to set the camera center to the clicked node."""
-                    scatter = self.parent_tab.gl_scatter
-                    if scatter is None:
-                        return
-                    
+                    """Handle right-click to set the camera center to the clicked node (vectorized)."""
                     try:
                         import numpy as np
-                        from PySide6.QtGui import QMatrix4x4, QVector4D, QVector3D
-                        
-                        click_pos = event.pos()
-                        
-                        if scatter.pos is None or len(scatter.pos) == 0:
-                            return
-                        
-                        positions = scatter.pos if isinstance(scatter.pos, np.ndarray) else np.array(scatter.pos)
-                        
-                        view_matrix = self.viewMatrix()
-                        proj_matrix = self.currentProjection()
-                        mvp_matrix = proj_matrix * view_matrix
-                        
-                        width = self.width()
-                        height = self.height()
-                        
-                        closest_idx = None
-                        closest_dist = float('inf')
-                        pick_threshold = 20.0
-                        
-                        for i in range(len(positions)):
-                            pos = positions[i]
-                            vec = QVector4D(pos[0], pos[1], pos[2], 1.0)
-                            clip_pos = mvp_matrix.map(vec)
-                            
-                            if clip_pos.w() == 0:
-                                continue
-                            
-                            ndc_x = clip_pos.x() / clip_pos.w()
-                            ndc_y = clip_pos.y() / clip_pos.w()
-                            ndc_z = clip_pos.z() / clip_pos.w()
-                            if ndc_z < 0 or ndc_z > 1:
-                                continue
-                            
-                            screen_x = (ndc_x * 0.5 + 0.5) * width
-                            screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * height
-                            
-                            dx = screen_x - click_pos.x()
-                            dy = screen_y - click_pos.y()
-                            dist = (dx*dx + dy*dy) ** 0.5
-                            
-                            if dist < pick_threshold and dist < closest_dist:
-                                closest_dist = dist
-                                closest_idx = i
-                        
+                        from PySide6.QtGui import QVector3D
+                        closest_idx = self.parent_tab.pick_nearest_point(self, event.pos())
                         if closest_idx is not None:
-                            # Set camera center to this node's position
+                            scatter = self.parent_tab.gl_scatter
+                            positions = scatter.pos if isinstance(scatter.pos, np.ndarray) else np.array(scatter.pos)
                             center = positions[closest_idx]
                             self.opts['center'] = QVector3D(float(center[0]), float(center[1]), float(center[2]))
                             self.update()
                             print(f"Camera center set to ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})")
-                            
                     except Exception as e:
                         print(f"Error in set camera center: {e}")
                         import traceback
@@ -4595,6 +4441,87 @@ class TagMap3DTab(QWidget):
         self.gl_view.opts['azimuth'] = 45
         self.gl_view.update()
 
+    def pick_nearest_point(self, gl_view, click_pos, pick_threshold=20.0):
+        """Vectorized 3D point picking using numpy matrix multiplication.
+
+        Projects all points to screen space in one vectorized operation
+        instead of iterating in a Python loop. ~100x faster at scale.
+
+        Args:
+            gl_view: The GLViewWidget instance (provides view/proj matrices).
+            click_pos: QPoint of the click in widget coordinates.
+            pick_threshold: Base pixel threshold for hit detection.
+
+        Returns:
+            int or None: Index of the nearest point within threshold, or None.
+        """
+        import numpy as np
+
+        scatter = self.gl_scatter
+        if scatter is None or scatter.pos is None or len(scatter.pos) == 0:
+            return None
+
+        positions = scatter.pos if isinstance(scatter.pos, np.ndarray) else np.array(scatter.pos)
+        n = len(positions)
+        if n == 0:
+            return None
+
+        # Build MVP matrix as numpy (4x4)
+        view_matrix = gl_view.viewMatrix()
+        proj_matrix = gl_view.currentProjection()
+        mvp = proj_matrix * view_matrix
+
+        # Extract 4x4 matrix from QMatrix4x4
+        m = np.array([
+            [mvp(0,0), mvp(0,1), mvp(0,2), mvp(0,3)],
+            [mvp(1,0), mvp(1,1), mvp(1,2), mvp(1,3)],
+            [mvp(2,0), mvp(2,1), mvp(2,2), mvp(2,3)],
+            [mvp(3,0), mvp(3,1), mvp(3,2), mvp(3,3)],
+        ])
+
+        # Homogeneous coordinates: (n, 4) @ (4, 4).T -> (n, 4)
+        ones = np.ones((n, 1))
+        pos_h = np.hstack([positions, ones])  # (n, 4)
+        clip = pos_h @ m.T  # (n, 4)
+
+        # Perspective divide
+        w = clip[:, 3:4]
+        # Avoid division by zero
+        w_safe = np.where(np.abs(w) < 1e-10, 1e-10, w)
+        ndc = clip[:, :3] / w_safe  # (n, 3)
+
+        # Filter: behind camera or outside NDC z range
+        valid = (ndc[:, 2] >= 0) & (ndc[:, 2] <= 1) & (w > 0)
+        if not np.any(valid):
+            return None
+
+        # Convert NDC to screen coordinates
+        width = gl_view.width()
+        height = gl_view.height()
+        screen_x = (ndc[:, 0] * 0.5 + 0.5) * width
+        screen_y = (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * height
+
+        # Distance from click to each point (vectorized)
+        dx = screen_x - click_pos.x()
+        dy = screen_y - click_pos.y()
+        dist = np.sqrt(dx * dx + dy * dy)
+
+        # Apply per-point size threshold if available
+        if isinstance(scatter.size, np.ndarray) and len(scatter.size) == n:
+            thresholds = pick_threshold + scatter.size
+        else:
+            base_size = scatter.size if isinstance(scatter.size, (int, float)) else 10
+            thresholds = np.full(n, pick_threshold + base_size)
+
+        # Mask: within threshold AND valid (in front of camera)
+        dist[~valid] = np.inf
+        dist[dist > thresholds] = np.inf
+
+        closest_idx = int(np.argmin(dist))
+        if dist[closest_idx] == np.inf:
+            return None
+        return closest_idx
+
     def on_node_clicked(self, scatter, ids):
         """Handle node click event to display file info.
 
@@ -4627,7 +4554,7 @@ class TagMap3DTab(QWidget):
             self._highlight_cluster(self.selected_cluster_id)
     
     def _build_base_scatter(self):
-        """Build and cache the base scatter (positions/sizes/base colors).
+        """Build and cache the base scatter (positions/sizes/base colors/cluster_ids).
 
         Returns the base colors_rgba array (no highlight/dim).
         """
@@ -4638,6 +4565,8 @@ class TagMap3DTab(QWidget):
         colors = np.array([node.color for node in self.node_list]) / 255.0
         alpha = self.transparency_spin.value()
         colors_rgba = np.column_stack([colors, alpha * np.ones(len(colors))])
+        # Cache cluster_ids as numpy array (avoids O(n) Python loop per blink tick)
+        self._base_cluster_ids = np.array([node.cluster_id for node in self.node_list], dtype=np.int32)
         self._base_positions = positions
         self._base_sizes = sizes
         self._base_colors_rgba = colors_rgba
@@ -4684,8 +4613,8 @@ class TagMap3DTab(QWidget):
             self._build_base_scatter()
         colors_rgba = self._base_colors_rgba.copy()
 
-        # Build the cluster-id lookup once (vectorized masks below).
-        cluster_ids = np.array([node.cluster_id for node in self.node_list])
+        # Use cached cluster_ids array (built once in _build_base_scatter).
+        cluster_ids = self._base_cluster_ids
 
         # Dimming is persistent while a selection is active (independent of blink).
         # Vectorized: dim every node NOT in the selected cluster.
@@ -5566,7 +5495,7 @@ class TagMap3DTab(QWidget):
             client_idx = self.client_combo.findText(settings.get("client", ""))
             if client_idx >= 0:
                 self.client_combo.setCurrentIndex(client_idx)
-            self.max_files_spin.setValue(settings.get("max_files", 4096))
+            self.max_files_spin.setValue(settings.get("max_files", 20000))
             tag_service_idx = self.tag_service_combo.findText(settings.get("tag_service", "auto2"))
             if tag_service_idx >= 0:
                 self.tag_service_combo.setCurrentIndex(tag_service_idx)

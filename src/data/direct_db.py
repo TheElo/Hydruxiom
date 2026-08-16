@@ -309,10 +309,154 @@ def direct_get_file_metadata(file_ids, tag_service="local", db_dir=None):
         conn.close()
 
 
-def direct_load_tags_for_files(file_ids, tag_service="local", db_dir=None):
+class DirectDBSession:
+    """Persistent DB session with pre-loaded lookup maps for efficient batch queries.
+
+    Opens the connection once, resolves the service ID once, and loads
+    sibling/parent lookup caches once. Subsequent batch queries reuse all
+    of this, avoiding per-chunk reconnection and cache reloads.
+
+    Usage:
+        with DirectDBSession(db_dir, tag_service="auto2") as session:
+            for chunk in chunks:
+                tags = session.load_tags(chunk)
+    """
+
+    def __init__(self, db_dir: str, tag_service: str = "local"):
+        self.conn = _connect(db_dir)
+        self.service_id = _resolve_service_id_with_mappings(self.conn, tag_service)
+        if self.service_id is None:
+            self.conn.close()
+            raise ValueError(f"No valid service with mappings found for '{tag_service}'")
+        self.mappings_table = f"current_mappings_{self.service_id}"
+        # Pre-load sibling and parent maps ONCE (the expensive part)
+        self.sibling_map, self.parent_map = self._load_lookup_maps()
+        # Cache for tag_id -> tag_name (avoids re-querying master.tags per chunk)
+        self._tag_name_cache: Dict[int, str] = {}
+        print(f"[DirectDBSession] Ready: service_id={self.service_id}, "
+              f"siblings={len(self.sibling_map)}, parents={len(self.parent_map)}")
+
+    def _load_lookup_maps(self):
+        """Load sibling and parent resolution maps from cache tables."""
+        siblings_table = f"actual_tag_siblings_lookup_cache_{self.service_id}"
+        parents_table = f"actual_tag_parents_lookup_cache_{self.service_id}"
+
+        sibling_rows = self.conn.execute(
+            f"SELECT bad_tag_id, ideal_tag_id FROM caches.{siblings_table}"
+        ).fetchall()
+        sibling_map = {row["bad_tag_id"]: row["ideal_tag_id"] for row in sibling_rows}
+
+        parent_rows = self.conn.execute(
+            f"SELECT child_tag_id, ancestor_tag_id FROM caches.{parents_table}"
+        ).fetchall()
+        parent_map = {}
+        for row in parent_rows:
+            parent_map.setdefault(row["child_tag_id"], set()).add(row["ancestor_tag_id"])
+
+        return sibling_map, parent_map
+
+    def _resolve_tag_names(self, tag_ids: set) -> Dict[int, str]:
+        """Resolve tag IDs to names, using cache for previously seen IDs."""
+        unknown = [tid for tid in tag_ids if tid not in self._tag_name_cache]
+        if unknown:
+            placeholders = ','.join('?' for _ in unknown)
+            rows = self.conn.execute(
+                f"""
+                SELECT t.tag_id, n.namespace, s.subtag
+                FROM master.tags t
+                LEFT JOIN master.namespaces n ON t.namespace_id = n.namespace_id
+                JOIN master.subtags s ON t.subtag_id = s.subtag_id
+                WHERE t.tag_id IN ({placeholders})
+                """,
+                unknown,
+            ).fetchall()
+            for row in rows:
+                namespace = row["namespace"]
+                subtag = row["subtag"]
+                self._tag_name_cache[row["tag_id"]] = f"{namespace}:{subtag}" if namespace else subtag
+        return {tid: self._tag_name_cache.get(tid, f"tag_id:{tid}") for tid in tag_ids}
+
+    def load_tags(self, file_ids) -> Dict[int, list]:
+        """Query display tags for a batch of file IDs.
+
+        Args:
+            file_ids: List of hash_ids to query.
+
+        Returns:
+            dict mapping file_id -> list of tag name strings.
+        """
+        if not file_ids:
+            return {}
+
+        placeholders = ','.join('?' for _ in file_ids)
+        tag_rows = self.conn.execute(
+            f"""
+            SELECT m.hash_id, m.tag_id
+            FROM mappings.{self.mappings_table} m
+            WHERE m.hash_id IN ({placeholders})
+            """,
+            file_ids,
+        ).fetchall()
+
+        # Collect raw tag_ids per file
+        raw_tag_ids_by_file = {}
+        for row in tag_rows:
+            raw_tag_ids_by_file.setdefault(row["hash_id"], []).append(row["tag_id"])
+
+        # Resolve to display tags (siblings + parents) using pre-loaded maps
+        display_tag_ids_by_file = {}
+        all_resolved_ids = set()
+        for fid, raw_ids in raw_tag_ids_by_file.items():
+            resolved = set()
+            for tid in raw_ids:
+                ideal = self.sibling_map.get(tid, tid)
+                resolved.add(ideal)
+                if ideal in self.parent_map:
+                    resolved.update(self.parent_map[ideal])
+            display_tag_ids_by_file[fid] = list(resolved)
+            all_resolved_ids.update(resolved)
+
+        # Resolve tag names (cached)
+        name_map = self._resolve_tag_names(all_resolved_ids) if all_resolved_ids else {}
+
+        tags_by_file = {}
+        for fid, resolved_ids in display_tag_ids_by_file.items():
+            tags_by_file[fid] = [name_map[tid] for tid in resolved_ids]
+
+        return tags_by_file
+
+    def close(self):
+        """Close the database connection."""
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def create_direct_db_session(db_dir: str, tag_service: str = "local") -> DirectDBSession:
+    """Factory function to create a DirectDBSession."""
+    return DirectDBSession(db_dir, tag_service=tag_service)
+
+
+def direct_load_tags_for_files(file_ids, tag_service="local", db_dir=None, session=None):
     """Drop-in replacement for DataLoader.load_tags_for_files output.
 
-    Returns a dict mapping file_id -> list of tags (same as the API path).
+    Args:
+        file_ids: List of file IDs to query.
+        tag_service: Tag service name.
+        db_dir: Hydrus DB directory (required if session is None).
+        session: Optional pre-existing DirectDBSession (avoids reconnection).
+
+    Returns:
+        dict mapping file_id -> list of tags (same as the API path).
     """
+    if session is not None:
+        return session.load_tags(file_ids)
+
     metadata = direct_get_file_metadata(file_ids, tag_service=tag_service, db_dir=db_dir)
     return {item["file_id"]: item["tags"] for item in metadata}

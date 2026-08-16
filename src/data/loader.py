@@ -58,7 +58,7 @@ class DataLoader:
             if max_files:
                 search_tags_with_limit.append(f"system:limit is {max_files}")
             else:
-                search_tags_with_limit.append("system:limit is 100000")
+                search_tags_with_limit.append("system:limit is 20000")
             
             # Pass tag service name (not key) to search_files
             # The API expects a single human-readable service name like "auto2", "local", "all known tags"
@@ -176,24 +176,51 @@ class DataLoader:
         total_files = len(self.all_file_ids)
         print(f"Loading tags for {total_files} files in chunks of {self.chunk_size}")
 
+        # Direct DB mode: create ONE persistent session for the entire load.
+        # This avoids per-chunk reconnection and cache table reloads.
+        direct_session = None
+        if self._direct_mode_active:
+            from src.data.direct_db import DirectDBSession
+            try:
+                direct_session = DirectDBSession(self._direct_db_dir, tag_service=tag_service)
+            except Exception as e:
+                print(f"Failed to create DirectDBSession: {e}; falling back to API")
+                self._direct_mode_active = False
+
         # Cache service_key lookup ONCE before the chunk loop (optimization)
-        from src.utils.query_comperator import get_service_key_by_name
-        service_key = get_service_key_by_name(self.client, tag_service)
-        if not service_key:
-            service_key = '6c6f6c616c2074616773'  # Default to local
+        service_key = None
+        if not direct_session:
+            from src.utils.query_comperator import get_service_key_by_name
+            service_key = get_service_key_by_name(self.client, tag_service)
+            if not service_key:
+                service_key = '6c6f6c616c2074616773'  # Default to local
 
         # Process in chunks
-        for start in range(0, total_files, self.chunk_size):
-            end = min(start + self.chunk_size, total_files)
-            chunk = self.all_file_ids[start:end]
-            
-            chunk_tags = self.load_tags_for_files(chunk, tag_service, service_key=service_key, transform=transform)
-            
-            if callback:
-                callback(chunk, chunk_tags, len(self.tag_data))
+        try:
+            for start in range(0, total_files, self.chunk_size):
+                end = min(start + self.chunk_size, total_files)
+                chunk = self.all_file_ids[start:end]
+                
+                if direct_session:
+                    chunk_tags = self._load_tags_direct(chunk, direct_session, transform)
+                else:
+                    chunk_tags = self.load_tags_for_files(chunk, tag_service, service_key=service_key, transform=transform)
+                
+                if callback:
+                    callback(chunk, chunk_tags, len(self.tag_data))
+        finally:
+            if direct_session:
+                direct_session.close()
 
         print(f"Finished loading {len(self.tag_data)} files with tags")
         return self.tag_data
+
+    def _load_tags_direct(self, file_ids, session, transform=None):
+        """Load tags for a chunk using a persistent DirectDBSession."""
+        tags_dict = session.load_tags(file_ids)
+        self._apply_transform(tags_dict, transform)
+        self.tag_data.update(tags_dict)
+        return tags_dict
 
     def get_tag_data(self):
         """Get the loaded tag data.
