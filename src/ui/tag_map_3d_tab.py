@@ -371,14 +371,77 @@ def _get_multiline_text_item_class():
     from PySide6.QtCore import QPointF, Qt as _Qt
 
     class _MultiLineGLTextItem(gl.GLTextItem):
+        """GLTextItem that stacks multi-line text in SCREEN space.
+
+        Performance: the per-frame paint() path is kept minimal. Everything
+        that depends only on (text, font, alignment) -- line splitting, font
+        metrics, and per-line horizontal advances -- is computed ONCE and
+        cached. Each frame we only project the world anchor to screen space
+        and issue drawText calls at the cached offsets. This matters a lot
+        when the view repaints continuously (e.g. camera wobble), because it
+        removes QFontMetrics + horizontalAdvance from the hot path.
+        """
+
+        def _build_cache(self):
+            """Precompute line layout metrics (called only when text/font change)."""
+            fm = QFontMetrics(self.font)
+            line_height = fm.lineSpacing()
+            lines = self.text.split("\n")
+            align = self.alignment
+            n = len(lines)
+
+            # Per-line horizontal offset (dx) and vertical offset (dy)
+            layout = []
+            for i, line in enumerate(lines):
+                if not line:
+                    continue
+                dx = 0.0
+                if align & _Qt.AlignmentFlag.AlignHCenter:
+                    dx = fm.horizontalAdvance(line) / 2.0
+                elif align & _Qt.AlignmentFlag.AlignRight:
+                    dx = fm.horizontalAdvance(line)
+                dy = i * line_height
+                if align & _Qt.AlignmentFlag.AlignVCenter:
+                    dy -= (n - 1) * line_height / 2.0
+                elif align & _Qt.AlignmentFlag.AlignTop:
+                    dy -= (n - 1) * line_height
+                layout.append((line, dx, dy))
+
+            self._label_cache = {
+                "key": (self.text, self.font.pointSizeF(), int(self.alignment)),
+                "layout": layout,
+            }
+
         def paint(self):
             if len(self.text) < 1:
                 return
+
+            # Rebuild the metrics cache only when text/font/alignment changed
+            cache = getattr(self, "_label_cache", None)
+            key = (self.text, self.font.pointSizeF(), int(self.alignment))
+            if cache is None or cache["key"] != key:
+                self._build_cache()
+                cache = self._label_cache
+            layout = cache["layout"]
+            if not layout:
+                return
+
             self.setupGLState()
             project = self.compute_projection()
             anchor = project.map(QVector3D(*self.pos)).toPointF()
 
-            painter = QPainter(self.view())
+            # Off-screen culling: skip labels whose anchor is outside the
+            # viewport (with a margin for text extent). Saves drawText calls
+            # for cohorts that are behind/beside the camera.
+            view = self.view()
+            vw = view.width()
+            vh = view.height()
+            margin = 200.0
+            if (anchor.x() < -margin or anchor.x() > vw + margin or
+                    anchor.y() < -margin or anchor.y() > vh + margin):
+                return
+
+            painter = QPainter(view)
             painter.setPen(self.color)
             painter.setFont(self.font)
             painter.setRenderHints(
@@ -386,27 +449,7 @@ def _get_multiline_text_item_class():
                 | QPainter.RenderHint.TextAntialiasing
             )
 
-            fm = QFontMetrics(self.font)
-            line_height = fm.lineSpacing()
-            lines = self.text.split("\n")
-            align = self.alignment
-            n = len(lines)
-
-            for i, line in enumerate(lines):
-                if not line:
-                    continue
-                # Horizontal alignment (center each line on the anchor)
-                dx = 0.0
-                if align & _Qt.AlignmentFlag.AlignHCenter:
-                    dx = fm.horizontalAdvance(line) / 2.0
-                elif align & _Qt.AlignmentFlag.AlignRight:
-                    dx = fm.horizontalAdvance(line)
-                # Vertical offset for this line (screen space)
-                dy = i * line_height
-                if align & _Qt.AlignmentFlag.AlignVCenter:
-                    dy -= (n - 1) * line_height / 2.0
-                elif align & _Qt.AlignmentFlag.AlignTop:
-                    dy -= (n - 1) * line_height
+            for line, dx, dy in layout:
                 painter.drawText(QPointF(anchor.x() - dx, anchor.y() + dy), line)
             painter.end()
 
@@ -523,6 +566,7 @@ class TagMap3DTab(QWidget):
         self.n_jobs = os.cpu_count() or 4
         self.use_direct_db = False
         self.client_db_paths = {}
+        self.tokenize = True
 
         # DBSCAN optimizer settings (managed by the settings dialog)
         self.opt_max_cohort_size = 500
@@ -556,17 +600,9 @@ class TagMap3DTab(QWidget):
         self.cohort_label_blink_timer.timeout.connect(self._toggle_cohort_label_blink)
         self.cohort_label_blink_visible = True
 
-        # Cluster hull meshes
-        self.cluster_hull_meshes = []  # List of GLMeshItem for cluster boundaries
-
         # Cohort labels
         self.cohort_label_items = []  # List of GLTextItem for cohort labels
         self.cohort_label_map = {}  # cluster_id -> GLTextItem (for targeted blink)
-
-        # V7: Relationship lines between related clusters
-        self.relationship_line_items = []  # List of GLLinePlotItem
-        self.relationship_label_items = []  # List of GLTextItem
-        self.relationship_pairs = []  # List of (cid1, cid2, score, shared_tags)
 
         # Auto-load last data
         self.auto_load_timer = QTimer(self)
@@ -585,11 +621,11 @@ class TagMap3DTab(QWidget):
         self.time_travel_current_index = 0
         self.time_travel_t = 0.0
         self.time_travel_segment_duration = 120  # frames per segment (2s at 60fps)
-        self.time_travel_dwell_duration = 120  # frames to dwell at each waypoint
+        self.time_travel_dwell_duration = 30  # frames to dwell at each waypoint (~1s)
         self.time_travel_frames = 0
         self.time_travel_mode = "dwell"  # "dwell", "travel", or "orbit"
         # Orbit parameters (spaceship circling a cluster)
-        self.time_travel_orbit_radius = 8.0  # distance from cluster centroid
+        self.time_travel_orbit_radius = 15.0  # distance from cluster centroid
         self.time_travel_orbit_speed = 0.02  # radians per frame
         self.time_travel_orbit_angle = 0.0
         self.time_travel_orbit_duration = 180  # frames to orbit (~3s at 60fps)
@@ -625,6 +661,9 @@ class TagMap3DTab(QWidget):
                 self.client_combo.setCurrentIndex(client_idx)
             self.chunk_size_spin.setValue(settings.get("chunk_size", 500))
             self.max_files_spin.setValue(settings.get("max_files", 4096))
+            # Populate tag services dynamically for the selected client, then
+            # restore the saved tag service selection.
+            self._populate_tag_services(self.client_combo.currentText())
             tag_service_idx = self.tag_service_combo.findText(settings.get("tag_service", "auto2"))
             if tag_service_idx >= 0:
                 self.tag_service_combo.setCurrentIndex(tag_service_idx)
@@ -676,21 +715,20 @@ class TagMap3DTab(QWidget):
             self.query_edit.setText(settings.get("query", ""))
             self.whitelist_edit.setText(settings.get("whitelist", ""))
             self.blacklist_edit.setText(settings.get("blacklist", ""))
-            self.tokenize_checkbox.setChecked(settings.get("tokenize", False))
+            self.tokenize = settings.get("tokenize", True)
             self.drop_empty_checkbox.setChecked(settings.get("drop_empty_files", False))
             self.min_doc_freq_spin.setValue(settings.get("min_doc_freq", 3))
             self.drop_universal_checkbox.setChecked(settings.get("drop_universal_tags", False))
 
-            # Visualization settings
-            self.min_size_spin.setValue(settings.get("min_size", 0.03))
-            self.max_size_spin.setValue(settings.get("max_size", 0.08))
+            # Visualization settings (node_size is stored as actual value, displayed x10)
+            # Backward compat: fall back to old "min_size" key if "node_size" not present
+            node_size_actual = settings.get("node_size", settings.get("min_size", 0.02))
+            self.min_size_spin.setValue(node_size_actual * 10.0)
             self.spread_spin.setValue(settings.get("spread", 1.0))
             self.orbit_speed_spin.setValue(settings.get("orbit_speed", 0.2))
             self.transparency_spin.setValue(settings.get("transparency", 0.8))
 
             # Anti-noise / quality settings
-            self.msaa_checkbox.setChecked(settings.get("msaa", True))
-            self.point_smooth_checkbox.setChecked(settings.get("point_smooth", True))
             self.supersample_checkbox.setChecked(settings.get("supersample", False))
             self.supersample_fps_spin.setValue(settings.get("supersample_fps", 10))
 
@@ -703,37 +741,11 @@ class TagMap3DTab(QWidget):
             if color_scheme_idx >= 0:
                 self.color_scheme_combo.setCurrentIndex(color_scheme_idx)
             
-            # V3: Cluster boundaries setting
-            self.show_boundaries_checkbox.setChecked(settings.get("show_cluster_boundaries", False))
-            self.boundary_alpha_spin.setValue(settings.get("boundary_alpha", 0.15))
-            
-            # V7: Relationship lines setting
-            # (backward compat: old "show_particles" key maps to the new toggle)
-            self.show_relationships_checkbox.setChecked(
-                settings.get("show_relationships", settings.get("show_particles", False))
-            )
-            metric_idx = self.relationship_metric_combo.findText(
-                settings.get("relationship_metric", "IDF Cosine")
-            )
-            if metric_idx >= 0:
-                self.relationship_metric_combo.setCurrentIndex(metric_idx)
-            self.relationship_min_sim_spin.setValue(settings.get("relationship_min_sim", 0.1))
-            self.relationship_max_spin.setValue(settings.get("relationship_max", 30))
-            self.relationship_alpha_spin.setValue(settings.get("relationship_alpha", 0.6))
-            self.relationship_width_spin.setValue(settings.get("relationship_width", 2))
-            rel_color = settings.get("relationship_color", [120, 160, 255])
-            self._relationship_color = tuple(rel_color)
-            self._update_relationship_color_button()
-            self.show_relationship_labels_checkbox.setChecked(
-                settings.get("show_relationship_labels", False)
-            )
-
             # Cohort label settings
             self.cohort_threshold_spin.setValue(settings.get("cohort_threshold", 0.9))
             self.show_cohort_labels_checkbox.setChecked(settings.get("show_cohort_labels", False))
             self.cohort_label_size_spin.setValue(settings.get("cohort_label_size", 14))
             self.dynamic_label_size_checkbox.setChecked(settings.get("dynamic_label_size", False))
-            self.invert_label_color_checkbox.setChecked(settings.get("invert_label_color", False))
             color = settings.get("cohort_label_color", [255, 255, 255])
             self._cohort_label_color = tuple(color)
             self._update_label_color_button()
@@ -746,10 +758,9 @@ class TagMap3DTab(QWidget):
                 self.cohort_label_mode_combo.setCurrentIndex(mode_idx)
             self.cohort_label_n_spin.setValue(settings.get("cohort_label_n", 10))
             self.cohort_label_max_tags_spin.setValue(settings.get("cohort_label_max_tags", 5))
-            # Smart labels settings
-            self.smart_labels_checkbox.setChecked(settings.get("smart_labels", False))
+            # Smart labels settings (merged into mode combo; "Raw" = disabled)
             smart_mode_idx = self.smart_label_mode_combo.findText(
-                settings.get("smart_label_mode", "All Unique")
+                settings.get("smart_label_mode", "Absolute Unique")
             )
             if smart_mode_idx >= 0:
                 self.smart_label_mode_combo.setCurrentIndex(smart_mode_idx)
@@ -763,18 +774,9 @@ class TagMap3DTab(QWidget):
             # Camera wobble settings
             self.wobble_enabled_checkbox.setChecked(settings.get("wobble_enabled", False))
             self.wobble_speed_spin.setValue(settings.get("wobble_speed", 1.0))
-            self.wobble_x_range_spin.setValue(settings.get("wobble_x_range", 10.0))
-            self.wobble_y_range_spin.setValue(settings.get("wobble_y_range", 10.0))
-            self.wobble_z_range_spin.setValue(settings.get("wobble_z_range", 20.0))
             self.wobble_azim_range_spin.setValue(settings.get("wobble_azim_range", 15.0))
             self.wobble_elev_range_spin.setValue(settings.get("wobble_elev_range", 10.0))
 
-            # Trail settings
-            self.trail_enabled_checkbox.setChecked(settings.get("trail_enabled", False))
-            self.trail_length_spin.setValue(settings.get("trail_length", 12))
-            self.trail_decay_spin.setValue(settings.get("trail_decay", 0.85))
-            self.trail_max_nodes_spin.setValue(settings.get("trail_max_nodes", 3000))
-            
             # Send to tab settings
             if hasattr(self, 'tab_name_edit'):
                 self.tab_name_edit.setText(settings.get("tab_name", ""))
@@ -816,55 +818,33 @@ class TagMap3DTab(QWidget):
             'min_doc_freq_spin': 'valueChanged',
             'drop_universal_checkbox': 'stateChanged',
             'min_size_spin': 'valueChanged',
-            'max_size_spin': 'valueChanged',
             'spread_spin': 'valueChanged',
             'orbit_speed_spin': 'valueChanged',
             'transparency_spin': 'valueChanged',
             'supersample_fps_spin': 'valueChanged',
             'dim_alpha_spin': 'valueChanged',
-            'boundary_alpha_spin': 'valueChanged',
-            'relationship_min_sim_spin': 'valueChanged',
-            'relationship_max_spin': 'valueChanged',
-            'relationship_alpha_spin': 'valueChanged',
-            'relationship_width_spin': 'valueChanged',
             'cohort_threshold_spin': 'valueChanged',
             'cohort_label_size_spin': 'valueChanged',
             'cohort_label_n_spin': 'valueChanged',
             'cohort_label_max_tags_spin': 'valueChanged',
             'wobble_speed_spin': 'valueChanged',
-            'wobble_x_range_spin': 'valueChanged',
-            'wobble_y_range_spin': 'valueChanged',
-            'wobble_z_range_spin': 'valueChanged',
             'wobble_azim_range_spin': 'valueChanged',
             'wobble_elev_range_spin': 'valueChanged',
-            'trail_length_spin': 'valueChanged',
-            'trail_decay_spin': 'valueChanged',
-            'trail_max_nodes_spin': 'valueChanged',
             # QCheckBox -> stateChanged
             'auto_load_checkbox': 'stateChanged',
             'normalize_checkbox': 'stateChanged',
-            'tokenize_checkbox': 'stateChanged',
             'drop_empty_checkbox': 'stateChanged',
-            'msaa_checkbox': 'stateChanged',
-            'point_smooth_checkbox': 'stateChanged',
             'supersample_checkbox': 'stateChanged',
             'dim_non_selected_checkbox': 'stateChanged',
-            'show_boundaries_checkbox': 'stateChanged',
-            'show_relationships_checkbox': 'stateChanged',
-            'show_relationship_labels_checkbox': 'stateChanged',
             'show_cohort_labels_checkbox': 'stateChanged',
             'dynamic_label_size_checkbox': 'stateChanged',
-            'invert_label_color_checkbox': 'stateChanged',
-            'smart_labels_checkbox': 'stateChanged',
             'wobble_enabled_checkbox': 'stateChanged',
-            'trail_enabled_checkbox': 'stateChanged',
             # QComboBox -> currentTextChanged
             'client_combo': 'currentTextChanged',
             'tag_service_combo': 'currentTextChanged',
             'algorithm_combo': 'currentTextChanged',
             'metric_combo': 'currentTextChanged',
             'color_scheme_combo': 'currentTextChanged',
-            'relationship_metric_combo': 'currentTextChanged',
             'cohort_label_mode_combo': 'currentTextChanged',
             'smart_label_mode_combo': 'currentTextChanged',
             # QLineEdit -> textChanged
@@ -924,50 +904,33 @@ class TagMap3DTab(QWidget):
                 "query": self.query_edit.text(),
                 "whitelist": self.whitelist_edit.text(),
                 "blacklist": self.blacklist_edit.text(),
-                "tokenize": self.tokenize_checkbox.isChecked(),
+                "tokenize": getattr(self, 'tokenize', True),
                 "drop_empty_files": self.drop_empty_checkbox.isChecked(),
                 "min_doc_freq": self.min_doc_freq_spin.value(),
                 "drop_universal_tags": self.drop_universal_checkbox.isChecked(),
-                "min_size": self.min_size_spin.value(),
-                "max_size": self.max_size_spin.value(),
+                "node_size": self.min_size_spin.value() / 10.0,
                 "spread": self.spread_spin.value(),
                 "orbit_speed": self.orbit_speed_spin.value(),
                 "transparency": self.transparency_spin.value(),
                 # Anti-noise / quality settings
-                "msaa": self.msaa_checkbox.isChecked(),
-                "point_smooth": self.point_smooth_checkbox.isChecked(),
                 "supersample": self.supersample_checkbox.isChecked(),
                 "supersample_fps": self.supersample_fps_spin.value(),
                 # Dim non-selected nodes settings
                 "dim_non_selected": self.dim_non_selected_checkbox.isChecked(),
                 "dim_alpha": self.dim_alpha_spin.value(),
-                # V5: Color scheme
+                # Color scheme
                 "color_scheme": self.color_scheme_combo.currentText(),
-                # V3: Cluster boundaries
-                "show_cluster_boundaries": self.show_boundaries_checkbox.isChecked(),
-                "boundary_alpha": self.boundary_alpha_spin.value(),
-                # V7: Relationship lines
-                "show_relationships": self.show_relationships_checkbox.isChecked(),
-                "relationship_metric": self.relationship_metric_combo.currentText(),
-                "relationship_min_sim": self.relationship_min_sim_spin.value(),
-                "relationship_max": self.relationship_max_spin.value(),
-                "relationship_alpha": self.relationship_alpha_spin.value(),
-                "relationship_width": self.relationship_width_spin.value(),
-                "relationship_color": list(self._relationship_color),
-                "show_relationship_labels": self.show_relationship_labels_checkbox.isChecked(),
                 # Cohort label settings
                 "cohort_threshold": self.cohort_threshold_spin.value(),
                 "show_cohort_labels": self.show_cohort_labels_checkbox.isChecked(),
                 "cohort_label_size": self.cohort_label_size_spin.value(),
                 "dynamic_label_size": self.dynamic_label_size_checkbox.isChecked(),
-                "invert_label_color": self.invert_label_color_checkbox.isChecked(),
                 "cohort_label_color": list(self._cohort_label_color),
                 "cohort_label_color2": list(self._cohort_label_color2),
                 "cohort_label_mode": self.cohort_label_mode_combo.currentText(),
                 "cohort_label_n": self.cohort_label_n_spin.value(),
                 "cohort_label_max_tags": self.cohort_label_max_tags_spin.value(),
-                # Smart labels settings
-                "smart_labels": self.smart_labels_checkbox.isChecked(),
+                # Smart labels settings (merged into mode combo; "Raw" = disabled)
                 "smart_label_mode": self.smart_label_mode_combo.currentText(),
                 # Split window settings (image preview)
                 # Fall back to previously saved values when the split window is closed
@@ -977,16 +940,8 @@ class TagMap3DTab(QWidget):
                 # Camera wobble settings
                 "wobble_enabled": self.wobble_enabled_checkbox.isChecked(),
                 "wobble_speed": self.wobble_speed_spin.value(),
-                "wobble_x_range": self.wobble_x_range_spin.value(),
-                "wobble_y_range": self.wobble_y_range_spin.value(),
-                "wobble_z_range": self.wobble_z_range_spin.value(),
                 "wobble_azim_range": self.wobble_azim_range_spin.value(),
                 "wobble_elev_range": self.wobble_elev_range_spin.value(),
-                # Trail settings
-                "trail_enabled": self.trail_enabled_checkbox.isChecked(),
-                "trail_length": self.trail_length_spin.value(),
-                "trail_decay": self.trail_decay_spin.value(),
-                "trail_max_nodes": self.trail_max_nodes_spin.value(),
                 # Send to tab settings
                 "tab_name": self.tab_name_edit.text() if hasattr(self, 'tab_name_edit') else "",
                 # Auto-load last data setting
@@ -1026,6 +981,48 @@ class TagMap3DTab(QWidget):
         for client_id, path in self.client_db_paths.items():
             if path:
                 set_client_db_path(client_id, path)
+
+    def _populate_tag_services(self, client_name):
+        """Dynamically populate the tag service combo with all services
+        available on the given Hydrus client.
+
+        Uses client.get_services() which returns every registered tag service
+        (name + key) directly — no file fetch required. Falls back to a
+        sensible default list if the client is unreachable.
+        """
+        if not hasattr(self, 'tag_service_combo'):
+            return
+
+        # Preserve the current selection so we can restore it after repopulating
+        previous = self.tag_service_combo.currentText()
+
+        names = []
+        if client_name:
+            try:
+                from src.utils.utility_functions import ConnectToClient
+                client = ConnectToClient(client_name)
+                services_dict = client.get_services()
+                services = (services_dict or {}).get("services", {})
+                # Sort by name for a stable, readable order
+                names = sorted(
+                    info.get("name", "") for info in services.values()
+                    if isinstance(info, dict) and info.get("name")
+                )
+            except Exception as e:
+                print(f"Could not fetch tag services for '{client_name}': {e}")
+
+        # Fallback defaults if the client is unreachable or returned nothing
+        if not names:
+            names = ["auto2", "local", "all known tags"]
+
+        self.tag_service_combo.blockSignals(True)
+        self.tag_service_combo.clear()
+        self.tag_service_combo.addItems(names)
+        # Restore previous selection if it still exists, else first item
+        idx = self.tag_service_combo.findText(previous)
+        if idx >= 0:
+            self.tag_service_combo.setCurrentIndex(idx)
+        self.tag_service_combo.blockSignals(False)
 
     def open_settings_dialog(self):
         """Open the advanced settings window for the 3D tag map tab."""
@@ -1181,6 +1178,7 @@ class TagMap3DTab(QWidget):
         self.client_combo.addItems(client_ids() or [])
         self.client_combo.setToolTip("Select which Hydrus client to connect to.\nClients are defined in clients.json at the project root.")
         self.client_combo.currentTextChanged.connect(self._load_client_db_path)
+        self.client_combo.currentTextChanged.connect(self._populate_tag_services)
         client_layout.addRow("Client:", self.client_combo)
 
         self.chunk_size_spin = QSpinBox()
@@ -1191,14 +1189,19 @@ class TagMap3DTab(QWidget):
 
         self.max_files_spin = QSpinBox()
         self.max_files_spin.setRange(1, 100000000)
-        self.max_files_spin.setValue(4096)
+        self.max_files_spin.setValue(20000)
         self.max_files_spin.setSingleStep(512)
-        self.max_files_spin.setToolTip("Maximum number of files to load and analyze.\nLower = faster processing, less memory.\nHigher = more complete visualization.\nDefault: 4096")
-        client_layout.addRow("Max Files:", self.max_files_spin)
+        self.max_files_spin.setToolTip("Maximum number of files to load and analyze.\nLower = faster processing, less memory.\nHigher = more complete visualization.\nDefault: 20000")
+        max_files_row = QHBoxLayout()
+        max_files_row.addWidget(self.max_files_spin)
+        max_files_hint = QLabel("(default)")
+        max_files_hint.setStyleSheet("color: #888; font-size: 10px;")
+        max_files_row.addWidget(max_files_hint)
+        max_files_row.addStretch()
+        client_layout.addRow("Max Files:", max_files_row)
 
         self.tag_service_combo = QComboBox()
-        self.tag_service_combo.addItems(["auto2", "local", "all known tags"])
-        self.tag_service_combo.setToolTip("Which tag service to use for fetching tags.\nauto2 = Automatic tag detection (recommended).\nlocal = Only locally stored tags.\nall known tags = Include all tags from Hydrus tag database.")
+        self.tag_service_combo.setToolTip("Which tag service to use for fetching tags.\nPopulated dynamically per client.")
         client_layout.addRow("Tag Service:", self.tag_service_combo)
 
         # Auto-load last data checkbox
@@ -1330,11 +1333,6 @@ class TagMap3DTab(QWidget):
         self.blacklist_edit.setToolTip("Tag-level filter: removes matching tags from all files\nbefore position calculation and visualization.\nComma-separated. Supports * wildcard.\nLeave empty to remove nothing.")
         filter_layout.addRow("Tag Blacklist:", self.blacklist_edit)
 
-        self.tokenize_checkbox = QCheckBox("Tokenize tags")
-        self.tokenize_checkbox.setChecked(False)
-        self.tokenize_checkbox.setToolTip("When enabled, tags are converted to integer indices once at load\ntime and carried through the pipeline as integers. This reduces RAM\n(no per-node string copies) and replaces repeated string hashing with\ninteger lookups. Strings are only materialised for display.\nDefault: OFF (proven string path).")
-        filter_layout.addRow("Tokenize:", self.tokenize_checkbox)
-
         self.drop_empty_checkbox = QCheckBox("Drop empty files")
         self.drop_empty_checkbox.setChecked(False)
         self.drop_empty_checkbox.setToolTip("When enabled, files with no tags remaining after the\nwhitelist/blacklist filters are excluded from the map.\nWhen disabled (default), they are kept and appear as untagged\nnodes at the origin.\nOnly applies when a whitelist or blacklist is set.")
@@ -1383,33 +1381,6 @@ class TagMap3DTab(QWidget):
         self.wobble_speed_spin.setToolTip("Speed of the wobble oscillation.\nHigher = faster movement.\nDefault: 1.0")
         wobble_layout.addRow("Speed:", self.wobble_speed_spin)
 
-        # X pan range
-        self.wobble_x_range_spin = QDoubleSpinBox()
-        self.wobble_x_range_spin.setRange(0.0, 100.0)
-        self.wobble_x_range_spin.setValue(10.0)
-        self.wobble_x_range_spin.setDecimals(1)
-        self.wobble_x_range_spin.setSingleStep(1.0)
-        self.wobble_x_range_spin.setToolTip("X-axis pan range (left-right movement).\nDefault: 10.0")
-        wobble_layout.addRow("X Range:", self.wobble_x_range_spin)
-
-        # Y pan range
-        self.wobble_y_range_spin = QDoubleSpinBox()
-        self.wobble_y_range_spin.setRange(0.0, 100.0)
-        self.wobble_y_range_spin.setValue(10.0)
-        self.wobble_y_range_spin.setDecimals(1)
-        self.wobble_y_range_spin.setSingleStep(1.0)
-        self.wobble_y_range_spin.setToolTip("Y-axis pan range (up-down movement).\nDefault: 10.0")
-        wobble_layout.addRow("Y Range:", self.wobble_y_range_spin)
-
-        # Z distance range
-        self.wobble_z_range_spin = QDoubleSpinBox()
-        self.wobble_z_range_spin.setRange(0.0, 200.0)
-        self.wobble_z_range_spin.setValue(20.0)
-        self.wobble_z_range_spin.setDecimals(1)
-        self.wobble_z_range_spin.setSingleStep(5.0)
-        self.wobble_z_range_spin.setToolTip("Z-axis (distance) range (zoom in-out movement).\nDefault: 20.0")
-        wobble_layout.addRow("Z Range:", self.wobble_z_range_spin)
-
         # Azimuth range
         self.wobble_azim_range_spin = QDoubleSpinBox()
         self.wobble_azim_range_spin.setRange(0.0, 180.0)
@@ -1428,37 +1399,6 @@ class TagMap3DTab(QWidget):
         self.wobble_elev_range_spin.setToolTip("Elevation rotation range (vertical rotation).\n0 = off.\nDefault: 10.0 degrees")
         wobble_layout.addRow("Elev Range:", self.wobble_elev_range_spin)
 
-        # Trail settings (visual trails behind nodes during wobble)
-        self.trail_enabled_checkbox = QCheckBox()
-        self.trail_enabled_checkbox.setChecked(False)
-        self.trail_enabled_checkbox.setToolTip("Draw fading trails behind nodes during camera wobble.\nDefault: OFF (large datasets are expensive).")
-        self.trail_enabled_checkbox.stateChanged.connect(self._on_trail_toggle)
-        wobble_layout.addRow("Trails:", self.trail_enabled_checkbox)
-
-        self.trail_length_spin = QSpinBox()
-        self.trail_length_spin.setRange(2, 60)
-        self.trail_length_spin.setValue(12)
-        self.trail_length_spin.setToolTip("Trail length: number of recent positions kept per node.\nHigher = longer trails, more memory.\nDefault: 12")
-        self.trail_length_spin.setEnabled(False)
-        wobble_layout.addRow("Trail Length:", self.trail_length_spin)
-
-        self.trail_decay_spin = QDoubleSpinBox()
-        self.trail_decay_spin.setRange(0.0, 1.0)
-        self.trail_decay_spin.setValue(0.85)
-        self.trail_decay_spin.setDecimals(2)
-        self.trail_decay_spin.setSingleStep(0.05)
-        self.trail_decay_spin.setToolTip("Trail decay: how quickly trail points fade (0 = instant, 1 = long-lasting).\nDefault: 0.85")
-        self.trail_decay_spin.setEnabled(False)
-        wobble_layout.addRow("Trail Decay:", self.trail_decay_spin)
-
-        self.trail_max_nodes_spin = QSpinBox()
-        self.trail_max_nodes_spin.setRange(100, 50000)
-        self.trail_max_nodes_spin.setValue(3000)
-        self.trail_max_nodes_spin.setSingleStep(500)
-        self.trail_max_nodes_spin.setToolTip("Max nodes that render trails (performance guard).\nLower = faster. Default: 3000")
-        self.trail_max_nodes_spin.setEnabled(False)
-        wobble_layout.addRow("Trail Max Nodes:", self.trail_max_nodes_spin)
-
         wobble_group.setLayout(wobble_layout)
         layout.addWidget(wobble_group)
 
@@ -1467,11 +1407,6 @@ class TagMap3DTab(QWidget):
         self.wobble_timer.timeout.connect(self._update_wobble)
         self.wobble_timer.setInterval(16)  # ~60fps
         self.wobble_time = 0.0
-
-        # Trail state (visual trails behind nodes during wobble)
-        self.trail_scatter = None  # GLScatterPlotItem for trails
-        self.trail_history = []  # list of recent position arrays (ring buffer)
-        self.trail_active = False
 
         # Load Button and Progress
         self.load_button = QPushButton("Load Data and Compute")
@@ -1649,16 +1584,6 @@ class TagMap3DTab(QWidget):
         try:
             import pyqtgraph.opengl as gl
 
-            # Apply MSAA antialiasing if enabled (must be set before GL context creation)
-            if self.msaa_checkbox.isChecked() if hasattr(self, 'msaa_checkbox') else True:
-                try:
-                    from PySide6.QtGui import QSurfaceFormat
-                    fmt = QSurfaceFormat.defaultFormat()
-                    fmt.setSamples(8)  # 8x multisample antialiasing
-                    QSurfaceFormat.setDefaultFormat(fmt)
-                except Exception as e:
-                    print(f"MSAA setup failed: {e}")
-
             # Create a custom GLViewWidget class that inherits from GLViewWidget
             class RightClickGLView(gl.GLViewWidget):
                 """GLViewWidget with right-click node inspection and custom orbit speed."""
@@ -1670,18 +1595,6 @@ class TagMap3DTab(QWidget):
                     self.is_selecting = False
                     # Enable keyboard focus for F11 fullscreen toggle
                     self.setFocusPolicy(Qt.StrongFocus)
-
-                def paintGL(self, *args, **kwargs):
-                    """Enable point smoothing for softer dots before rendering."""
-                    try:
-                        import OpenGL.GL as gl
-                        if self.parent_tab.point_smooth_checkbox.isChecked() if hasattr(self.parent_tab, 'point_smooth_checkbox') else True:
-                            gl.glEnable(gl.GL_POINT_SMOOTH)
-                        else:
-                            gl.glDisable(gl.GL_POINT_SMOOTH)
-                    except Exception:
-                        pass
-                    return super().paintGL(*args, **kwargs)
 
                 def evalKeyState(self):
                     """Override to use custom orbit speed from settings."""
@@ -1951,6 +1864,11 @@ class TagMap3DTab(QWidget):
                         self.parent_tab.toggle_split_window()
                         event.accept()
                         return
+                    elif event.key() == Qt.Key_R and event.modifiers() & Qt.ControlModifier:
+                        # Pop selected cohort
+                        self.parent_tab._pop_selected_cohort()
+                        event.accept()
+                        return
                     super().keyPressEvent(event)
             
             # Create the custom view widget
@@ -2133,8 +2051,8 @@ class TagMap3DTab(QWidget):
         self.send_status_label.setWordWrap(True)
         send_layout.addWidget(self.send_status_label)
 
-        # Time Travel button
-        self.time_travel_button = QPushButton("Time Travel")
+        # Explore button
+        self.time_travel_button = QPushButton("Explore")
         self.time_travel_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: {BLUE_60};
@@ -2150,7 +2068,7 @@ class TagMap3DTab(QWidget):
                 background-color: {GRAY_40};
             }}
         """)
-        self.time_travel_button.setToolTip("Animate camera flying through cluster centroids.")
+        self.time_travel_button.setToolTip("Fly the camera through the largest cluster centroids to explore the map.")
         self.time_travel_button.clicked.connect(self._toggle_time_travel)
         self.time_travel_button.setEnabled(False)  # Enabled when data is loaded
         send_layout.addWidget(self.time_travel_button)
@@ -2194,7 +2112,7 @@ class TagMap3DTab(QWidget):
                 background-color: {GRAY_40};
             }}
         """)
-        self.pop_button.setToolTip("Remove the selected cohort from the view\n(keep everything else). Positions of remaining nodes stay unchanged.")
+        self.pop_button.setToolTip("Remove the selected cohort from the view\n(keep everything else). Positions of remaining nodes stay unchanged.\nShortcut: Ctrl+R")
         self.pop_button.clicked.connect(self._pop_selected_cohort)
         self.pop_button.setEnabled(False)  # Enabled when a cohort is selected
         send_layout.addWidget(self.pop_button)
@@ -2230,22 +2148,13 @@ class TagMap3DTab(QWidget):
         vis_layout = QFormLayout()
 
         self.min_size_spin = QDoubleSpinBox()
-        self.min_size_spin.setRange(0.001, 5.0)
-        self.min_size_spin.setValue(0.03)
+        self.min_size_spin.setRange(0.01, 0.5)
+        self.min_size_spin.setValue(0.2)
         self.min_size_spin.setSingleStep(0.01)
-        self.min_size_spin.setDecimals(3)
+        self.min_size_spin.setDecimals(2)
         self.min_size_spin.valueChanged.connect(self._on_size_changed)
-        self.min_size_spin.setToolTip("Minimum size of a node (sphere) in the 3D view.\nFiles with few tags will be this size.\nLower = tiny dots, Higher = more visible small nodes.\nDefault: 0.03")
-        vis_layout.addRow("Min Size:", self.min_size_spin)
-
-        self.max_size_spin = QDoubleSpinBox()
-        self.max_size_spin.setRange(0.001, 5.0)
-        self.max_size_spin.setValue(0.08)
-        self.max_size_spin.setSingleStep(0.01)
-        self.max_size_spin.setDecimals(3)
-        self.max_size_spin.valueChanged.connect(self._on_size_changed)
-        self.max_size_spin.setToolTip("Maximum size of a node (sphere) in the 3D view.\nFiles with many tags will approach this size.\nDefault: 0.08")
-        vis_layout.addRow("Max Size:", self.max_size_spin)
+        self.min_size_spin.setToolTip("Node size in the 3D view.\nDisplay value is x10 of the actual size.\nDefault: 0.2 (actual: 0.02)")
+        vis_layout.addRow("Node Size:", self.min_size_spin)
 
         self.spread_spin = QDoubleSpinBox()
         self.spread_spin.setRange(0.1, 10.0)
@@ -2298,16 +2207,6 @@ class TagMap3DTab(QWidget):
         vis_layout.addRow("Color Scheme:", self.color_scheme_combo)
 
         # Anti-noise / quality settings
-        self.msaa_checkbox = QCheckBox("MSAA Antialiasing")
-        self.msaa_checkbox.setChecked(True)
-        self.msaa_checkbox.setToolTip("Enable multisample antialiasing (MSAA) on the 3D view.\nReduces jagged/aliased edges on points and lines at high resolution.\nDefault: ON.")
-        vis_layout.addRow(self.msaa_checkbox)
-
-        self.point_smooth_checkbox = QCheckBox("Smooth Points")
-        self.point_smooth_checkbox.setChecked(True)
-        self.point_smooth_checkbox.setToolTip("Enable GL_POINT_SMOOTH for softer, rounder point rendering.\nReduces the 'noisy dot' look at high resolution.\nDefault: ON.")
-        vis_layout.addRow(self.point_smooth_checkbox)
-
         self.supersample_checkbox = QCheckBox("Supersample (4x)")
         self.supersample_checkbox.setChecked(False)
         self.supersample_checkbox.setToolTip("Render the view at 4x resolution then downsample.\nGreatly reduces aliasing/noise but uses more GPU memory.\nDefault: OFF.")
@@ -2320,101 +2219,6 @@ class TagMap3DTab(QWidget):
         self.supersample_fps_spin.setToolTip("FPS for the 4x supersample render.\n0 = disable the FPS limiter (render as fast as possible).\nHigher = smoother but heavier (more GPU/CPU).\nDefault: 10")
         self.supersample_fps_spin.valueChanged.connect(self._on_supersample_fps_changed)
         vis_layout.addRow("Supersample FPS:", self.supersample_fps_spin)
-
-        # Show Cluster Boundaries checkbox
-        self.show_boundaries_checkbox = QCheckBox("Show Cluster Boundaries")
-        self.show_boundaries_checkbox.setChecked(False)
-        self.show_boundaries_checkbox.stateChanged.connect(self._on_boundaries_toggle)
-        self.show_boundaries_checkbox.setToolTip("Render semi-transparent convex hull meshes\naround clusters (10+ nodes). Default: OFF.")
-        vis_layout.addRow(self.show_boundaries_checkbox)
-
-        # Boundary Opacity spinner
-        self.boundary_alpha_spin = QDoubleSpinBox()
-        self.boundary_alpha_spin.setRange(0.0, 1.0)
-        self.boundary_alpha_spin.setValue(0.15)
-        self.boundary_alpha_spin.setDecimals(2)
-        self.boundary_alpha_spin.setSingleStep(0.05)
-        self.boundary_alpha_spin.valueChanged.connect(self._on_boundary_alpha_changed)
-        self.boundary_alpha_spin.setToolTip("Opacity of cluster boundary hulls.\nHigher = more visible.\nDefault: 0.15")
-        vis_layout.addRow("Boundary Opacity:", self.boundary_alpha_spin)
-
-        # Show Relationship Lines checkbox
-        self.show_relationships_checkbox = QCheckBox("Show Relationship Lines")
-        self.show_relationships_checkbox.setChecked(False)
-        self.show_relationships_checkbox.stateChanged.connect(self._on_relationships_toggle)
-        self.show_relationships_checkbox.setToolTip("Draw lines between related clusters.\nLine opacity encodes relationship strength.\nDefault: OFF.")
-        vis_layout.addRow(self.show_relationships_checkbox)
-
-        # Relationship metric combo (enabled only when relationships checked)
-        self.relationship_metric_combo = QComboBox()
-        self.relationship_metric_combo.addItems(["IDF Cosine", "Shared Tag Count"])
-        self.relationship_metric_combo.setCurrentIndex(0)
-        self.relationship_metric_combo.currentIndexChanged.connect(self._on_relationship_metric_changed)
-        self.relationship_metric_combo.setToolTip("How cluster relatedness is measured.\nIDF Cosine: IDF-weighted cosine similarity between cluster tag vectors\n(rare shared tags count more than common ones).\nShared Tag Count: raw number of shared tags (legacy behavior).\nDefault: IDF Cosine")
-        self.relationship_metric_combo.setEnabled(False)
-        vis_layout.addRow("Metric:", self.relationship_metric_combo)
-
-        # Min similarity threshold (enabled only when relationships checked)
-        self.relationship_min_sim_spin = QDoubleSpinBox()
-        self.relationship_min_sim_spin.setRange(0.0, 1.0)
-        self.relationship_min_sim_spin.setValue(0.1)
-        self.relationship_min_sim_spin.setDecimals(2)
-        self.relationship_min_sim_spin.setSingleStep(0.05)
-        self.relationship_min_sim_spin.setToolTip("Minimum similarity score for a line to be drawn.\n0.0 = show all related pairs.\nDefault: 0.10")
-        self.relationship_min_sim_spin.setEnabled(False)
-        self.relationship_min_sim_spin.valueChanged.connect(self._on_relationship_params_changed)
-        vis_layout.addRow("Min Similarity:", self.relationship_min_sim_spin)
-
-        # Max relationships (enabled only when relationships checked)
-        self.relationship_max_spin = QSpinBox()
-        self.relationship_max_spin.setRange(1, 200)
-        self.relationship_max_spin.setValue(30)
-        self.relationship_max_spin.setToolTip("Maximum number of relationship lines to draw\n(top N strongest pairs).\nDefault: 30")
-        self.relationship_max_spin.setEnabled(False)
-        self.relationship_max_spin.valueChanged.connect(self._on_relationship_params_changed)
-        vis_layout.addRow("Max Lines:", self.relationship_max_spin)
-
-        # Line opacity (enabled only when relationships checked)
-        self.relationship_alpha_spin = QDoubleSpinBox()
-        self.relationship_alpha_spin.setRange(0.05, 1.0)
-        self.relationship_alpha_spin.setValue(0.6)
-        self.relationship_alpha_spin.setDecimals(2)
-        self.relationship_alpha_spin.setSingleStep(0.05)
-        self.relationship_alpha_spin.setToolTip("Base opacity of relationship lines.\nStronger relationships are drawn more opaque.\nDefault: 0.60")
-        self.relationship_alpha_spin.setEnabled(False)
-        self.relationship_alpha_spin.valueChanged.connect(self._on_relationship_params_changed)
-        vis_layout.addRow("Line Opacity:", self.relationship_alpha_spin)
-
-        # Line width (thickness) of relationship lines
-        self.relationship_width_spin = QSpinBox()
-        self.relationship_width_spin.setRange(1, 20)
-        self.relationship_width_spin.setValue(2)
-        self.relationship_width_spin.setToolTip("Thickness (width in pixels) of relationship lines.\nHigher = thicker, more visible lines.\nDefault: 2")
-        self.relationship_width_spin.setEnabled(False)
-        self.relationship_width_spin.valueChanged.connect(self._on_relationship_params_changed)
-        vis_layout.addRow("Line Width:", self.relationship_width_spin)
-
-        # Line color for relationship lines
-        rel_color_row = QHBoxLayout()
-        rel_color_label = QLabel("Line Color:")
-        rel_color_label.setStyleSheet(f"color: {RED_A};")
-        rel_color_row.addWidget(rel_color_label)
-        self.relationship_color_btn = QPushButton("")
-        self.relationship_color_btn.setFixedSize(40, 24)
-        self.relationship_color_btn.setToolTip("Color of relationship lines. Click to change.")
-        self.relationship_color_btn.clicked.connect(self._pick_relationship_color)
-        self._relationship_color = (120, 160, 255)  # default soft blue
-        self._update_relationship_color_button()
-        rel_color_row.addWidget(self.relationship_color_btn)
-        rel_color_row.addStretch()
-        vis_layout.addRow(rel_color_row)
-
-        # Show Relationship Labels checkbox (separate toggle)
-        self.show_relationship_labels_checkbox = QCheckBox("Show Relationship Labels")
-        self.show_relationship_labels_checkbox.setChecked(False)
-        self.show_relationship_labels_checkbox.stateChanged.connect(self._on_relationship_labels_toggle)
-        self.show_relationship_labels_checkbox.setToolTip("Show a label at the midpoint of each relationship line\nlisting the top shared tags between the two clusters.\nOnly applies when Show Relationship Lines is ON.\nDefault: OFF.")
-        vis_layout.addRow(self.show_relationship_labels_checkbox)
 
         vis_group.setLayout(vis_layout)
         layout.addWidget(vis_group)
@@ -2513,27 +2317,17 @@ class TagMap3DTab(QWidget):
         max_tags_row.addStretch()
         cohort_layout.addLayout(max_tags_row)
 
-        # Smart Labels toggle
-        self.smart_labels_checkbox = QCheckBox("Smart Labels")
-        self.smart_labels_checkbox.setChecked(False)
-        self.smart_labels_checkbox.setToolTip(
-            "Resolve duplicate labels on nearby cohorts.\n"
-            "When two close cohorts would get the same label, the larger cohort keeps it\n"
-            "and the smaller cohort gets the next-in-line dominant tag(s).\n"
-            "Only applies to cohorts within the top 5 closest by centroid distance."
-        )
-        self.smart_labels_checkbox.stateChanged.connect(self._on_smart_labels_toggled)
-        cohort_layout.addWidget(self.smart_labels_checkbox)
-
-        # Smart Label Mode (controls behavior when max_tags >= 2)
+        # Smart Label Mode (merged toggle + mode into one dropdown)
         smart_mode_row = QHBoxLayout()
-        smart_mode_label = QLabel("Smart Mode:")
+        smart_mode_label = QLabel("Label Mode:")
         smart_mode_label.setStyleSheet(f"color: {RED_A};")
         smart_mode_row.addWidget(smart_mode_label)
         self.smart_label_mode_combo = QComboBox()
-        self.smart_label_mode_combo.addItems(["All Unique", "Overlap", "Absolute Unique"])
+        self.smart_label_mode_combo.addItems(["Raw", "All Unique", "Overlap", "Absolute Unique"])
+        self.smart_label_mode_combo.setCurrentText("Absolute Unique")
         self.smart_label_mode_combo.setToolTip(
-            "How to resolve duplicate labels.\n"
+            "How to resolve duplicate labels across cohorts.\n"
+            "Raw: no deduplication, each cohort shows its own top tags (may overlap).\n"
             "All Unique (proximity): smaller nearby cohort gets completely different tags (e.g. TagC, TagD).\n"
             "Overlap (proximity): smaller nearby cohort keeps the first shared tag, replaces the rest (e.g. TagA, TagC).\n"
             "Absolute Unique (global): no tag is repeated in ANY cohort label. Cohorts are processed\n"
@@ -2578,50 +2372,6 @@ class TagMap3DTab(QWidget):
         label_color_row.addWidget(self.cohort_label_color2_btn)
         label_color_row.addStretch()
         cohort_layout.addLayout(label_color_row)
-
-        # Invert color toggle
-        self.invert_label_color_checkbox = QCheckBox("Invert Label Color")
-        self.invert_label_color_checkbox.setChecked(False)
-        self.invert_label_color_checkbox.setToolTip("Invert the label color to contrast with the background for readability.")
-        self.invert_label_color_checkbox.stateChanged.connect(self._on_invert_label_color_toggled)
-        cohort_layout.addWidget(self.invert_label_color_checkbox)
-
-        # Cohort table
-        self.cohort_table = QTableWidget()
-        self.cohort_table.setColumnCount(3)
-        self.cohort_table.setHorizontalHeaderLabels(["Cohort", "Count", "Dominant Tags"])
-        self.cohort_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
-        self.cohort_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
-        self.cohort_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.cohort_table.setColumnWidth(0, 70)
-        self.cohort_table.setColumnWidth(1, 60)
-        self.cohort_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.cohort_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.cohort_table.setStyleSheet(f"""
-            QTableWidget {{
-                background-color: {GRAY_40};
-                color: {RED_A};
-                border: 1px solid {BLUE_60};
-                gridline-color: {BLUE_60};
-                font-size: 11px;
-            }}
-            QTableWidget::item {{
-                padding: 3px;
-            }}
-            QTableWidget::item:selected {{
-                background-color: {BLUE_60};
-            }}
-            QHeaderView::section {{
-                background-color: {BLUE_60};
-                color: {RED_A};
-                padding: 4px;
-                border: 1px solid {GRAY_40};
-                font-weight: bold;
-            }}
-        """)
-        self.cohort_table.setToolTip("Click a row to select all files in that cohort.")
-        self.cohort_table.cellClicked.connect(self._on_cohort_selected)
-        cohort_layout.addWidget(self.cohort_table)
 
         cohort_group.setLayout(cohort_layout)
         layout.addWidget(cohort_group)
@@ -2704,77 +2454,8 @@ class TagMap3DTab(QWidget):
         if hasattr(self, 'sidebar_toggle_btn'):
             self._position_toggle_buttons()
 
-    def _update_cohort_table(self):
-        """Update the cohort table with top 20 cohorts by file count."""
-        if not hasattr(self, 'node_list') or not self.node_list:
-            return
-
-        from collections import defaultdict, Counter
-
-        # Group nodes by cluster_id (exclude noise cluster -1)
-        cluster_nodes = defaultdict(list)
-        for node in self.node_list:
-            if node.cluster_id != -1:
-                cluster_nodes[node.cluster_id].append(node)
-
-        if not cluster_nodes:
-            self.cohort_table.setRowCount(0)
-            return
-
-        # Build cohort info: (cluster_id, count, tag_counter)
-        cohort_info = []
-        for cluster_id, nodes in cluster_nodes.items():
-            count = len(nodes)
-            tag_counter = Counter()
-            for node in nodes:
-                if self.tag_interner:
-                    tag_counter.update(self.tag_interner.strings_to_list(node.tags))
-                else:
-                    tag_counter.update(node.tags)
-            cohort_info.append((cluster_id, count, tag_counter))
-
-        # Sort by count descending, take top 20
-        cohort_info.sort(key=lambda x: x[1], reverse=True)
-        top_cohorts = cohort_info[:20]
-
-        # Get threshold percentage
-        threshold = self.cohort_threshold_spin.value()
-
-        # Populate table
-        self.cohort_table.setRowCount(len(top_cohorts))
-        for row, (cluster_id, count, tag_counter) in enumerate(top_cohorts):
-            # Cohort ID
-            cohort_item = QTableWidgetItem(f"{cluster_id}")
-            cohort_item.setTextAlignment(Qt.AlignCenter)
-            self.cohort_table.setItem(row, 0, cohort_item)
-
-            # Count
-            count_item = QTableWidgetItem(f"{count}")
-            count_item.setTextAlignment(Qt.AlignCenter)
-            self.cohort_table.setItem(row, 1, count_item)
-
-            # Dominant tags (tags present in >= threshold % of files)
-            dominant_tags = []
-            for tag, tag_count in tag_counter.most_common():
-                percentage = tag_count / count
-                if percentage >= threshold:
-                    dominant_tags.append(f"{tag} ({percentage:.0%})")
-
-            # If no tags meet the threshold, fall back to showing the top tags anyway
-            if not dominant_tags:
-                for tag, tag_count in tag_counter.most_common(5):
-                    percentage = tag_count / count
-                    dominant_tags.append(f"{tag} ({percentage:.0%})")
-
-            tags_text = ", ".join(dominant_tags[:5])
-            if len(dominant_tags) > 5:
-                tags_text += " ..."
-            tags_item = QTableWidgetItem(tags_text if tags_text else "-")
-            self.cohort_table.setItem(row, 2, tags_item)
-
     def _on_cohort_threshold_changed(self, value):
-        """Update cohort table and labels when threshold changes."""
-        self._update_cohort_table()
+        """Update cohort labels when threshold changes."""
         self._update_cohort_labels()
 
     def _on_show_cohort_labels_toggled(self, state):
@@ -2827,20 +2508,12 @@ class TagMap3DTab(QWidget):
         """Update cohort labels when the max-tags-per-label parameter changes."""
         self._update_cohort_labels()
 
-    def _on_smart_labels_toggled(self, state):
-        """Update cohort labels when the smart labels toggle changes."""
-        self._update_cohort_labels()
-
     def _on_smart_label_mode_changed(self, value):
         """Update cohort labels when the smart label mode changes."""
         self._update_cohort_labels()
 
     def _on_dynamic_label_size_toggled(self, state):
         """Toggle dynamic label sizing."""
-        self._update_cohort_labels()
-
-    def _on_invert_label_color_toggled(self, state):
-        """Toggle label color inversion."""
         self._update_cohort_labels()
 
     def _pick_cohort_label_color(self):
@@ -2903,8 +2576,6 @@ class TagMap3DTab(QWidget):
             r, g, b = self._cohort_label_color
         else:
             r, g, b = self._cohort_label_color2
-        if self.invert_label_color_checkbox.isChecked():
-            r, g, b = 255 - r, 255 - g, 255 - b
         return (r, g, b, 255)
 
     def _get_query_shared_tags(self):
@@ -2970,16 +2641,14 @@ class TagMap3DTab(QWidget):
     def _get_cohort_dominant_tags_full(self, nodes):
         """Get the FULL ranked dominant-tag list for a cohort (not truncated).
 
-        Same filtering rules as _compute_cohort_label_text (skips AND-shared
-        query tags, applies the threshold with top-tag fallback) but returns
-        the complete ranked list so smart-labels resolution can pick
+        Skips AND-shared query tags but does NOT apply the cohort threshold.
+        Returns the complete ranked list so smart-labels resolution can pick
         next-in-line tags when the top ones are taken.
 
         Returns:
-            list: All qualifying tags in dominance order (tag, count) tuples.
+            list: All non-shared tags in dominance order (tag, count) tuples.
         """
         from collections import Counter
-        count = len(nodes)
         tag_counter = Counter()
         for node in nodes:
             if self.tag_interner:
@@ -2988,22 +2657,12 @@ class TagMap3DTab(QWidget):
                 tag_counter.update(node.tags)
 
         shared_tags = self._get_query_shared_tags()
-        threshold = self.cohort_threshold_spin.value()
 
         ranked = []
         for tag, tag_count in tag_counter.most_common():
             if tag in shared_tags:
                 continue
-            percentage = tag_count / count
-            if percentage >= threshold:
-                ranked.append((tag, tag_count))
-
-        # If no tags meet the threshold, fall back to top tags (still filtered)
-        if not ranked:
-            for tag, tag_count in tag_counter.most_common():
-                if tag in shared_tags:
-                    continue
-                ranked.append((tag, tag_count))
+            ranked.append((tag, tag_count))
 
         return ranked
 
@@ -3171,10 +2830,8 @@ class TagMap3DTab(QWidget):
             if not cluster_nodes:
                 return
 
-            # Determine label color (with inversion)
+            # Determine label color
             r, g, b = self._cohort_label_color
-            if self.invert_label_color_checkbox.isChecked():
-                r, g, b = 255 - r, 255 - g, 255 - b
 
             # Compute max cohort size for dynamic scaling
             max_count = max(len(nodes) for nodes in cluster_nodes.values()) if cluster_nodes else 1
@@ -3205,9 +2862,9 @@ class TagMap3DTab(QWidget):
                     cluster_nodes[selected_cid] = selected_nodes
 
             # Smart labels: resolve duplicate labels across cohorts
-            smart_labels_enabled = self.smart_labels_checkbox.isChecked()
+            smart_label_mode = self.smart_label_mode_combo.currentText()
             smart_label_map = None
-            if smart_labels_enabled:
+            if smart_label_mode != "Raw":
                 try:
                     smart_label_map = self._apply_smart_labels(cluster_nodes)
                 except Exception as e:
@@ -3300,111 +2957,6 @@ class TagMap3DTab(QWidget):
                 pass
         self.cohort_label_items = []
         self.cohort_label_map = {}
-
-    def _on_cohort_selected(self, row, column):
-        """Handle cohort row selection - highlight all nodes in that cohort."""
-        if not hasattr(self, 'node_list') or not self.node_list:
-            return
-
-        # Get cluster_id from first column
-        cohort_item = self.cohort_table.item(row, 0)
-        if not cohort_item:
-            return
-
-        try:
-            cluster_id = int(cohort_item.text())
-        except ValueError:
-            return
-
-        # Clear previous selection
-        self.clear_selection()
-
-        # Clear previous tag widgets and query states
-        self.tag_query_states.clear()
-        self._clear_tag_widgets()
-
-        # Find all nodes in this cluster
-        cluster_nodes = [n for n in self.node_list if n.cluster_id == cluster_id]
-        if not cluster_nodes:
-            return
-
-        # Gather info
-        file_ids = [n.file_id for n in cluster_nodes]
-
-        # Count tag occurrences
-        tag_counts = {}
-        for n in cluster_nodes:
-            for tag in n.tags:
-                if self.tag_interner and isinstance(tag, int):
-                    tag = self.tag_interner.index_to_string(tag)
-                if tag is None:
-                    continue
-                tag_counts[tag] = tag_counts.get(tag, 0) + 1
-
-        sorted_tags = sorted(tag_counts.items(), key=lambda x: (-x[1], x[0]))
-
-        # DEBUG: Log what's happening
-        print(f"[DEBUG] _on_cohort_selected: cluster_id={cluster_id}, nodes={len(cluster_nodes)}, tags={len(tag_counts)}")
-        print(f"[DEBUG] sorted_tags[:5]={sorted_tags[:5]}")
-        print(f"[DEBUG] tag_grid exists: {hasattr(self, 'tag_grid')}")
-        print(f"[DEBUG] tag_grid count before: {self.tag_grid.count() if hasattr(self, 'tag_grid') else 'N/A'}")
-
-        # Update text info with cohort summary and top 20 tags with counts
-        info_lines = [
-            f"Cohort {cluster_id} - {len(cluster_nodes)} files",
-            "",
-            f"Top Tags ({min(len(tag_counts), 20)} shown):",
-        ]
-        for rank, (tag, count) in enumerate(sorted_tags[:20], 1):
-            pct = count / len(cluster_nodes) * 100
-            info_lines.append(f"{rank}. {tag} ({count} files, {pct:.0f}%)")
-        self.info_text.setText("\n".join(info_lines))
-
-        # Also create clickable tag widgets for top tags (kept alongside text display)
-        tags_to_show = sorted_tags[:20]  # Limit to 20 tags for performance
-        included_query, excluded_query, or_query = self._get_query_tag_states()
-        for idx, (tag, count) in enumerate(tags_to_show):
-            tag_widget = ClickableTag(tag)
-            tag_widget.setToolTip(f"Appears in {count} files ({count/len(cluster_nodes)*100:.0f}%)")
-            tag_widget.stateChanged.connect(self._on_tag_state_changed)
-            # Initialize state from the current query so already-queried tags show correctly
-            if tag in excluded_query:
-                tag_widget.state = 2
-            elif tag in or_query:
-                tag_widget.state = 3
-            elif tag in included_query:
-                tag_widget.state = 1
-            else:
-                tag_widget.state = 0
-            tag_widget._update_appearance()
-            self.tag_query_states[tag] = tag_widget.state
-            self._tag_widgets.append(tag_widget)
-            self.tag_grid.addWidget(tag_widget, idx // 3, idx % 3)  # 3 columns
-
-        # Force layout refresh so the tags render immediately
-        self.tag_container.update()
-        self.tag_grid.update()
-
-        # Set up cluster selection highlight
-        self.selected_cluster_id = cluster_id
-        self.selection_timer.start(500)
-
-        # Enable cut/pop/re-cluster buttons for the selected cohort
-        if hasattr(self, 'cut_button'):
-            self.cut_button.setEnabled(True)
-        if hasattr(self, 'pop_button'):
-            self.pop_button.setEnabled(True)
-        if hasattr(self, 'cluster_button'):
-            self.cluster_button.setEnabled(True)
-
-        # Update the cohort tag data panel
-        self._update_selection_tags(cluster_nodes)
-
-        # Ensure the selected cohort gets a label (even if filtered out by label mode)
-        self._update_cohort_labels()
-
-        # Sync split window if open
-        self._sync_split_window()
 
     def _update_selection_tags(self, cluster_nodes):
         """Populate the Cohort Tag Data panel with top 20 tags for the selection.
@@ -3620,8 +3172,7 @@ class TagMap3DTab(QWidget):
         metric = self.metric_combo.currentText() if hasattr(self, 'metric_combo') else 'cosine'
         eps = self.eps_spin.value() / 100.0
         min_samples = self.min_samples_spin.value()
-        min_size = float(self.min_size_spin.value())
-        max_size = float(self.max_size_spin.value())
+        node_size = float(self.min_size_spin.value()) / 10.0
         spread = float(self.spread_spin.value())
         whitelist = [t.strip() for t in self.whitelist_edit.text().split(',') if t.strip()]
         blacklist = [t.strip() for t in self.blacklist_edit.text().split(',') if t.strip()]
@@ -3660,7 +3211,7 @@ class TagMap3DTab(QWidget):
         # Build as a local first; only swap into self.tag_interner after the
         # load succeeds so a failed load (e.g. 0 files) doesn't orphan the
         # old scene graph's indices against an empty interner.
-        tokenize = self.tokenize_checkbox.isChecked() if hasattr(self, 'tokenize_checkbox') else False
+        tokenize = getattr(self, 'tokenize', True)
         new_interner = TagInterner() if tokenize else None
 
         # Per-chunk transform (string phase): applied DURING load so each file
@@ -3795,7 +3346,7 @@ class TagMap3DTab(QWidget):
         scene = SceneGraph()
         _t_scene = time.perf_counter()
         scene.build_from_data(file_ids, positions, tag_data, cluster_labels,
-                             min_size=min_size, max_size=max_size,
+                             node_size=node_size,
                              tokenized=bool(self.tag_interner), reverse_vocab=reverse_vocab)
         print(f"[Timing] Building scene graph took {time.perf_counter() - _t_scene:.2f}s")
 
@@ -3849,8 +3400,7 @@ class TagMap3DTab(QWidget):
         metric = self.metric_combo.currentText() if hasattr(self, 'metric_combo') else 'cosine'
         eps = self.eps_spin.value() / 100.0
         min_samples = self.min_samples_spin.value()
-        min_size = float(self.min_size_spin.value())
-        max_size = float(self.max_size_spin.value())
+        node_size = float(self.min_size_spin.value()) / 10.0
         min_doc_freq = self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3
         drop_universal = self.drop_universal_checkbox.isChecked() if hasattr(self, 'drop_universal_checkbox') else False
 
@@ -3904,7 +3454,7 @@ class TagMap3DTab(QWidget):
         scene = SceneGraph()
         _t_scene = time.perf_counter()
         scene.build_from_data(file_ids, positions, tag_data, cluster_labels,
-                             min_size=min_size, max_size=max_size,
+                             node_size=node_size,
                              tokenized=bool(self.tag_interner), reverse_vocab=reverse_vocab)
         print(f"[Timing] Building scene graph took {time.perf_counter() - _t_scene:.2f}s")
 
@@ -3968,8 +3518,7 @@ class TagMap3DTab(QWidget):
         metric = self.metric_combo.currentText() if hasattr(self, 'metric_combo') else 'cosine'
         eps = self.eps_spin.value() / 100.0
         min_samples = self.min_samples_spin.value()
-        min_size = float(self.min_size_spin.value())
-        max_size = float(self.max_size_spin.value())
+        node_size = float(self.min_size_spin.value()) / 10.0
         min_doc_freq = self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3
         drop_universal = self.drop_universal_checkbox.isChecked() if hasattr(self, 'drop_universal_checkbox') else False
 
@@ -4020,7 +3569,7 @@ class TagMap3DTab(QWidget):
         scene = SceneGraph()
         _t_scene = time.perf_counter()
         scene.build_from_data(file_ids, positions, sub_tag_data, cluster_labels,
-                              min_size=min_size, max_size=max_size,
+                              node_size=node_size,
                               tokenized=bool(self.tag_interner), reverse_vocab=reverse_vocab)
         print(f"[Timing] Building sub-scene took {time.perf_counter() - _t_scene:.2f}s")
 
@@ -4069,8 +3618,7 @@ class TagMap3DTab(QWidget):
         import numpy as np
         from src.core.models import SceneGraph
 
-        min_size = float(self.min_size_spin.value())
-        max_size = float(self.max_size_spin.value())
+        node_size = float(self.min_size_spin.value()) / 10.0
 
         file_ids = [n.file_id for n in remaining_nodes]
         positions = np.array([n.position for n in remaining_nodes])
@@ -4087,8 +3635,7 @@ class TagMap3DTab(QWidget):
             positions,
             tag_data,
             cluster_labels,
-            min_size=min_size,
-            max_size=max_size,
+            node_size=node_size,
             tokenized=bool(self.tag_interner),
             reverse_vocab=reverse_vocab,
         )
@@ -4150,8 +3697,7 @@ class TagMap3DTab(QWidget):
 
         eps = self.eps_spin.value() / 100.0
         min_samples = self.min_samples_spin.value()
-        min_size = float(self.min_size_spin.value())
-        max_size = float(self.max_size_spin.value())
+        node_size = float(self.min_size_spin.value()) / 10.0
 
         # Use existing positions (no re-reduce)
         positions = np.array([node.position for node in cluster_nodes])
@@ -4222,8 +3768,7 @@ class TagMap3DTab(QWidget):
             all_positions,
             all_tag_data,
             np.array(all_labels),
-            min_size=min_size,
-            max_size=max_size,
+            node_size=node_size,
             tokenized=bool(self.tag_interner),
             reverse_vocab=reverse_vocab,
         )
@@ -4308,8 +3853,7 @@ class TagMap3DTab(QWidget):
 
         eps = self.eps_spin.value() / 100.0
         min_samples = self.min_samples_spin.value()
-        min_size = float(self.min_size_spin.value())
-        max_size = float(self.max_size_spin.value())
+        node_size = float(self.min_size_spin.value()) / 10.0
         spread = float(self.spread_spin.value())
 
         # Use existing positions for ALL nodes (no re-reduce)
@@ -4337,8 +3881,7 @@ class TagMap3DTab(QWidget):
             all_positions,
             all_tag_data,
             cluster_labels,
-            min_size=min_size,
-            max_size=max_size,
+            node_size=node_size,
             tokenized=bool(self.tag_interner),
             reverse_vocab=reverse_vocab,
         )
@@ -4411,8 +3954,7 @@ class TagMap3DTab(QWidget):
         min_samples_min = getattr(self, 'opt_min_samples_min', 2)
         min_samples_max = getattr(self, 'opt_min_samples_max', 30)
 
-        min_size = float(self.min_size_spin.value())
-        max_size = float(self.max_size_spin.value())
+        node_size = float(self.min_size_spin.value()) / 10.0
         spread = float(self.spread_spin.value())
 
         # Use existing positions for ALL nodes (no re-reduce)
@@ -4468,8 +4010,7 @@ class TagMap3DTab(QWidget):
             all_positions,
             all_tag_data,
             cluster_labels,
-            min_size=min_size,
-            max_size=max_size,
+            node_size=node_size,
             tokenized=bool(self.tag_interner),
             reverse_vocab=reverse_vocab,
         )
@@ -4552,8 +4093,7 @@ class TagMap3DTab(QWidget):
             "metric": self.metric_combo.currentText() if hasattr(self, 'metric_combo') else 'cosine',
             "eps": self.eps_spin.value() / 100.0,
             "min_samples": self.min_samples_spin.value(),
-            "min_size": float(self.min_size_spin.value()),
-            "max_size": float(self.max_size_spin.value()),
+            "node_size": float(self.min_size_spin.value()) / 10.0,
             "spread": float(self.spread_spin.value()),
             "min_doc_freq": self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3,
             "drop_universal_tags": self.drop_universal_checkbox.isChecked() if hasattr(self, 'drop_universal_checkbox') else False,
@@ -4739,8 +4279,8 @@ class TagMap3DTab(QWidget):
                 self.metric_combo.setCurrentIndex(metric_idx)
             self.eps_spin.setValue(settings_meta.get("eps", 0.5) * 100.0)
             self.min_samples_spin.setValue(settings_meta.get("min_samples", 10))
-            self.min_size_spin.setValue(settings_meta.get("min_size", 0.03))
-            self.max_size_spin.setValue(settings_meta.get("max_size", 0.08))
+            node_size_actual = settings_meta.get("node_size", settings_meta.get("min_size", 0.02))
+            self.min_size_spin.setValue(node_size_actual * 10.0)
             self.spread_spin.setValue(settings_meta.get("spread", 1.0))
             if hasattr(self, 'min_doc_freq_spin'):
                 self.min_doc_freq_spin.setValue(settings_meta.get("min_doc_freq", 3))
@@ -4817,7 +4357,6 @@ class TagMap3DTab(QWidget):
             self.node_list = list(scene.nodes.values())
             self._build_base_scatter()
             self._apply_highlight_colors(self._base_colors_rgba)
-            self._update_cohort_table()
             self._update_cohort_labels()
         else:
             self.render_scene(scene)
@@ -4851,10 +4390,6 @@ class TagMap3DTab(QWidget):
             # Clear existing scatter
             if self.gl_scatter:
                 self.gl_view.removeItem(self.gl_scatter)
-
-            # Remove old hulls and relationship lines when re-rendering
-            self._remove_cluster_hulls()
-            self._remove_relationship_lines()
 
             # Get data
             positions = scene.get_node_positions()
@@ -4912,19 +4447,8 @@ class TagMap3DTab(QWidget):
                 self._fit_camera_to_data(positions)
                 self._camera_initialized = True
 
-            # Update cohort table
-            self._update_cohort_table()
-
             # Ensure the 3D view has keyboard focus for F11 fullscreen toggle
             self.gl_view.setFocus()
-
-            # Re-apply cluster boundaries if enabled
-            if self.show_boundaries_checkbox.isChecked():
-                self._update_cluster_hulls()
-
-            # Re-apply relationship lines if enabled
-            if self.show_relationships_checkbox.isChecked():
-                self._update_relationship_lines()
 
             # Re-apply cohort labels if enabled
             if self.show_cohort_labels_checkbox.isChecked():
@@ -5109,9 +4633,8 @@ class TagMap3DTab(QWidget):
         """
         import numpy as np
         positions = np.array([node.position for node in self.node_list]) * float(self.spread_spin.value())
-        min_size = self.min_size_spin.value()
-        max_size = self.max_size_spin.value()
-        sizes = np.array([max(min_size, min(max_size, len(node.tags) * 0.015)) for node in self.node_list])
+        node_size = self.min_size_spin.value() / 10.0
+        sizes = np.full(len(self.node_list), node_size)
         colors = np.array([node.color for node in self.node_list]) / 255.0
         alpha = self.transparency_spin.value()
         colors_rgba = np.column_stack([colors, alpha * np.ones(len(colors))])
@@ -5760,12 +5283,11 @@ class TagMap3DTab(QWidget):
         if self.gl_scatter and hasattr(self, 'node_list') and self.node_list:
             import numpy as np
             import pyqtgraph.opengl as gl
-            min_size = self.min_size_spin.value()
-            max_size = self.max_size_spin.value()
+            node_size = self.min_size_spin.value() / 10.0
             alpha = self.transparency_spin.value()
             
-            # Recalculate sizes based on tag counts
-            sizes = np.array([max(min_size, min(max_size, len(node.tags) * 0.015)) for node in self.node_list])
+            # Uniform node size
+            sizes = np.full(len(self.node_list), node_size)
             
             # Remove old scatter and create new one with updated sizes
             self.gl_view.removeItem(self.gl_scatter)
@@ -5796,13 +5318,12 @@ class TagMap3DTab(QWidget):
             import numpy as np
             import pyqtgraph.opengl as gl
             spread = float(self.spread_spin.value())
-            min_size = self.min_size_spin.value()
-            max_size = self.max_size_spin.value()
+            node_size = self.min_size_spin.value() / 10.0
             alpha = self.transparency_spin.value()
             
             # Recalculate positions with spread
             positions = np.array([node.position for node in self.node_list]) * spread
-            sizes = np.array([max(min_size, min(max_size, len(node.tags) * 0.015)) for node in self.node_list])
+            sizes = np.full(len(self.node_list), node_size)
             colors = np.array([node.color for node in self.node_list]) / 255.0
             colors_rgba = np.column_stack([colors, alpha * np.ones(len(colors))])
             
@@ -5821,10 +5342,6 @@ class TagMap3DTab(QWidget):
             self.gl_view.addItem(self.gl_scatter)
             self._build_base_scatter()
 
-            # Re-apply relationship lines if visible (positions depend on spread)
-            if self.show_relationships_checkbox.isChecked():
-                self._update_relationship_lines()
-
         # Re-apply selection style if a selection is active
         self._reapply_selection_style()
 
@@ -5834,13 +5351,12 @@ class TagMap3DTab(QWidget):
             import numpy as np
             import pyqtgraph.opengl as gl
             spread = float(self.spread_spin.value())
-            min_size = self.min_size_spin.value()
-            max_size = self.max_size_spin.value()
+            node_size = self.min_size_spin.value() / 10.0
             alpha = self.transparency_spin.value()
             
             # Recalculate positions with spread
             positions = np.array([node.position for node in self.node_list]) * spread
-            sizes = np.array([max(min_size, min(max_size, len(node.tags) * 0.015)) for node in self.node_list])
+            sizes = np.full(len(self.node_list), node_size)
             colors = np.array([node.color for node in self.node_list]) / 255.0
             colors_rgba = np.column_stack([colors, alpha * np.ones(len(colors))])
             
@@ -5872,99 +5388,6 @@ class TagMap3DTab(QWidget):
             self.wobble_timer.stop()
             print("Camera wobble disabled")
 
-    def _on_trail_toggle(self, state):
-        """Handle trail enable/disable toggle."""
-        from PySide6.QtCore import Qt
-        enabled = state == Qt.CheckState.Checked.value
-        self.trail_active = enabled
-        # Enable/disable trail parameter spins
-        self.trail_length_spin.setEnabled(enabled)
-        self.trail_decay_spin.setEnabled(enabled)
-        self.trail_max_nodes_spin.setEnabled(enabled)
-        if enabled:
-            self.trail_history = []
-            self._ensure_trail_scatter()
-        else:
-            self._clear_trails()
-        print(f"Trails {'enabled' if enabled else 'disabled'}")
-
-    def _ensure_trail_scatter(self):
-        """Create the trail scatter item if it doesn't exist."""
-        import pyqtgraph.opengl as gl
-        if self.trail_scatter is None and hasattr(self, 'gl_view'):
-            self.trail_scatter = gl.GLScatterPlotItem()
-            self.trail_scatter.setGLOptions('translucent')
-            self.gl_view.addItem(self.trail_scatter)
-
-    def _clear_trails(self):
-        """Remove trail scatter and reset history."""
-        import numpy as np
-        self.trail_history = []
-        if self.trail_scatter is not None:
-            self.trail_scatter.setData(pos=np.zeros((0, 3)))
-            self.trail_scatter.setVisible(False)
-
-    def _update_trails(self):
-        """Capture the camera position and render a fading trail of its path.
-
-        The nodes themselves are static; it is the CAMERA that moves during
-        wobble. So the trail traces the camera's position over time, giving a
-        visible path of the wobble motion.
-        """
-        import numpy as np
-        if not self.trail_active or not hasattr(self, 'gl_view'):
-            return
-        self._ensure_trail_scatter()
-        if self.trail_scatter is None:
-            return
-
-        trail_len = self.trail_length_spin.value()
-        decay = self.trail_decay_spin.value()
-
-        # Capture the current camera position (center + distance/elevation/azimuth)
-        center = self.gl_view.opts.get('center', np.array([0.0, 0.0, 0.0]))
-        distance = float(self.gl_view.opts.get('distance', 200))
-        elevation = float(self.gl_view.opts.get('elevation', 30))
-        azimuth = float(self.gl_view.opts.get('azimuth', 45))
-
-        # Convert spherical camera params to a 3D position
-        import math
-        elev_rad = math.radians(elevation)
-        azim_rad = math.radians(azimuth)
-        cam_pos = np.array([
-            float(center[0]) + distance * math.cos(elev_rad) * math.cos(azim_rad),
-            float(center[1]) + distance * math.cos(elev_rad) * math.sin(azim_rad),
-            float(center[2]) + distance * math.sin(elev_rad),
-        ])
-
-        # Ring buffer of recent camera positions
-        self.trail_history.append(cam_pos)
-        if len(self.trail_history) > trail_len:
-            self.trail_history.pop(0)
-
-        # Build trail points with decaying alpha
-        all_pos = []
-        all_color = []
-        all_size = []
-        n_hist = len(self.trail_history)
-        for k, hist_pos in enumerate(self.trail_history):
-            alpha = decay ** (n_hist - 1 - k)
-            if alpha < 0.05:
-                continue
-            all_pos.append(hist_pos)
-            all_color.append((1.0, 1.0, 1.0, alpha))
-            all_size.append(2.0)
-
-        if all_pos:
-            self.trail_scatter.setData(
-                pos=np.array(all_pos),
-                color=np.array(all_color),
-                size=np.array(all_size),
-            )
-            self.trail_scatter.setVisible(True)
-        else:
-            self.trail_scatter.setVisible(False)
-
     def _update_wobble(self):
         """Update camera position for wobble effect."""
         import numpy as np
@@ -5976,9 +5399,6 @@ class TagMap3DTab(QWidget):
         
         # Get wobble parameters
         speed = self.wobble_speed_spin.value()
-        x_range = self.wobble_x_range_spin.value()
-        y_range = self.wobble_y_range_spin.value()
-        z_range = self.wobble_z_range_spin.value()
         azim_range = self.wobble_azim_range_spin.value()
         elev_range = self.wobble_elev_range_spin.value()
         
@@ -5986,30 +5406,28 @@ class TagMap3DTab(QWidget):
         t = self.wobble_time * speed
         
         # Get current camera state
-        current_center = self.gl_view.opts.get('center', np.array([0, 0, 0]))
-        current_distance = self.gl_view.opts.get('distance', 200)
         current_elevation = self.gl_view.opts.get('elevation', 30)
         current_azimuth = self.gl_view.opts.get('azimuth', 45)
         
-        # Apply wobble offsets
-        new_distance = current_distance + np.sin(t * 1.3) * z_range
+        # Apply wobble offsets (azimuth + elevation rotation for parallax depth)
         new_elevation = current_elevation + np.sin(t * 0.7) * elev_range
         new_azimuth = current_azimuth + np.sin(t * 0.5) * azim_range
-        
+
         # Update camera position
-        self.gl_view.opts['distance'] = new_distance
         self.gl_view.opts['elevation'] = new_elevation
         self.gl_view.opts['azimuth'] = new_azimuth
         self.gl_view.update()
-
-        # Render trails if enabled
-        self._update_trails()
 
     def keyPressEvent(self, event):
         """Handle key press events for fullscreen toggle and shortcuts."""
         # Ctrl+E: send selected cohort to Hydrus tab
         if event.key() == Qt.Key_E and event.modifiers() & Qt.ControlModifier:
             self.send_selected_to_tab()
+            event.accept()
+            return
+        # Ctrl+R: pop selected cohort
+        if event.key() == Qt.Key_R and event.modifiers() & Qt.ControlModifier:
+            self._pop_selected_cohort()
             event.accept()
             return
         if event.key() == Qt.Key_F11:
@@ -6093,13 +5511,12 @@ class TagMap3DTab(QWidget):
         import pyqtgraph.opengl as gl
 
         spread = float(self.spread_spin.value())
-        min_size = self.min_size_spin.value()
-        max_size = self.max_size_spin.value()
+        node_size = self.min_size_spin.value() / 10.0
         alpha = self.transparency_spin.value()
 
         # Recalculate positions
         positions = np.array([node.position for node in self.node_list]) * spread
-        sizes = np.array([max(min_size, min(max_size, len(node.tags) * 0.015)) for node in self.node_list])
+        sizes = np.full(len(self.node_list), node_size)
 
         # Generate new colors based on scheme
         colors = []
@@ -6128,400 +5545,6 @@ class TagMap3DTab(QWidget):
             pass
         self.gl_view.addItem(self.gl_scatter)
         self._build_base_scatter()
-
-        # Update hull colors if visible
-        if self.show_boundaries_checkbox.isChecked():
-            self._update_cluster_hulls()
-
-        # Update relationship line colors if visible
-        if self.show_relationships_checkbox.isChecked():
-            self._update_relationship_lines()
-
-    # Cluster Boundary Meshes (Convex Hulls)
-
-    def _on_boundaries_toggle(self, state):
-        """Handle cluster boundaries checkbox toggle."""
-        from PySide6.QtCore import Qt
-        if state == Qt.CheckState.Checked.value:
-            self._update_cluster_hulls()
-            print("Cluster boundaries enabled")
-        else:
-            self._remove_cluster_hulls()
-            print("Cluster boundaries disabled")
-
-    def _on_boundary_alpha_changed(self):
-        """Handle boundary opacity changes - rebuild hulls."""
-        if self.show_boundaries_checkbox.isChecked():
-            self._update_cluster_hulls()
-
-    def _update_cluster_hulls(self):
-        """Create convex hull meshes around clusters with 10+ nodes."""
-        # Remove existing hulls first
-        self._remove_cluster_hulls()
-
-        if not hasattr(self, 'node_list') or not self.node_list:
-            return
-
-        try:
-            import pyqtgraph.opengl as gl
-            import numpy as np
-            from scipy.spatial import ConvexHull
-            from collections import defaultdict
-
-            # Group nodes by cluster
-            cluster_nodes = defaultdict(list)
-            for node in self.node_list:
-                if node.cluster_id != -1:  # Skip noise
-                    cluster_nodes[node.cluster_id].append(node)
-
-            spread = float(self.spread_spin.value())
-
-            for cluster_id, nodes in cluster_nodes.items():
-                if len(nodes) < 10:
-                    continue  # Skip small clusters
-
-                # Get 3D positions
-                positions = np.array([n.position for n in nodes]) * spread
-
-                # Compute convex hull
-                hull = ConvexHull(positions)
-
-                # Get cluster color
-                cluster_ids = set(n.cluster_id for n in self.node_list)
-                total_clusters = len(cluster_ids) if cluster_ids else 1
-                color = self._get_color_for_cluster(cluster_id, total_clusters)
-                color_normalized = np.array(color) / 255.0
-
-                # Create mesh from hull vertices and simplices
-                vertices = positions[hull.vertices]
-                faces = hull.simplices
-
-                # Create mesh item with configurable opacity
-                boundary_alpha = self.boundary_alpha_spin.value() if hasattr(self, 'boundary_alpha_spin') else 0.15
-                mesh = gl.GLMeshItem(
-                    vertexes=vertices,
-                    faces=faces,
-                    color=(*color_normalized, boundary_alpha),  # R, G, B, A
-                    shader="color",
-                    renderMode="solid"
-                )
-                self.gl_view.addItem(mesh)
-                self.cluster_hull_meshes.append(mesh)
-
-            print(f"Created {len(self.cluster_hull_meshes)} cluster hull meshes")
-        except ImportError as e:
-            print(f"Error updating cluster hulls (missing dependency): {e}")
-        except Exception as e:
-            print(f"Error updating cluster hulls: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def _remove_cluster_hulls(self):
-        """Remove all cluster hull meshes from the view."""
-        for mesh in self.cluster_hull_meshes:
-            try:
-                self.gl_view.removeItem(mesh)
-            except Exception:
-                pass
-        self.cluster_hull_meshes = []
-
-    # V7: Relationship Lines between related clusters
-
-    def _on_relationships_toggle(self, state):
-        """Handle relationship lines checkbox toggle."""
-        from PySide6.QtCore import Qt
-        if state == Qt.CheckState.Checked.value:
-            self.relationship_metric_combo.setEnabled(True)
-            self.relationship_min_sim_spin.setEnabled(True)
-            self.relationship_max_spin.setEnabled(True)
-            self.relationship_alpha_spin.setEnabled(True)
-            self.relationship_width_spin.setEnabled(True)
-            self.relationship_color_btn.setEnabled(True)
-            self._update_relationship_lines()
-            print("Relationship lines enabled")
-        else:
-            self.relationship_metric_combo.setEnabled(False)
-            self.relationship_min_sim_spin.setEnabled(False)
-            self.relationship_max_spin.setEnabled(False)
-            self.relationship_alpha_spin.setEnabled(False)
-            self.relationship_width_spin.setEnabled(False)
-            self.relationship_color_btn.setEnabled(False)
-            self._remove_relationship_lines()
-            print("Relationship lines disabled")
-
-    def _pick_relationship_color(self):
-        """Open color picker for relationship lines."""
-        from PySide6.QtWidgets import QColorDialog
-        from PySide6.QtGui import QColor
-        color = QColorDialog.getColor(
-            QColor(*self._relationship_color),
-            self,
-            "Select Relationship Line Color",
-        )
-        if color.isValid():
-            self._relationship_color = (color.red(), color.green(), color.blue())
-            self._update_relationship_color_button()
-            if self.show_relationships_checkbox.isChecked():
-                self._update_relationship_lines()
-
-    def _update_relationship_color_button(self):
-        """Update the relationship line color button background."""
-        r, g, b = self._relationship_color
-        self.relationship_color_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: rgb({r}, {g}, {b});
-                border: 1px solid {BLUE_60};
-                border-radius: 3px;
-            }}
-        """)
-
-    def _on_relationship_metric_changed(self):
-        """Handle metric combo change - rebuild lines with new metric."""
-        if self.show_relationships_checkbox.isChecked():
-            self._update_relationship_lines()
-
-    def _on_relationship_params_changed(self):
-        """Handle threshold/max/opacity changes - rebuild lines."""
-        if self.show_relationships_checkbox.isChecked():
-            self._update_relationship_lines()
-
-    def _on_relationship_labels_toggle(self, state):
-        """Handle relationship labels checkbox toggle."""
-        from PySide6.QtCore import Qt
-        if state == Qt.CheckState.Checked.value and self.show_relationships_checkbox.isChecked():
-            self._update_relationship_lines()
-        else:
-            self._remove_relationship_labels()
-
-    def _compute_cluster_relationships(self):
-        """Compute related cluster pairs with a similarity score.
-
-        Returns:
-            List of (cid1, cid2, score, shared_tag_strings) sorted by
-            score descending. Score is in [0, 1] for both metrics.
-        """
-        import numpy as np
-        from collections import Counter
-
-        if not hasattr(self, 'node_list') or not self.node_list:
-            return []
-
-        # Group nodes by cluster, collecting tag counts and positions
-        cluster_data = {}  # cluster_id -> {'positions': [...], 'tag_counts': Counter}
-        for node in self.node_list:
-            if node.cluster_id == -1:
-                continue
-            if node.cluster_id not in cluster_data:
-                cluster_data[node.cluster_id] = {'positions': [], 'tag_counts': Counter()}
-            cluster_data[node.cluster_id]['positions'].append(node.position)
-            if self.tag_interner:
-                cluster_data[node.cluster_id]['tag_counts'].update(
-                    self.tag_interner.strings_to_list(node.tags)
-                )
-            else:
-                cluster_data[node.cluster_id]['tag_counts'].update(node.tags)
-
-        if len(cluster_data) < 2:
-            return []
-
-        # Document frequency: how many clusters contain each tag
-        n_clusters = len(cluster_data)
-        tag_df = Counter()
-        for data in cluster_data.values():
-            for tag in data['tag_counts']:
-                tag_df[tag] += 1
-
-        # Build one IDF-weighted vector per cluster (mean of member tag counts)
-        metric = self.relationship_metric_combo.currentText()
-        centroids = {}
-        cluster_vectors = {}
-        for cid, data in cluster_data.items():
-            centroids[cid] = np.mean(data['positions'], axis=0)
-            if metric == "IDF Cosine":
-                # IDF-weighted vector: weight = log(1 + N/df)
-                vec = {}
-                for tag, count in data['tag_counts'].items():
-                    idf = np.log(1.0 + n_clusters / tag_df[tag])
-                    vec[tag] = count * idf
-                cluster_vectors[cid] = vec
-            else:
-                # Raw count vector (shared-tag-count metric)
-                cluster_vectors[cid] = dict(data['tag_counts'])
-
-        # Pairwise similarity
-        cluster_ids = list(centroids.keys())
-        related_pairs = []
-        for i in range(len(cluster_ids)):
-            for j in range(i + 1, len(cluster_ids)):
-                cid1, cid2 = cluster_ids[i], cluster_ids[j]
-                v1, v2 = cluster_vectors[cid1], cluster_vectors[cid2]
-                shared = set(v1.keys()) & set(v2.keys())
-                if not shared:
-                    continue
-                if metric == "IDF Cosine":
-                    dot = sum(v1[t] * v2[t] for t in shared)
-                    norm1 = np.sqrt(sum(w * w for w in v1.values()))
-                    norm2 = np.sqrt(sum(w * w for w in v2.values()))
-                    score = dot / (norm1 * norm2) if norm1 > 0 and norm2 > 0 else 0.0
-                else:
-                    # Normalize raw shared count to [0, 1] via Jaccard-like
-                    # overlap coefficient: |A ∩ B| / min(|A|, |B|)
-                    score = len(shared) / min(len(v1), len(v2))
-                # Top shared tags by combined weight (for labels)
-                top_shared = sorted(
-                    shared, key=lambda t: v1[t] + v2[t], reverse=True
-                )[:3]
-                related_pairs.append((cid1, cid2, score, top_shared))
-
-        related_pairs.sort(key=lambda x: x[2], reverse=True)
-        return related_pairs
-
-    def _update_relationship_lines(self):
-        """Draw lines between related clusters (static, strength-encoded)."""
-        # Remove existing lines and labels first
-        self._remove_relationship_lines()
-
-        if not hasattr(self, 'gl_view') or self.gl_view is None:
-            return
-        if not hasattr(self, 'node_list') or not self.node_list:
-            return
-
-        try:
-            import pyqtgraph.opengl as gl
-            import numpy as np
-
-            pairs = self._compute_cluster_relationships()
-            if not pairs:
-                print("No related clusters found")
-                return
-
-            # Apply threshold and max-lines limit
-            min_sim = float(self.relationship_min_sim_spin.value())
-            max_lines = int(self.relationship_max_spin.value())
-            base_alpha = float(self.relationship_alpha_spin.value())
-            line_width = int(self.relationship_width_spin.value())
-            rel_r, rel_g, rel_b = self._relationship_color
-            pairs = [p for p in pairs if p[2] >= min_sim][:max_lines]
-            if not pairs:
-                print(f"No cluster pairs above similarity threshold {min_sim}")
-                return
-
-            spread = float(self.spread_spin.value())
-
-            # Precompute centroids once (avoids O(pairs x nodes) rescans)
-            cluster_positions = {}
-            for n in self.node_list:
-                if n.cluster_id != -1:
-                    cluster_positions.setdefault(n.cluster_id, []).append(n.position)
-            centroids = {
-                cid: np.mean(positions, axis=0) * spread
-                for cid, positions in cluster_positions.items()
-            }
-
-            # Normalize scores to [0, 1] within the visible set for opacity mapping
-            scores = np.array([p[2] for p in pairs])
-            s_min, s_max = scores.min(), scores.max()
-            s_range = (s_max - s_min) if s_max > s_min else 1.0
-
-            self.relationship_pairs = []
-            for cid1, cid2, score, top_shared in pairs:
-                pos1 = centroids[cid1]
-                pos2 = centroids[cid2]
-
-                # Opacity encodes relative strength: 0.3x..1.0x of base alpha
-                t = (score - s_min) / s_range
-                alpha = base_alpha * (0.3 + 0.7 * t)
-
-                # Color: user-selected relationship line color
-                color = [rel_r / 255.0, rel_g / 255.0, rel_b / 255.0, alpha]
-
-                line = gl.GLLinePlotItem(
-                    pen=gl.mkPen(color=color, width=line_width),
-                    pos=np.array([pos1, pos2]),
-                )
-                self.gl_view.addItem(line)
-                self.relationship_line_items.append(line)
-                self.relationship_pairs.append((cid1, cid2, score, top_shared))
-
-            print(f"Drawn {len(self.relationship_line_items)} relationship lines")
-
-            # Labels (separate toggle)
-            if self.show_relationship_labels_checkbox.isChecked():
-                self._update_relationship_labels()
-
-        except Exception as e:
-            print(f"Error updating relationship lines: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def _update_relationship_labels(self):
-        """Show a label at the midpoint of each relationship line."""
-        self._remove_relationship_labels()
-
-        if not self.relationship_pairs:
-            return
-
-        try:
-            import pyqtgraph.opengl as gl
-            import numpy as np
-            from PySide6.QtGui import QFont
-
-            spread = float(self.spread_spin.value())
-            font = QFont("Helvetica", 11)
-
-            # Precompute centroids once (avoids O(pairs x nodes) rescans)
-            cluster_positions = {}
-            for n in self.node_list:
-                if n.cluster_id != -1:
-                    cluster_positions.setdefault(n.cluster_id, []).append(n.position)
-            centroids = {
-                cid: np.mean(positions, axis=0) * spread
-                for cid, positions in cluster_positions.items()
-            }
-
-            for cid1, cid2, score, top_shared in self.relationship_pairs:
-                pos1 = centroids[cid1]
-                pos2 = centroids[cid2]
-                midpoint = (pos1 + pos2) / 2.0
-
-                # Label: top shared tags + score
-                tag_text = ", ".join(top_shared[:3]) if top_shared else ""
-                text = f"{tag_text} ({score:.2f})" if tag_text else f"{score:.2f}"
-
-                label_item = gl.GLTextItem(
-                    pos=midpoint,
-                    text=text,
-                    color=(255, 255, 255, 220),
-                    font=font,
-                    alignment=Qt.AlignHCenter | Qt.AlignVCenter,
-                )
-                self.gl_view.addItem(label_item)
-                self.relationship_label_items.append(label_item)
-
-        except Exception as e:
-            print(f"Error updating relationship labels: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def _remove_relationship_labels(self):
-        """Remove all relationship label items from the view."""
-        for item in self.relationship_label_items:
-            try:
-                self.gl_view.removeItem(item)
-            except Exception:
-                pass
-        self.relationship_label_items = []
-
-    def _remove_relationship_lines(self):
-        """Remove all relationship lines and labels from the view."""
-        self._remove_relationship_labels()
-        for item in self.relationship_line_items:
-            try:
-                self.gl_view.removeItem(item)
-            except Exception:
-                pass
-        self.relationship_line_items = []
-        self.relationship_pairs = []
 
     # Remember Last Session
     def _load_last_data(self):
@@ -6624,7 +5647,7 @@ class TagMap3DTab(QWidget):
                     cluster_data[node.cluster_id].append(node)
 
             if len(cluster_data) < 2:
-                self.status_label.setText("Need at least 2 clusters for Time Travel")
+                self.status_label.setText("Need at least 2 clusters for Explore")
                 return
 
             # Calculate centroids and sort by cluster size (largest first)
@@ -6656,15 +5679,21 @@ class TagMap3DTab(QWidget):
             self.time_travel_frames = 0
             self.time_travel_mode = "dwell"
 
+            # Zoom in: reduce camera distance so clusters are visible
+            self.gl_view.opts['distance'] = 50.0
+
+            # Scale orbit radius to be visible at the new distance
+            self.time_travel_orbit_radius = 15.0
+
             # Update button
             self.time_travel_button.setText("Stop")
-            self.time_travel_button.setToolTip("Stop the Time Travel animation.")
+            self.time_travel_button.setToolTip("Stop the Explore animation.")
 
             # Start timer at ~30fps
             self.time_travel_timer.start(33)
 
             # Show initial cluster name
-            self.status_label.setText(f"Time Travel: {self.time_travel_waypoints[0][1]}")
+            self.status_label.setText(f"Explore: {self.time_travel_waypoints[0][1]}")
 
             # Set initial camera position
             self._set_camera_to_waypoint(self.time_travel_waypoints[0][0], 1.0)
@@ -6676,12 +5705,16 @@ class TagMap3DTab(QWidget):
             self._stop_time_travel()
 
     def _stop_time_travel(self):
-        """Stop time travel animation and restore button."""
+        """Stop explore animation and restore button + camera distance."""
         self.time_travel_active = False
         self.time_travel_timer.stop()
-        self.time_travel_button.setText("Time Travel")
+        self.time_travel_button.setText("Explore")
         self.time_travel_button.setToolTip("Animate camera flying through cluster centroids.")
-        self.status_label.setText("Time Travel stopped")
+        # Restore camera distance
+        if hasattr(self, 'gl_view') and self.gl_view:
+            self.gl_view.opts['distance'] = 200.0
+            self.gl_view.update()
+        self.status_label.setText("Explore stopped")
 
     def _update_time_travel(self):
         """Called at ~30fps to update camera position for time travel."""
@@ -6735,7 +5768,7 @@ class TagMap3DTab(QWidget):
                 self.time_travel_orbit_center = self.time_travel_waypoints[self.time_travel_current_index][0]
 
                 # Update status
-                self.status_label.setText(f"Time Travel: {self.time_travel_waypoints[self.time_travel_current_index][1]}")
+                self.status_label.setText(f"Explore: {self.time_travel_waypoints[self.time_travel_current_index][1]}")
 
                 # Set camera to reached waypoint
                 self._set_camera_to_waypoint(self.time_travel_waypoints[self.time_travel_current_index][0], 1.0)

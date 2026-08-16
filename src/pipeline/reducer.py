@@ -47,21 +47,18 @@ class Reducer:
 
         Returns:
             np.ndarray: 3D coordinates of shape (n_samples, n_components)
+
+        Raises:
+            Exception: If the reduction algorithm fails (no silent fallback).
         """
-        try:
-            if self.algorithm == 'umap':
-                return self._umap_transform(sparse_matrix)
-            elif self.algorithm == 'gpu':
-                return self._gpu_umap_transform(sparse_matrix)
-            elif self.algorithm == 'pca':
-                return self._pca_transform(sparse_matrix)
-            else:
-                print(f"Unknown algorithm {self.algorithm}, falling back to PCA")
-                return self._pca_transform(sparse_matrix)
-        except Exception as e:
-            print(f"Error in {self.algorithm}: {e}")
-            print("Falling back to PCA...")
+        if self.algorithm == 'umap':
+            return self._umap_transform(sparse_matrix)
+        elif self.algorithm == 'gpu':
+            return self._gpu_umap_transform(sparse_matrix)
+        elif self.algorithm == 'pca':
             return self._pca_transform(sparse_matrix)
+        else:
+            raise ValueError(f"Unknown algorithm: {self.algorithm}")
 
     def _umap_transform(self, sparse_matrix):
         """Apply UMAP dimensionality reduction.
@@ -71,38 +68,38 @@ class Reducer:
 
         Returns:
             np.ndarray: 3D coordinates
+
+        Raises:
+            ImportError: If umap-learn is not installed.
+            Exception: If UMAP fails (e.g., memory allocation error).
         """
         try:
             import umap
-            
-            print(f"Applying UMAP (n_neighbors={self.n_neighbors}, min_dist={self.min_dist}, "
-                  f"n_epochs={self.n_epochs}, learning_rate={self.learning_rate}, low_memory={self.low_memory}, "
-                  f"metric={self.metric})...")
-            
-            reducer = umap.UMAP(
-                n_components=self.n_components,
-                n_neighbors=self.n_neighbors,
-                min_dist=self.min_dist,
-                n_epochs=self.n_epochs,
-                low_memory=self.low_memory,
-                learning_rate=self.learning_rate,
-                metric=self.metric,
-                n_jobs=self.n_jobs,  # CPU parallelism (no random_state for parallel NN-descent)
-                verbose=True
-            )
-            
-            # UMAP can work directly with sparse matrices
-            positions = reducer.fit_transform(sparse_matrix)
-            self.model = reducer
-            
-            print(f"UMAP reduction complete: {positions.shape}")
-            return positions
         except ImportError:
-            print("UMAP not installed, falling back to PCA")
-            return self._pca_transform(sparse_matrix)
-        except Exception as e:
-            print(f"UMAP failed: {e}")
-            return self._pca_transform(sparse_matrix)
+            raise ImportError("UMAP is not installed. Install with: pip install umap-learn")
+
+        print(f"Applying UMAP (n_neighbors={self.n_neighbors}, min_dist={self.min_dist}, "
+              f"n_epochs={self.n_epochs}, learning_rate={self.learning_rate}, low_memory={self.low_memory}, "
+              f"metric={self.metric})...")
+
+        reducer = umap.UMAP(
+            n_components=self.n_components,
+            n_neighbors=self.n_neighbors,
+            min_dist=self.min_dist,
+            n_epochs=self.n_epochs,
+            low_memory=self.low_memory,
+            learning_rate=self.learning_rate,
+            metric=self.metric,
+            n_jobs=self.n_jobs,  # CPU parallelism (no random_state for parallel NN-descent)
+            verbose=False
+        )
+
+        # UMAP can work directly with sparse matrices
+        positions = reducer.fit_transform(sparse_matrix)
+        self.model = reducer
+
+        print(f"UMAP reduction complete: {positions.shape}")
+        return positions
 
     def _gpu_umap_transform(self, sparse_matrix):
         """Apply GPU-accelerated UMAP via cuvs (RAPIDS).
@@ -138,7 +135,7 @@ class Reducer:
                 n_epochs=self.n_epochs,
                 metric=self.metric,
                 random_state=42,
-                verbose=True
+                verbose=False
             )
             positions = reducer.fit_transform(gpu_data)
             self.model = reducer

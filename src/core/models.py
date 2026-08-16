@@ -84,7 +84,7 @@ class SceneGraph:
         self.clusters[cluster.cluster_id] = cluster
 
     def build_from_data(self, file_ids, positions, tag_data, cluster_labels,
-                        top_n_dominant_tags=5, min_size=0.3, max_size=0.8,
+                        top_n_dominant_tags=5, node_size=0.02,
                         tokenized=False, reverse_vocab=None):
         """Build the complete scene graph from processed data.
 
@@ -95,8 +95,7 @@ class SceneGraph:
                 (strings, or integer indices when tokenized=True)
             cluster_labels: np.ndarray of cluster labels
             top_n_dominant_tags: Number of dominant tags per cluster
-            min_size: Minimum node size
-            max_size: Maximum node size
+            node_size: Uniform node size for all nodes
             tokenized: Whether tag_data values are integer indices (default: False)
             reverse_vocab: List mapping index -> tag string, used only when
                 tokenized=True (e.g. from a TagInterner)
@@ -118,8 +117,8 @@ class SceneGraph:
             else:
                 score = sum(ExternalTagScores.get(tag, 0) for tag in tags)
             
-            # Size based on tag count (normalized to configurable range)
-            size = max(min_size, min(max_size, len(tags) * 0.15))
+            # Uniform node size
+            size = node_size
             
             # Color based on cluster
             if cluster_id == -1:

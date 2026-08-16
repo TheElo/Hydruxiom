@@ -17,3 +17,6 @@ matplotlib>=3.7.0
 # Hydrus integration
 hydrus-api==4.0.0
 requests>=2.31.0
+
+# Benchmarking (optional, used by benchmarks/benchmark_umap_cores.py)
+psutil>=5.9.0

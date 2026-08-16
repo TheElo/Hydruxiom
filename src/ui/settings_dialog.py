@@ -33,6 +33,7 @@ class TagMap3DSettingsDialog(QDialog):
         self.n_jobs = getattr(self.tab, 'n_jobs', os.cpu_count() or 4)
         self.use_direct_db = getattr(self.tab, 'use_direct_db', False)
         self.client_db_paths = dict(getattr(self.tab, 'client_db_paths', {}))
+        self.tokenize = getattr(self.tab, 'tokenize', True)
 
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(10, 10, 10, 10)
@@ -56,6 +57,17 @@ class TagMap3DSettingsDialog(QDialog):
             "Number of CPU cores to use for UMAP parallel NN-descent.\nHigher = faster but uses more CPU.\nDefault: all cores."
         )
         perf_layout.addRow("CPU Cores:", self.n_jobs_spin)
+
+        self.tokenize_checkbox = QCheckBox("Tokenize tags")
+        self.tokenize_checkbox.setChecked(self.tokenize)
+        self.tokenize_checkbox.setToolTip(
+            "When enabled, tags are converted to integer indices once at load\n"
+            "time and carried through the pipeline as integers. This reduces RAM\n"
+            "(no per-node string copies) and replaces repeated string hashing with\n"
+            "integer lookups. Strings are only materialised for display.\n"
+            "Default: ON."
+        )
+        perf_layout.addRow(self.tokenize_checkbox)
 
         perf_group.setLayout(perf_layout)
         main_layout.addWidget(perf_group)
@@ -197,6 +209,7 @@ class TagMap3DSettingsDialog(QDialog):
         tab.low_memory = self.low_memory_checkbox.isChecked()
         tab.n_jobs = self.n_jobs_spin.value()
         tab.use_direct_db = self.direct_db_checkbox.isChecked()
+        tab.tokenize = self.tokenize_checkbox.isChecked()
 
         # DBSCAN optimizer parameters
         tab.normalize_positions = self.normalize_checkbox.isChecked()
