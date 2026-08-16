@@ -222,6 +222,39 @@ class SceneGraph:
         """
         return [node for node in self.nodes.values() if node.cluster_id == cluster_id]
 
+    def without_cluster(self, cluster_id):
+        """Return a new SceneGraph with all nodes of `cluster_id` removed.
+
+        Fast path for "pop cohort": reuses the existing TagNode and Cluster
+        objects directly (no recreation, no tag-list copying, no cluster
+        recomputation). Removing one cohort does not affect any other cohort's
+        positions, colors, dominant tags, or density, so those are carried over
+        as-is.
+
+        Args:
+            cluster_id: The cluster to remove.
+
+        Returns:
+            SceneGraph: A new scene graph without the given cluster's nodes.
+        """
+        new = SceneGraph()
+        new.tokenized = self.tokenized
+        new.reverse_vocab = self.reverse_vocab
+        new.camera_position = self.camera_position.copy()
+        new.camera_target = self.camera_target.copy()
+
+        # Reuse node objects (skip only the popped cluster's nodes)
+        for fid, node in self.nodes.items():
+            if node.cluster_id != cluster_id:
+                new.nodes[fid] = node
+
+        # Reuse cluster objects (they reference the same surviving nodes)
+        for cid, cluster in self.clusters.items():
+            if cid != cluster_id:
+                new.clusters[cid] = cluster
+
+        return new
+
     def get_node_positions(self):
         """Get all node positions as a numpy array.
 

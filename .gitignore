@@ -43,9 +43,11 @@ desktop.ini
 *.log
 sessions/
 *.npz
+screenshots/
 
 # Sensitive: contains Hydrus API keys + local paths
 clients.json
+clients.json.bak
 
 # Runtime state / user-specific settings (contain client names, queries, local paths)
 3d_tag_map_settings.json

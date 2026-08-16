@@ -8,15 +8,20 @@ import os
 import tempfile
 import time
 
+import numpy as np
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSpinBox, QComboBox, QProgressBar, QGroupBox, QFormLayout,
     QTextEdit, QSplitter, QScrollArea, QLineEdit, QDoubleSpinBox, QCheckBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QGridLayout, QFileDialog
+    QTableWidget, QTableWidgetItem, QHeaderView, QGridLayout, QFileDialog, QTabWidget
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent
 from PySide6.QtGui import QCloseEvent, QMouseEvent, QVector3D, QFont
-from src.ui.styles import GRAY_40, GRAY_33, RED_A, BLUE_60
+from src.ui.styles import (
+    GRAY_40, GRAY_33, RED_A, BLUE_60,
+    TAB_BACKGROUND, TAB_TEXT, TAB_SELECTED, TAB_BORDER,
+)
 
 
 class ClickableTag(QLabel):
@@ -134,7 +139,7 @@ class ClickableTag(QLabel):
             """)
 
 class TagMap3DSplitWindow(QWidget):
-    """Separate window syncing image previews to the 3D tag map.
+    """Media Viewer: separate window syncing image previews to the 3D tag map.
 
     Display modes based on selection state:
     - Single file selected: shows that file
@@ -145,7 +150,7 @@ class TagMap3DSplitWindow(QWidget):
     def __init__(self, parent_tab):
         super().__init__()
         self.parent_tab = parent_tab
-        self.setWindowTitle("3D Tag Map - Image Preview")
+        self.setWindowTitle("Hydruxiom - Media Viewer")
         self.resize(900, 700)
         self.setMinimumSize(600, 400)
 
@@ -172,14 +177,14 @@ class TagMap3DSplitWindow(QWidget):
         controls.addWidget(QLabel("Max Files:"))
         self.max_files_spin = QSpinBox()
         self.max_files_spin.setRange(1, 500)
-        self.max_files_spin.setValue(60)
+        self.max_files_spin.setValue(28)
         self.max_files_spin.setToolTip("Maximum number of thumbnails to pull.")
         controls.addWidget(self.max_files_spin)
 
         controls.addWidget(QLabel("Image Size:"))
         self.image_size_spin = QSpinBox()
         self.image_size_spin.setRange(50, 800)
-        self.image_size_spin.setValue(200)
+        self.image_size_spin.setValue(400)
         self.image_size_spin.setToolTip("Size of each thumbnail in pixels.")
         controls.addWidget(self.image_size_spin)
 
@@ -211,6 +216,10 @@ class TagMap3DSplitWindow(QWidget):
         # Store clickable cohort tiles for future interaction
         self.cohort_tiles = []  # list of (cluster_id, QLabel)
 
+        # Zoom state: file id currently shown full-res after a thumbnail click.
+        # None = showing the grid; set = showing one full file (click to go back).
+        self._zoomed_file_id = None
+
     def clear_grid(self):
         """Remove all widgets from the grid layout."""
         while self.grid_layout.count() > 0:
@@ -221,16 +230,26 @@ class TagMap3DSplitWindow(QWidget):
                     widget.setParent(None)
                     widget.deleteLater()
         self.cohort_tiles = []
-        # Reset single-file view
+        # Reset zoom + single-file view
+        self._zoomed_file_id = None
         self._single_file_pixmap = None
         self.single_file_label.clear()
         self.single_file_label.hide()
         self.scroll_area.show()
 
-    def show_single_image(self, pixmap, tooltip=""):
-        """Show a single full-res image scaled to fill the window."""
+    def show_single_image(self, pixmap, tooltip="", file_id=None):
+        """Show a single full-res image scaled to fill the window.
+
+        If ``file_id`` is given (thumbnail zoom), clicking the image again goes
+        back to the grid; otherwise (node selection) it just displays.
+        """
         self._single_file_pixmap = pixmap
         self.single_file_label.setToolTip(tooltip)
+        self._zoomed_file_id = file_id
+        if file_id is not None:
+            self.single_file_label.setCursor(Qt.PointingHandCursor)
+        else:
+            self.single_file_label.unsetCursor()
         self.scroll_area.hide()
         self.single_file_label.show()
         self._scale_single_image()
@@ -268,8 +287,13 @@ class TagMap3DSplitWindow(QWidget):
                 with open(settings_file, "r") as f:
                     settings = json.load(f)
                 self.columns_spin.setValue(settings.get("split_columns", 4))
-                self.max_files_spin.setValue(settings.get("split_max_files", 60))
-                self.image_size_spin.setValue(settings.get("split_image_size", 200))
+                self.max_files_spin.setValue(settings.get("split_max_files", 28))
+                self.image_size_spin.setValue(settings.get("split_image_size", 400))
+                # Restore window position/size (best effort)
+                if hasattr(self.parent_tab, '_restore_window_geometry'):
+                    self.parent_tab._restore_window_geometry(
+                        settings, "split_window_geometry", self
+                    )
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
 
@@ -294,7 +318,19 @@ class TagMap3DSplitWindow(QWidget):
             pass
 
     def closeEvent(self, event):
-        """Save settings when the split window closes."""
+        """Save settings (incl. window geometry) when the media viewer closes."""
+        try:
+            if hasattr(self.parent_tab, '_persist_split_window_geometry'):
+                self.parent_tab._persist_split_window_geometry()
+        except Exception:
+            pass
+        # Clear the tab's reference so F4 re-opens a fresh instance next time
+        # (closing via X must behave like closing via the toggle).
+        try:
+            if getattr(self.parent_tab, 'split_window', None) is self:
+                self.parent_tab.split_window = None
+        except Exception:
+            pass
         self._save_settings()
         super().closeEvent(event)
 
@@ -302,8 +338,13 @@ class TagMap3DSplitWindow(QWidget):
         """Update the title bar text."""
         self.title_label.setText(text)
 
-    def add_image(self, pixmap, tooltip=""):
-        """Add a single image label to the grid using configured columns/size."""
+    def add_image(self, pixmap, tooltip="", file_id=None):
+        """Add a single image label to the grid using configured columns/size.
+
+        Thumbnails are clickable: clicking one opens that file full-res in this
+        window (click again to return to the grid). ``file_id`` is stored as a
+        widget property so mousePressEvent can look it up.
+        """
         from PySide6.QtWidgets import QLabel
         size = self.image_size_spin.value() if hasattr(self, 'image_size_spin') else 200
         label = QLabel()
@@ -313,6 +354,9 @@ class TagMap3DSplitWindow(QWidget):
         label.setStyleSheet("border: 1px solid #4050a0;")
         if tooltip:
             label.setToolTip(tooltip)
+        if file_id is not None:
+            label.setProperty("file_id", str(file_id))
+            label.setCursor(Qt.PointingHandCursor)
         cols = self.columns_spin.value() if hasattr(self, 'columns_spin') else 4
         index = self.grid_layout.count()
         row = index // cols
@@ -329,13 +373,33 @@ class TagMap3DSplitWindow(QWidget):
         return label
 
     def mousePressEvent(self, event):
-        """Handle clicks on cohort tiles to move camera to that cohort."""
+        """Handle clicks in the media viewer.
+
+        - Full-res image shown via thumbnail zoom: click to go back to the grid.
+        - Thumbnail with a file_id: click to open that file full-res here.
+        - Cohort representative tile: click to move the 3D camera to it.
+        """
         if event.button() == Qt.LeftButton:
+            # Zoomed-out state: clicking the big image returns to the grid.
+            if self._zoomed_file_id is not None and self.single_file_label.isVisible():
+                fid = self._zoomed_file_id
+                self._zoomed_file_id = None
+                self.parent_tab._return_to_grid(fid)
+                event.accept()
+                return
+
             widget = self.childAt(event.position().toPoint())
             if widget is not None:
+                # Cohort representative tile -> move camera to that cohort.
                 cluster_id = widget.property("cluster_id")
                 if cluster_id is not None and cluster_id != -1:
                     self.parent_tab._move_camera_to_cluster(cluster_id)
+                    event.accept()
+                    return
+                # Regular thumbnail with a file id -> open full-res here.
+                fid = widget.property("file_id")
+                if fid is not None:
+                    self.parent_tab._open_file_in_viewer(fid)
                     event.accept()
                     return
         super().mousePressEvent(event)
@@ -560,6 +624,7 @@ class TagMap3DTab(QWidget):
         self.scene_graph = None
         self.client = None
         self.tag_data = None  # Store tag data for recomputation
+        self.tag_interner = None  # TagInterner instance (set on load; None after session load)
 
         # Advanced settings (managed by the settings dialog)
         self.low_memory = False
@@ -567,6 +632,8 @@ class TagMap3DTab(QWidget):
         self.use_direct_db = False
         self.client_db_paths = {}
         self.tokenize = True
+        self.drop_universal = True  # Drop universal tags (managed in settings dialog)
+        self.drop_empty_files = False  # Drop empty files (managed in settings dialog)
 
         # DBSCAN optimizer settings (managed by the settings dialog)
         self.opt_max_cohort_size = 500
@@ -577,16 +644,32 @@ class TagMap3DTab(QWidget):
         self.opt_min_samples_min = 2
         self.opt_min_samples_max = 30
         # Normalize positions before DBSCAN (global + split clustering)
-        self.normalize_positions = False
+        self.normalize_positions = True
 
         # Optional external tag-score DB path (empty = scoring disabled)
         self.score_db_path = ""
 
+        # UI scale factor in percent (applied at startup via QT_SCALE_FACTOR;
+        # changing it requires an app restart to take effect).
+        self.ui_scale = 100
+
         self.setup_ui()
+
+        # Star twinkle effect state (must exist BEFORE load_settings, which sets
+        # the twinkle spin values and can fire the connected handlers).
+        self.gl_twinkle = None  # Separate scatter item for twinkling nodes
+        self.twinkle_active = False
+        self.twinkle_indices = np.array([], dtype=np.int32)  # indices of active twinkling nodes
+        self.twinkle_birth = np.array([])  # birth time (perf_counter) per node
+        self.twinkle_lifespan = np.array([])  # lifespan in seconds per node
+        self.twinkle_phase = np.array([])  # random phase offset per node
+        self.twinkle_timer = QTimer(self)
+        self.twinkle_timer.timeout.connect(self._update_twinkle)
+
         self.load_settings()
         self._load_client_db_path()
         self._connect_settings_signals()
-        
+
         # Selection tracking for visual indicator
         self.selected_node_index = None
         self.selected_cluster_id = None
@@ -594,6 +677,7 @@ class TagMap3DTab(QWidget):
         self.selection_timer.timeout.connect(self._toggle_selection_highlight)
         self.selection_visible = False
         self.original_colors = None  # Store original colors for restoration
+        self.gl_highlight = None  # Separate highlight scatter item (selected points only)
 
         # Cohort label blink timer
         self.cohort_label_blink_timer = QTimer(self)
@@ -637,12 +721,44 @@ class TagMap3DTab(QWidget):
         self.tag_query_states = {}  # tag_name -> 0 (neutral), 1 (included), 2 (excluded)
         self._tag_widgets = []  # Store references to prevent garbage collection
 
-        # Split window for image preview sync
+        # Media viewer (split) window for image preview sync
         self.split_window = None
 
-        # Last-used DBSCAN params for recluster grey-out logic
-        self._last_used_eps = None
-        self._last_used_min_samples = None
+        # F4 toggles the media viewer from anywhere in the app, not only when
+        # the 3D view has keyboard focus (the old keyPressEvent path missed
+        # presses made while another widget/window had focus).
+        from PySide6.QtGui import QShortcut, QKeySequence
+        self._shortcuts = []
+
+        def _add(key, slot):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            sc.activated.connect(slot)
+            self._shortcuts.append(sc)  # keep references alive
+
+        # Plain function keys: always active
+        _add("F3", self.open_settings_dialog)   # Settings window
+        _add("F4", self.toggle_split_window)    # Media viewer (toggle)
+        _add("F5", self.start_loading)          # Load & Compute
+        _add("F6", self.start_recompute)        # Recompute (UMAP only)
+        _add("F7", self.start_recluster)        # Regroup (DBSCAN only)
+        _add("F12", self._take_supersample_screenshot)  # 4x snapshot -> screenshots/
+
+        # Ctrl+ combos: skip while a text field has focus so standard
+        # cut/copy/save behavior is preserved in the query/whitelist edits.
+        from PySide6.QtWidgets import QLineEdit, QTextEdit
+
+        def _guarded(slot):
+            fw = self.focusWidget()
+            if isinstance(fw, (QLineEdit, QTextEdit)):
+                return
+            slot()
+
+        _add("Ctrl+X", lambda: _guarded(self.clear_session))          # Clear session
+        _add("Ctrl+S", lambda: _guarded(self._recluster_selection))   # Split group
+        _add("Ctrl+E", lambda: _guarded(self._cut_selected_cohort))   # Cut out
+        _add("Ctrl+T", lambda: _guarded(self.send_selected_to_tab))   # Send to Tab
+
         # Flag: next on_loading_finished is a re-cluster (positions unchanged)
         self._pending_recluster = False
 
@@ -659,7 +775,7 @@ class TagMap3DTab(QWidget):
             client_idx = self.client_combo.findText(settings.get("client", ""))
             if client_idx >= 0:
                 self.client_combo.setCurrentIndex(client_idx)
-            self.chunk_size_spin.setValue(settings.get("chunk_size", 500))
+            self.chunk_size_spin.setValue(settings.get("chunk_size", 8192))
             self.max_files_spin.setValue(settings.get("max_files", 20000))
             # Populate tag services dynamically for the selected client, then
             # restore the saved tag service selection.
@@ -673,20 +789,20 @@ class TagMap3DTab(QWidget):
 
             # Auto-load last data setting
             if hasattr(self, 'auto_load_checkbox'):
-                self.auto_load_checkbox.setChecked(settings.get("auto_load_last_data", False))
+                self.auto_load_checkbox.setChecked(settings.get("auto_load_last_data", True))
 
             # Algorithm settings
             algo_idx = self.algorithm_combo.findText(settings.get("algorithm", "UMAP"))
             if algo_idx >= 0:
                 self.algorithm_combo.setCurrentIndex(algo_idx)
             self.n_neighbors_spin.setValue(settings.get("n_neighbors", 15))
-            self.min_dist_spin.setValue(settings.get("min_dist", 50))
+            self.min_dist_spin.setValue(settings.get("min_dist", 10))
             self.n_epochs_spin.setValue(settings.get("n_epochs", 0))
             self.learning_rate_spin.setValue(settings.get("learning_rate", 1.0))
             metric_idx = self.metric_combo.findText(settings.get("metric", "cosine"))
             if metric_idx >= 0:
                 self.metric_combo.setCurrentIndex(metric_idx)
-            self.subsample_checkbox.setChecked(settings.get("subsample_enabled", True))
+            self.subsample_checkbox.setChecked(settings.get("subsample_enabled", False))
             self.subsample_size_spin.setValue(settings.get("subsample_size", 70000))
 
             # Advanced settings (low RAM, CPU cores)
@@ -704,11 +820,16 @@ class TagMap3DTab(QWidget):
             self.opt_eps_max = settings.get("opt_eps_max", 100)
             self.opt_min_samples_min = settings.get("opt_min_samples_min", 2)
             self.opt_min_samples_max = settings.get("opt_min_samples_max", 30)
-            self.normalize_positions = settings.get("normalize_positions", False)
+            self.normalize_positions = settings.get("normalize_positions", True)
             # Sync the inline checkbox so the UI reflects the saved value
             self.normalize_checkbox.setChecked(self.normalize_positions)
             # Optional tag-score DB path
             self.score_db_path = settings.get("score_db_path", "")
+            # UI scale (percent); applied at startup, restart required to change
+            try:
+                self.ui_scale = int(settings.get("ui_scale", 100))
+            except (TypeError, ValueError):
+                self.ui_scale = 100
             # Sub-clustering settings
             self.sub_eps_spin.setValue(settings.get("sub_eps", 20))
             self.sub_min_samples_spin.setValue(settings.get("sub_min_samples", 4))
@@ -718,9 +839,9 @@ class TagMap3DTab(QWidget):
             self.whitelist_edit.setText(settings.get("whitelist", ""))
             self.blacklist_edit.setText(settings.get("blacklist", ""))
             self.tokenize = settings.get("tokenize", True)
-            self.drop_empty_checkbox.setChecked(settings.get("drop_empty_files", False))
+            self.drop_empty_files = settings.get("drop_empty_files", False)
             self.min_doc_freq_spin.setValue(settings.get("min_doc_freq", 3))
-            self.drop_universal_checkbox.setChecked(settings.get("drop_universal_tags", False))
+            self.drop_universal = settings.get("drop_universal_tags", True)
 
             # Visualization settings (node_size is stored as actual value, displayed x10)
             # Backward compat: fall back to old "min_size" key if "node_size" not present
@@ -737,6 +858,19 @@ class TagMap3DTab(QWidget):
             # Dim non-selected nodes settings
             self.dim_non_selected_checkbox.setChecked(settings.get("dim_non_selected", True))
             self.dim_alpha_spin.setValue(settings.get("dim_alpha", 0.15))
+            if "highlight_color" in settings:
+                self.highlight_color = tuple(settings["highlight_color"])
+                r, g, b = int(self.highlight_color[0]*255), int(self.highlight_color[1]*255), int(self.highlight_color[2]*255)
+                self.highlight_color_btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: black; font-weight: bold;")
+
+            # Star twinkle settings (set values first, then toggle to avoid premature spawn)
+            self.twinkle_count_spin.setValue(settings.get("twinkle_count", 2000))
+            self.twinkle_lifespan_min_spin.setValue(settings.get("twinkle_lifespan_min", 1.0))
+            self.twinkle_lifespan_max_spin.setValue(settings.get("twinkle_lifespan_max", 6.0))
+            self.twinkle_freq_spin.setValue(settings.get("twinkle_freq", 2.0))
+            self.twinkle_brightness_spin.setValue(settings.get("twinkle_brightness", 1.5))
+            # Toggle last: _on_twinkle_toggle will no-op if no scene loaded yet
+            self.twinkle_checkbox.setChecked(settings.get("twinkle_enabled", False))
 
             # V5: Color scheme setting
             color_scheme_idx = self.color_scheme_combo.findText(settings.get("color_scheme", "Pastel"))
@@ -746,7 +880,7 @@ class TagMap3DTab(QWidget):
             # Cohort label settings
             self.cohort_threshold_spin.setValue(settings.get("cohort_threshold", 0.9))
             self.show_cohort_labels_checkbox.setChecked(settings.get("show_cohort_labels", False))
-            self.cohort_label_size_spin.setValue(settings.get("cohort_label_size", 14))
+            self.cohort_label_size_spin.setValue(settings.get("cohort_label_size", 18))
             self.dynamic_label_size_checkbox.setChecked(settings.get("dynamic_label_size", False))
             color = settings.get("cohort_label_color", [255, 255, 255])
             self._cohort_label_color = tuple(color)
@@ -755,10 +889,10 @@ class TagMap3DTab(QWidget):
             self._cohort_label_color2 = tuple(color2)
             self._update_label_color_button2()
             # Label mode + N
-            mode_idx = self.cohort_label_mode_combo.findText(settings.get("cohort_label_mode", "Top N largest"))
+            mode_idx = self.cohort_label_mode_combo.findText(settings.get("cohort_label_mode", "Selected & N neighbors"))
             if mode_idx >= 0:
                 self.cohort_label_mode_combo.setCurrentIndex(mode_idx)
-            self.cohort_label_n_spin.setValue(settings.get("cohort_label_n", 10))
+            self.cohort_label_n_spin.setValue(settings.get("cohort_label_n", 5))
             self.cohort_label_max_tags_spin.setValue(settings.get("cohort_label_max_tags", 5))
             # Smart labels settings (merged into mode combo; "Raw" = disabled)
             smart_mode_idx = self.smart_label_mode_combo.findText(
@@ -770,8 +904,8 @@ class TagMap3DTab(QWidget):
             # Split window settings (image preview)
             if hasattr(self, 'split_window') and self.split_window:
                 self.split_window.columns_spin.setValue(settings.get("split_columns", 4))
-                self.split_window.max_files_spin.setValue(settings.get("split_max_files", 60))
-                self.split_window.image_size_spin.setValue(settings.get("split_image_size", 200))
+                self.split_window.max_files_spin.setValue(settings.get("split_max_files", 28))
+                self.split_window.image_size_spin.setValue(settings.get("split_image_size", 400))
             
             # Camera wobble settings
             self.wobble_enabled_checkbox.setChecked(settings.get("wobble_enabled", False))
@@ -782,6 +916,19 @@ class TagMap3DTab(QWidget):
             # Send to tab settings
             if hasattr(self, 'tab_name_edit'):
                 self.tab_name_edit.setText(settings.get("tab_name", ""))
+
+            # Window geometry (main window + splitter sizes)
+            main_window = getattr(self, 'main_window', None)
+            if main_window is not None:
+                self._restore_window_geometry(settings, "window_geometry", main_window)
+            if hasattr(self, 'main_splitter'):
+                try:
+                    raw = settings.get("splitter_sizes")
+                    if raw:
+                        from PySide6.QtCore import QByteArray
+                        self.main_splitter.restoreState(QByteArray(bytes.fromhex(raw)))
+                except Exception:
+                    pass
         except (json.JSONDecodeError, KeyError, TypeError):
             pass  # Use defaults if settings file is corrupted
 
@@ -818,7 +965,6 @@ class TagMap3DTab(QWidget):
             'sub_eps_spin': 'valueChanged',
             'sub_min_samples_spin': 'valueChanged',
             'min_doc_freq_spin': 'valueChanged',
-            'drop_universal_checkbox': 'stateChanged',
             'min_size_spin': 'valueChanged',
             'spread_spin': 'valueChanged',
             'orbit_speed_spin': 'valueChanged',
@@ -835,7 +981,6 @@ class TagMap3DTab(QWidget):
             # QCheckBox -> stateChanged
             'auto_load_checkbox': 'stateChanged',
             'normalize_checkbox': 'stateChanged',
-            'drop_empty_checkbox': 'stateChanged',
             'supersample_checkbox': 'stateChanged',
             'dim_non_selected_checkbox': 'stateChanged',
             'show_cohort_labels_checkbox': 'stateChanged',
@@ -903,15 +1048,17 @@ class TagMap3DTab(QWidget):
                 "opt_eps_max": getattr(self, 'opt_eps_max', 100),
                 "opt_min_samples_min": getattr(self, 'opt_min_samples_min', 2),
                 "opt_min_samples_max": getattr(self, 'opt_min_samples_max', 30),
-                "normalize_positions": getattr(self, 'normalize_positions', False),
+                "normalize_positions": getattr(self, 'normalize_positions', True),
                 "score_db_path": getattr(self, 'score_db_path', ''),
+                # UI scale (percent); applied at startup via QT_SCALE_FACTOR
+                "ui_scale": getattr(self, 'ui_scale', 100),
                 "query": self.query_edit.text(),
                 "whitelist": self.whitelist_edit.text(),
                 "blacklist": self.blacklist_edit.text(),
                 "tokenize": getattr(self, 'tokenize', True),
-                "drop_empty_files": self.drop_empty_checkbox.isChecked(),
+                "drop_empty_files": getattr(self, 'drop_empty_files', False),
                 "min_doc_freq": self.min_doc_freq_spin.value(),
-                "drop_universal_tags": self.drop_universal_checkbox.isChecked(),
+                "drop_universal_tags": self.drop_universal,
                 "node_size": self.min_size_spin.value() / 10.0,
                 "spread": self.spread_spin.value(),
                 "orbit_speed": self.orbit_speed_spin.value(),
@@ -922,6 +1069,14 @@ class TagMap3DTab(QWidget):
                 # Dim non-selected nodes settings
                 "dim_non_selected": self.dim_non_selected_checkbox.isChecked(),
                 "dim_alpha": self.dim_alpha_spin.value(),
+                "highlight_color": list(self.highlight_color),
+                # Star twinkle settings
+                "twinkle_enabled": self.twinkle_checkbox.isChecked(),
+                "twinkle_count": self.twinkle_count_spin.value(),
+                "twinkle_lifespan_min": self.twinkle_lifespan_min_spin.value(),
+                "twinkle_lifespan_max": self.twinkle_lifespan_max_spin.value(),
+                "twinkle_freq": self.twinkle_freq_spin.value(),
+                "twinkle_brightness": self.twinkle_brightness_spin.value(),
                 # Color scheme
                 "color_scheme": self.color_scheme_combo.currentText(),
                 # Cohort label settings
@@ -939,8 +1094,8 @@ class TagMap3DTab(QWidget):
                 # Split window settings (image preview)
                 # Fall back to previously saved values when the split window is closed
                 "split_columns": self.split_window.columns_spin.value() if hasattr(self, 'split_window') and self.split_window else existing.get("split_columns", 4),
-                "split_max_files": self.split_window.max_files_spin.value() if hasattr(self, 'split_window') and self.split_window else existing.get("split_max_files", 60),
-                "split_image_size": self.split_window.image_size_spin.value() if hasattr(self, 'split_window') and self.split_window else existing.get("split_image_size", 200),
+                "split_max_files": self.split_window.max_files_spin.value() if hasattr(self, 'split_window') and self.split_window else existing.get("split_max_files", 28),
+                "split_image_size": self.split_window.image_size_spin.value() if hasattr(self, 'split_window') and self.split_window else existing.get("split_image_size", 400),
                 # Camera wobble settings
                 "wobble_enabled": self.wobble_enabled_checkbox.isChecked(),
                 "wobble_speed": self.wobble_speed_spin.value(),
@@ -949,8 +1104,21 @@ class TagMap3DTab(QWidget):
                 # Send to tab settings
                 "tab_name": self.tab_name_edit.text() if hasattr(self, 'tab_name_edit') else "",
                 # Auto-load last data setting
-                "auto_load_last_data": self.auto_load_checkbox.isChecked() if hasattr(self, 'auto_load_checkbox') else False,
+                "auto_load_last_data": self.auto_load_checkbox.isChecked() if hasattr(self, 'auto_load_checkbox') else True,
             }
+
+            # Window geometry (main window + splitter sizes)
+            main_window = getattr(self, 'main_window', None)
+            if main_window is not None:
+                self._save_window_geometry(settings, "window_geometry", main_window)
+            if hasattr(self, 'main_splitter'):
+                try:
+                    # PySide6: saveState() takes NO argument and returns the QByteArray.
+                    ba = self.main_splitter.saveState()
+                    if len(ba) > 0:
+                        settings["splitter_sizes"] = bytes(ba).hex()
+                except Exception:
+                    pass
             # Atomic write: write to temp file, then replace.
             # This prevents corruption if the app crashes mid-write.
             settings_dir = os.path.dirname(SETTINGS_FILE) or '.'
@@ -967,6 +1135,71 @@ class TagMap3DTab(QWidget):
                 raise
         except OSError:
             pass  # Silently fail if we can't write settings
+
+    @staticmethod
+    def _save_window_geometry(settings, key, widget):
+        """Serialize a window's geometry (pos + size) into the settings dict.
+
+        Stored as base64 of QByteArray(saveGeometry()) so it round-trips
+        through JSON. No-op if the widget is missing or not yet shown.
+        """
+        try:
+            # PySide6: saveGeometry() takes NO argument and returns the
+            # QByteArray (unlike PyQt5's in/out buffer form).
+            ba = widget.saveGeometry()
+            if len(ba) > 0:
+                settings[key] = bytes(ba).hex()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _restore_window_geometry(settings, key, widget):
+        """Restore a window's geometry from the settings dict (best effort)."""
+        try:
+            from PySide6.QtCore import QByteArray, QCoreApplication
+            raw = settings.get(key)
+            if not raw:
+                return False
+            ba = QByteArray(bytes.fromhex(raw))
+            ok = widget.restoreGeometry(ba)
+            # Guard against a saved position on a monitor that no longer exists.
+            geo = widget.geometry()
+            screens = QCoreApplication.screens()
+            if ok and screens and not any(s.availableGeometry().intersects(geo) for s in screens):
+                return False
+            return bool(ok)
+        except Exception:
+            return False
+
+    def _persist_split_window_geometry(self):
+        """Persist the split window's geometry to the settings file (atomic).
+
+        Called from TagMap3DSplitWindow.closeEvent(). Reads the existing JSON,
+        updates only the geometry key and writes it back, so no other saved
+        values are touched.
+        """
+        if getattr(self, 'split_window', None) is None:
+            return
+        try:
+            settings = {}
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    settings = json.load(f)
+            self._save_window_geometry(settings, "split_window_geometry", self.split_window)
+            settings_dir = os.path.dirname(SETTINGS_FILE) or '.'
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=settings_dir, suffix='.tmp')
+            try:
+                with os.fdopen(tmp_fd, 'w', encoding="utf-8") as f:
+                    json.dump(settings, f, indent=2)
+                os.replace(tmp_path, SETTINGS_FILE)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception:
+            pass
 
     def _load_client_db_path(self):
         """Load all client DB paths into the settings dialog state."""
@@ -1005,13 +1238,23 @@ class TagMap3DTab(QWidget):
             try:
                 from src.utils.utility_functions import ConnectToClient
                 client = ConnectToClient(client_name)
-                services_dict = client.get_services()
-                services = (services_dict or {}).get("services", {})
-                # Sort by name for a stable, readable order
-                names = sorted(
-                    info.get("name", "") for info in services.values()
-                    if isinstance(info, dict) and info.get("name")
-                )
+                services_dict = client.get_services() or {}
+                # Only real TAG services belong in this combo. The flat
+                # 'services' dict also contains file domains (my files, trash,
+                # all local files...) and rating services,
+                # which are not valid tag sources and would leak into the list.
+                # Hydrus categorises them for us: use only the tag categories.
+                tag_categories = ("local_tags", "all_known_tags", "tag_repositories")
+                seen = set()
+                collected = []
+                for cat in tag_categories:
+                    for info in services_dict.get(cat, []) or []:
+                        if isinstance(info, dict):
+                            nm = info.get("name", "")
+                            if nm and nm not in seen:
+                                seen.add(nm)
+                                collected.append(nm)
+                names = sorted(collected)
             except Exception as e:
                 print(f"Could not fetch tag services for '{client_name}': {e}")
 
@@ -1034,6 +1277,29 @@ class TagMap3DTab(QWidget):
         dialog = TagMap3DSettingsDialog(self)
         dialog.exec()
 
+    def _refresh_client_combo(self):
+        """Rebuild the client combo from clients.json, preserving selection.
+
+        Called after the Settings window saves client changes so newly added /
+        renamed / removed clients are reflected without restarting the app.
+        """
+        if not hasattr(self, 'client_combo'):
+            return
+        from src.data.clients import client_ids
+        previous = self.client_combo.currentText()
+        self.client_combo.blockSignals(True)
+        self.client_combo.clear()
+        ids = client_ids() or []
+        self.client_combo.addItems(ids)
+        idx = self.client_combo.findText(previous)
+        if idx >= 0:
+            self.client_combo.setCurrentIndex(idx)
+        elif ids:
+            self.client_combo.setCurrentIndex(0)
+        self.client_combo.blockSignals(False)
+        # Refresh tag services for the (possibly new) selected client.
+        self._populate_tag_services(self.client_combo.currentText())
+
     def closeEvent(self, event: QCloseEvent):
         """Handle window close event to save settings."""
         self._save_client_db_path()
@@ -1048,6 +1314,7 @@ class TagMap3DTab(QWidget):
 
         # Create main horizontal splitter: left panel | center (3D + info) | right sidebar
         main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter = main_splitter  # kept for geometry persistence
 
         # Left panel - Controls (toggleable)
         self.left_sidebar = self.create_control_panel()
@@ -1079,6 +1346,9 @@ class TagMap3DTab(QWidget):
         # Right sidebar - Actions panel (toggleable)
         self.right_sidebar = self.create_right_sidebar()
         main_splitter.addWidget(self.right_sidebar)
+
+        # Reorganize: right sidebar into tabs, move wobble/status/tag-grid.
+        self._reorganize_sidebars()
 
         main_splitter.setStretchFactor(0, 0)  # Left panel - fixed
         main_splitter.setStretchFactor(1, 1)  # Center - stretches
@@ -1187,8 +1457,8 @@ class TagMap3DTab(QWidget):
 
         self.chunk_size_spin = QSpinBox()
         self.chunk_size_spin.setRange(50, 100000000)
-        self.chunk_size_spin.setValue(500)
-        self.chunk_size_spin.setToolTip("Number of files to fetch per API request.\nLarger = faster but may timeout.\nSmaller = more requests but more reliable.\nDefault: 500")
+        self.chunk_size_spin.setValue(8192)
+        self.chunk_size_spin.setToolTip("Number of files to fetch per API request.\nLarger = faster but may timeout.\nSmaller = more requests but more reliable.\nDefault: 8192")
         client_layout.addRow("Chunk Size:", self.chunk_size_spin)
 
         self.max_files_spin = QSpinBox()
@@ -1208,10 +1478,10 @@ class TagMap3DTab(QWidget):
         self.tag_service_combo.setToolTip("Which tag service to use for fetching tags.\nPopulated dynamically per client.")
         client_layout.addRow("Tag Service:", self.tag_service_combo)
 
-        # Auto-load last data checkbox
-        self.auto_load_checkbox = QCheckBox("Auto-load last data")
-        self.auto_load_checkbox.setChecked(False)
-        self.auto_load_checkbox.setToolTip("When enabled, automatically load the last used\ndata on next launch with saved parameters.")
+        # Auto-load session checkbox (loads last generated session on startup)
+        self.auto_load_checkbox = QCheckBox("Auto load session")
+        self.auto_load_checkbox.setChecked(True)
+        self.auto_load_checkbox.setToolTip("When enabled, automatically load the last generated\nsession on next launch (skips query, UMAP, DBSCAN).\nA session is saved automatically after every successful load.")
         client_layout.addRow(self.auto_load_checkbox)
 
         client_group.setLayout(client_layout)
@@ -1235,9 +1505,9 @@ class TagMap3DTab(QWidget):
 
         self.min_dist_spin = QSpinBox()
         self.min_dist_spin.setRange(0, 100)
-        self.min_dist_spin.setValue(50)
+        self.min_dist_spin.setValue(10)
         self.min_dist_spin.setSuffix("%")
-        self.min_dist_spin.setToolTip("UMAP parameter: Minimum distance between points (0-100%).\nLower (0-20%) = points packed tightly together.\nHigher (50-100%) = more spread out, easier to see individual points.\nDefault: 50%")
+        self.min_dist_spin.setToolTip("UMAP parameter: Minimum distance between points (0-100%).\nLower (0-20%) = points packed tightly together.\nHigher (50-100%) = more spread out, easier to see individual points.\nDefault: 10%")
         algo_layout.addRow("Min Dist:", self.min_dist_spin)
 
         self.n_epochs_spin = QSpinBox()
@@ -1261,7 +1531,7 @@ class TagMap3DTab(QWidget):
 
         # UMAP Subsampling (for large datasets)
         self.subsample_checkbox = QCheckBox("Subsample")
-        self.subsample_checkbox.setChecked(True)
+        self.subsample_checkbox.setChecked(False)
         self.subsample_checkbox.setToolTip("Fit UMAP on a random subset, then transform all points.\n"
                                            "Essential for 1M+ files to avoid memory allocation failures.\n"
                                            "The subset size controls accuracy vs. speed tradeoff.")
@@ -1278,7 +1548,6 @@ class TagMap3DTab(QWidget):
         algo_layout.addRow("Subset Size:", self.subsample_size_spin)
 
         algo_group.setLayout(algo_layout)
-        layout.addWidget(algo_group)
 
         # Cluster Settings Group
         cluster_group = QGroupBox("Cluster Settings")
@@ -1288,7 +1557,7 @@ class TagMap3DTab(QWidget):
         self.eps_spin = QSpinBox()
         self.eps_spin.setRange(1, 200)
         self.eps_spin.setValue(50)
-        self.eps_spin.setSingleStep(5)
+        self.eps_spin.setSingleStep(1)
         self.eps_spin.setToolTip("DBSCAN parameter: Maximum distance between points in same cluster (as % of data spread).\nLower (10-30%) = many small, tight clusters.\nHigher (100-200%) = few large clusters.\nDefault: 50%")
         cluster_layout.addRow("EPS (%):", self.eps_spin)
 
@@ -1300,7 +1569,7 @@ class TagMap3DTab(QWidget):
 
         # Normalize positions before DBSCAN toggle (global + split clustering)
         self.normalize_checkbox = QCheckBox("Normalize positions before DBSCAN")
-        self.normalize_checkbox.setChecked(getattr(self, 'normalize_positions', False))
+        self.normalize_checkbox.setChecked(getattr(self, 'normalize_positions', True))
         self.normalize_checkbox.setToolTip(
             "When enabled, positions are normalized (centered + std-scaled) before\n"
             "DBSCAN clustering. Makes eps a relative measure of local density rather\n"
@@ -1328,14 +1597,9 @@ class TagMap3DTab(QWidget):
         self.sub_min_samples_spin.setToolTip("Sub-cluster Min Samples: minimum points for a sub-cohort.\nIndependent from global Min Samples.")
         cluster_layout.addRow("Sub Min Samples:", self.sub_min_samples_spin)
 
-        # Recluster button grey-out: unlock only when target params differ from last-used
-        self.eps_spin.valueChanged.connect(self._update_recluster_button_state)
-        self.min_samples_spin.valueChanged.connect(self._update_recluster_button_state)
-
         cluster_group.setLayout(cluster_layout)
-        layout.addWidget(cluster_group)
 
-        # Filter Settings Group
+        # Filter Settings Group (the tag-query grid is appended at the end)
         filter_group = QGroupBox("Filter Settings")
         filter_group.setToolTip("Filter which files are included in the visualization.")
         filter_layout = QFormLayout()
@@ -1355,10 +1619,8 @@ class TagMap3DTab(QWidget):
         self.blacklist_edit.setToolTip("Tag-level filter: removes matching tags from all files\nbefore position calculation and visualization.\nComma-separated. Supports * wildcard.\nLeave empty to remove nothing.")
         filter_layout.addRow("Tag Blacklist:", self.blacklist_edit)
 
-        self.drop_empty_checkbox = QCheckBox("Drop empty files")
-        self.drop_empty_checkbox.setChecked(False)
-        self.drop_empty_checkbox.setToolTip("When enabled, files with no tags remaining after the\nwhitelist/blacklist filters are excluded from the map.\nWhen disabled (default), they are kept and appear as untagged\nnodes at the origin.\nOnly applies when a whitelist or blacklist is set.")
-        filter_layout.addRow(self.drop_empty_checkbox)
+        # "Drop empty files" moved to the Settings window (Performance group),
+        # backed by the self.drop_empty_files attribute.
 
         self.min_doc_freq_spin = QSpinBox()
         self.min_doc_freq_spin.setRange(1, 100)
@@ -1366,15 +1628,17 @@ class TagMap3DTab(QWidget):
         self.min_doc_freq_spin.setToolTip("Vectorizer: Minimum documents a tag must appear in\nto be included in the vocabulary.\nHigher = fewer rare tags, faster UMAP.\nLower = more tags, slower but more detailed.\nDefault: 3")
         filter_layout.addRow("Min Doc Freq:", self.min_doc_freq_spin)
 
-        self.drop_universal_checkbox = QCheckBox("Drop Universal Tags")
-        self.drop_universal_checkbox.setChecked(False)
-        self.drop_universal_checkbox.setToolTip("Exclude tags that appear in EVERY loaded file from the vocabulary.\nThese tags provide zero discriminative power (they are usually\nalready visible in your query field) and only add noise dimensions.\nUseful for large AND queries where all files share the same tags.\nDefault: OFF")
-        filter_layout.addRow(self.drop_universal_checkbox)
+        # Tag query builder is reparented here from the right sidebar after both
+        # panels are built (see setup_ui). Store the layout for that step.
+        self._filter_layout = filter_layout
 
         filter_group.setLayout(filter_layout)
+        # Order: Client -> Filter -> Algorithm -> Cluster (Filter sits below Client).
         layout.addWidget(filter_group)
+        layout.addWidget(algo_group)
+        layout.addWidget(cluster_group)
 
-        # Camera Wobble Group (for depth perception)
+        # Camera Wobble Group (for depth perception) — moved to right sidebar "Visuals" tab
         wobble_group = QGroupBox("Camera Wobble (Depth Effect)")
         wobble_group.setToolTip("Continuous camera movement to create depth perception through parallax.")
         wobble_layout = QFormLayout()
@@ -1388,11 +1652,12 @@ class TagMap3DTab(QWidget):
         self.wobble_continuous_checkbox = QCheckBox()
         self.wobble_continuous_checkbox.setChecked(False)
         self.wobble_continuous_checkbox.setToolTip(
-            "Spin the camera continuously (azimuth + elevation rotate in one "
-            "direction and wrap around) instead of oscillating back and forth.\n"
+            "Spin the camera continuously (azimuth rotates in one direction and "
+            "wraps around, elevation bobs gently) instead of oscillating back and forth.\n"
             "The Azim/Elev Range values become the spin speed (degrees per second).\n"
             "Default: OFF (classic sine wobble)."
         )
+        self.wobble_continuous_checkbox.stateChanged.connect(self._on_wobble_continuous_toggle)
         wobble_layout.addRow("Continuous Spin:", self.wobble_continuous_checkbox)
 
         self.wobble_speed_spin = QDoubleSpinBox()
@@ -1422,16 +1687,21 @@ class TagMap3DTab(QWidget):
         wobble_layout.addRow("Elev Range:", self.wobble_elev_range_spin)
 
         wobble_group.setLayout(wobble_layout)
-        layout.addWidget(wobble_group)
+        # Stored (not added to left panel) — placed in the right sidebar "Visuals" tab.
+        self.wobble_group = wobble_group
 
         # Initialize wobble timer and state
         self.wobble_timer = QTimer()
         self.wobble_timer.timeout.connect(self._update_wobble)
         self.wobble_timer.setInterval(16)  # ~60fps
         self.wobble_time = 0.0
+        self.wobble_base_azim = 45.0   # base azimuth (captured on enable)
+        self.wobble_base_elev = 30.0   # base elevation (captured on enable)
+        self.wobble_spin_azim = 0.0    # continuous-spin azimuth accumulator
+        self.wobble_user_interacting = False  # True while user drags (pauses wobble)
 
         # Load Button and Progress
-        self.load_button = QPushButton("Load Data and Compute")
+        self.load_button = QPushButton("Load & Compute")
         self.load_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: {BLUE_60};
@@ -1447,31 +1717,11 @@ class TagMap3DTab(QWidget):
                 background-color: {GRAY_40};
             }}
         """)
+        self.load_button.setToolTip("Load files from Hydrus and compute the full 3D map\n(query -> tags -> UMAP/PCA -> DBSCAN).\nShortcut: F5")
         self.load_button.clicked.connect(self.start_loading)
         layout.addWidget(self.load_button)
 
-        # Load Last Data button (loads with saved params)
-        self.load_last_button = QPushButton("Load Last Data")
-        self.load_last_button.setStyleSheet(f"""
-            QPushButton {{
-                background-color: rgb(60, 80, 160);
-                color: {RED_A};
-                padding: 8px;
-                font-size: 12px;
-                border-radius: 5px;
-            }}
-            QPushButton:hover {{
-                background-color: rgb(80, 100, 200);
-            }}
-            QPushButton:disabled {{
-                background-color: {GRAY_40};
-            }}
-        """)
-        self.load_last_button.setToolTip("Load data using the last saved parameters.")
-        self.load_last_button.clicked.connect(self._load_last_data)
-        layout.addWidget(self.load_last_button)
-
-        self.recompute_button = QPushButton("Recompute (Use Current Data)")
+        self.recompute_button = QPushButton("Recompute")
         self.recompute_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: rgb(60, 80, 160);
@@ -1489,11 +1739,14 @@ class TagMap3DTab(QWidget):
         """)
         self.recompute_button.setEnabled(False)
         self.recompute_button.clicked.connect(self.start_recompute)
-        self.recompute_button.setToolTip("Re-run UMAP/PCA and DBSCAN with new settings using currently loaded data.")
+        self.recompute_button.setToolTip("Re-run UMAP/PCA only with new settings using currently loaded data.\nClustering is separate (use Regroup).\nShortcut: F6")
         layout.addWidget(self.recompute_button)
 
-        # Reapply DBSCAN button (re-cluster only, no re-reduce)
-        self.recluster_button = QPushButton("Reapply DBSCAN")
+        # Regroup + Optimize row: Regroup takes ~3/4 width, Optimize is a small icon (~1/4)
+        regroup_row = QHBoxLayout()
+        regroup_row.setSpacing(4)
+
+        self.recluster_button = QPushButton("Regroup")
         self.recluster_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: rgb(60, 80, 160);
@@ -1511,17 +1764,17 @@ class TagMap3DTab(QWidget):
         """)
         self.recluster_button.setEnabled(False)
         self.recluster_button.clicked.connect(self.start_recluster)
-        self.recluster_button.setToolTip("Re-run DBSCAN only on current positions (no UMAP/PCA re-run). Use after changing eps/min_samples.")
-        layout.addWidget(self.recluster_button)
+        self.recluster_button.setToolTip("Re-run DBSCAN only on current positions (no UMAP/PCA re-run). Use after changing eps/min_samples.\nShortcut: F7")
+        regroup_row.addWidget(self.recluster_button, 3)
 
-        # Optimize DBSCAN button (auto-search ideal eps/min_samples)
-        self.optimize_button = QPushButton("Optimize DBSCAN")
+        # Optimize: small icon button next to Regroup
+        self.optimize_button = QPushButton("⚙")
         self.optimize_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: rgb(60, 80, 160);
                 color: {RED_A};
-                padding: 8px;
-                font-size: 12px;
+                padding: 4px;
+                font-size: 14px;
                 border-radius: 5px;
             }}
             QPushButton:hover {{
@@ -1534,55 +1787,38 @@ class TagMap3DTab(QWidget):
         self.optimize_button.setEnabled(False)
         self.optimize_button.clicked.connect(self.start_optimize)
         self.optimize_button.setToolTip(
-            "Automatically search for the ideal eps/min_samples combination.\n"
+            "Optimize DBSCAN: automatically search for the ideal eps/min_samples combination.\n"
             "Goal: reduce non-cohorted (noise) nodes and split disproportionately\n"
             "large cohorts. Runs DBSCAN multiple times to find the best settings."
         )
-        layout.addWidget(self.optimize_button)
+        regroup_row.addWidget(self.optimize_button, 1)
 
-        # Save Session button
-        self.save_session_button = QPushButton("Save Session")
-        self.save_session_button.setStyleSheet(f"""
+        layout.addLayout(regroup_row)
+
+        # Clear button - drop the current session data and free resources
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.setStyleSheet(f"""
             QPushButton {{
-                background-color: rgb(60, 80, 160);
+                background-color: rgb(120, 50, 60);
                 color: {RED_A};
                 padding: 8px;
                 font-size: 12px;
                 border-radius: 5px;
             }}
             QPushButton:hover {{
-                background-color: rgb(80, 100, 200);
+                background-color: rgb(160, 70, 80);
             }}
             QPushButton:disabled {{
                 background-color: {GRAY_40};
             }}
         """)
-        self.save_session_button.setEnabled(False)
-        self.save_session_button.clicked.connect(self._save_session)
-        self.save_session_button.setToolTip("Save the current rendered session (positions, clusters, tags) to skip reprocessing on next load.")
-        layout.addWidget(self.save_session_button)
+        self.clear_button.setToolTip("Drop the current session data (scene graph, node list,\nGPU buffers) and clear the view.\nFrees memory before starting a new load.\nShortcut: Ctrl+X")
+        self.clear_button.clicked.connect(self.clear_session)
+        layout.addWidget(self.clear_button)
 
-        # Load Session button
-        self.load_session_button = QPushButton("Load Session")
-        self.load_session_button.setStyleSheet(f"""
-            QPushButton {{
-                background-color: rgb(60, 80, 160);
-                color: {RED_A};
-                padding: 8px;
-                font-size: 12px;
-                border-radius: 5px;
-            }}
-            QPushButton:hover {{
-                background-color: rgb(80, 100, 200);
-            }}
-            QPushButton:disabled {{
-                background-color: {GRAY_40};
-            }}
-        """)
-        self.load_session_button.setEnabled(True)  # Available at startup to load a session
-        self.load_session_button.clicked.connect(self._load_session)
-        self.load_session_button.setToolTip("Load a saved session directly (skips query, metadata, UMAP, DBSCAN).")
-        layout.addWidget(self.load_session_button)
+        # Session buttons are now automatic (hidden). Objects kept for setEnabled compat.
+        self.save_session_button = QPushButton()  # hidden, auto-saved after each load
+        self.load_session_button = QPushButton()  # hidden, auto-loaded on startup
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
@@ -1618,6 +1854,15 @@ class TagMap3DTab(QWidget):
                     # Enable keyboard focus for F11 fullscreen toggle
                     self.setFocusPolicy(Qt.StrongFocus)
 
+                def mouseReleaseEvent(self, event: QMouseEvent):
+                    """Resume wobble from the user's new camera position."""
+                    if hasattr(self.parent_tab, 'wobble_user_interacting'):
+                        self.parent_tab.wobble_user_interacting = False
+                        # Re-base so wobble continues smoothly from where the user left it.
+                        if hasattr(self.parent_tab, '_capture_wobble_base'):
+                            self.parent_tab._capture_wobble_base()
+                    super().mouseReleaseEvent(event)
+
                 def evalKeyState(self):
                     """Override to use custom orbit speed from settings."""
                     from PySide6.QtCore import Qt
@@ -1649,6 +1894,10 @@ class TagMap3DTab(QWidget):
                     - Right click: move camera center to node under cursor
                     - Ctrl+Right click: move camera center to node under cursor
                     """
+                    # Pause wobble while the user interacts so manual orbit works.
+                    if hasattr(self.parent_tab, 'wobble_user_interacting'):
+                        self.parent_tab.wobble_user_interacting = True
+
                     # Handle left-click for cohort selection
                     if event.button() == Qt.MouseButton.LeftButton:
                         # Ctrl+Left click selects a node
@@ -1725,11 +1974,6 @@ class TagMap3DTab(QWidget):
                     elif event.key() == Qt.Key_F2:
                         # Toggle right sidebar
                         self.parent_tab.toggle_sidebar()
-                        event.accept()
-                        return
-                    elif event.key() == Qt.Key_F4:
-                        # Toggle split window
-                        self.parent_tab.toggle_split_window()
                         event.accept()
                         return
                     elif event.key() == Qt.Key_R and event.modifiers() & Qt.ControlModifier:
@@ -1839,6 +2083,7 @@ class TagMap3DTab(QWidget):
         self.info_layout.addWidget(self.tag_container)
 
         info_group.setLayout(info_layout)
+        self._info_group = info_group  # reorganized into tabs in setup_ui
         layout.addWidget(info_group)
 
         # Selection Cohort Tags Section
@@ -1864,6 +2109,7 @@ class TagMap3DTab(QWidget):
         selection_tags_layout.addWidget(self.selection_tags_text)
 
         selection_tags_group.setLayout(selection_tags_layout)
+        self._selection_tags_group = selection_tags_group  # reorganized into tabs in setup_ui
         layout.addWidget(selection_tags_group)
 
         # Send to Tab Section
@@ -1958,7 +2204,7 @@ class TagMap3DTab(QWidget):
                 background-color: {GRAY_40};
             }}
         """)
-        self.cut_button.setToolTip("Cut out the selected cohort - keep only its nodes\nand remove everything else from the view.")
+        self.cut_button.setToolTip("Cut out the selected cohort - keep only its nodes\nand remove everything else from the view.\nShortcut: Ctrl+E")
         self.cut_button.clicked.connect(self._cut_selected_cohort)
         self.cut_button.setEnabled(False)  # Enabled when a cohort is selected
         send_layout.addWidget(self.cut_button)
@@ -1985,8 +2231,8 @@ class TagMap3DTab(QWidget):
         self.pop_button.setEnabled(False)  # Enabled when a cohort is selected
         send_layout.addWidget(self.pop_button)
 
-        # Re-cluster selection button - apply cluster algo on selection, keep positions
-        self.cluster_button = QPushButton("Re-cluster selection")
+        # Split group button - apply cluster algo on selection, keep positions
+        self.cluster_button = QPushButton("Split group")
         self.cluster_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: {BLUE_60};
@@ -2002,12 +2248,13 @@ class TagMap3DTab(QWidget):
                 background-color: {GRAY_40};
             }}
         """)
-        self.cluster_button.setToolTip("Apply the cluster algorithm on the selected cohort\nusing its existing positions to identify smaller sub-cohorts.\nPositions stay unchanged; only coloring/labels change.")
+        self.cluster_button.setToolTip("Split the selected cohort into sub-groups using the cluster\nalgorithm on its existing positions.\nPositions stay unchanged; only coloring/labels change.\nShortcut: Ctrl+S")
         self.cluster_button.clicked.connect(self._recluster_selection)
         self.cluster_button.setEnabled(False)  # Enabled when a cohort is selected
         send_layout.addWidget(self.cluster_button)
 
         send_group.setLayout(send_layout)
+        self._send_group = send_group  # reorganized into tabs in setup_ui
         layout.addWidget(send_group)
 
         # Visualization Settings Group (moved from left sidebar)
@@ -2066,6 +2313,62 @@ class TagMap3DTab(QWidget):
         self.dim_alpha_spin.setToolTip("Alpha (transparency) applied to non-selected nodes\nwhen a selection is active.\n0.0 = fully transparent, 1.0 = fully opaque.\nDefault: 0.15")
         vis_layout.addRow("Dim Alpha:", self.dim_alpha_spin)
 
+        # Highlight color for selected cluster/node
+        self.highlight_color = (0.0, 1.0, 1.0)  # Default: cyan
+        self.highlight_color_btn = QPushButton("Cyan")
+        self.highlight_color_btn.setFixedWidth(80)
+        self.highlight_color_btn.setStyleSheet(f"background-color: rgb(0, 255, 255); color: black; font-weight: bold;")
+        self.highlight_color_btn.clicked.connect(self._pick_highlight_color)
+        self.highlight_color_btn.setToolTip("Color used to highlight the selected cluster or node.\nClick to choose a custom color.")
+        vis_layout.addRow("Highlight Color:", self.highlight_color_btn)
+
+        # Star twinkle effect (random nodes blink in their own color)
+        self.twinkle_checkbox = QCheckBox("Star Twinkle")
+        self.twinkle_checkbox.setChecked(False)
+        self.twinkle_checkbox.stateChanged.connect(self._on_twinkle_toggle)
+        self.twinkle_checkbox.setToolTip("Animate a random set of nodes blinking in their own color\nlike stars twinkling. Dead nodes are periodically replaced with new random ones.")
+        vis_layout.addRow(self.twinkle_checkbox)
+
+        self.twinkle_count_spin = QSpinBox()
+        self.twinkle_count_spin.setRange(10, 20000)
+        self.twinkle_count_spin.setValue(2000)
+        self.twinkle_count_spin.setSingleStep(50)
+        self.twinkle_count_spin.valueChanged.connect(self._on_twinkle_param_changed)
+        self.twinkle_count_spin.setToolTip("Number of nodes twinkling at any given time.\nDefault: 2000")
+        vis_layout.addRow("Twinkle Count:", self.twinkle_count_spin)
+
+        self.twinkle_lifespan_min_spin = QDoubleSpinBox()
+        self.twinkle_lifespan_min_spin.setRange(0.1, 60.0)
+        self.twinkle_lifespan_min_spin.setValue(1.0)
+        self.twinkle_lifespan_min_spin.setDecimals(1)
+        self.twinkle_lifespan_min_spin.valueChanged.connect(self._on_twinkle_param_changed)
+        self.twinkle_lifespan_min_spin.setToolTip("Minimum lifespan (seconds) before a twinkling node is replaced.\nDefault: 1.0")
+        vis_layout.addRow("Lifespan Min (s):", self.twinkle_lifespan_min_spin)
+
+        self.twinkle_lifespan_max_spin = QDoubleSpinBox()
+        self.twinkle_lifespan_max_spin.setRange(0.1, 120.0)
+        self.twinkle_lifespan_max_spin.setValue(6.0)
+        self.twinkle_lifespan_max_spin.setDecimals(1)
+        self.twinkle_lifespan_max_spin.valueChanged.connect(self._on_twinkle_param_changed)
+        self.twinkle_lifespan_max_spin.setToolTip("Maximum lifespan (seconds) before a twinkling node is replaced.\nEach node gets a random lifespan in [min, max].\nDefault: 6.0")
+        vis_layout.addRow("Lifespan Max (s):", self.twinkle_lifespan_max_spin)
+
+        self.twinkle_freq_spin = QDoubleSpinBox()
+        self.twinkle_freq_spin.setRange(0.1, 20.0)
+        self.twinkle_freq_spin.setValue(2.0)
+        self.twinkle_freq_spin.setDecimals(1)
+        self.twinkle_freq_spin.valueChanged.connect(self._on_twinkle_param_changed)
+        self.twinkle_freq_spin.setToolTip("Blink frequency (Hz): how fast each node pulses.\nDefault: 2.0")
+        vis_layout.addRow("Blink Freq (Hz):", self.twinkle_freq_spin)
+
+        self.twinkle_brightness_spin = QDoubleSpinBox()
+        self.twinkle_brightness_spin.setRange(0.1, 3.0)
+        self.twinkle_brightness_spin.setValue(1.5)
+        self.twinkle_brightness_spin.setDecimals(2)
+        self.twinkle_brightness_spin.valueChanged.connect(self._on_twinkle_param_changed)
+        self.twinkle_brightness_spin.setToolTip("Peak brightness multiplier when a node is at full blink.\n1.0 = no extra brightness, 3.0 = very bright.\nDefault: 1.5")
+        vis_layout.addRow("Brightness:", self.twinkle_brightness_spin)
+
         # V5: Color Scheme dropdown
         self.color_scheme_combo = QComboBox()
         self.color_scheme_combo.addItems(["Pastel", "Viridis", "Plasma", "Inferno", "Coolwarm"])
@@ -2075,9 +2378,9 @@ class TagMap3DTab(QWidget):
         vis_layout.addRow("Color Scheme:", self.color_scheme_combo)
 
         # Anti-noise / quality settings
-        self.supersample_checkbox = QCheckBox("Supersample (4x)")
+        self.supersample_checkbox = QCheckBox("4x Snapshot")
         self.supersample_checkbox.setChecked(False)
-        self.supersample_checkbox.setToolTip("Render the view at 4x resolution then downsample.\nGreatly reduces aliasing/noise but uses more GPU memory.\nDefault: OFF.")
+        self.supersample_checkbox.setToolTip("Render a static 4x-resolution snapshot of the view (reduces aliasing/noise).\nWhile enabled, the image is frozen and you cannot orbit or select.\nDisable to return to normal interactive viewing.\nDefault: OFF.")
         self.supersample_checkbox.stateChanged.connect(self._on_supersample_toggle)
         vis_layout.addRow(self.supersample_checkbox)
 
@@ -2086,9 +2389,10 @@ class TagMap3DTab(QWidget):
         self.supersample_fps_spin.setValue(10)
         self.supersample_fps_spin.setToolTip("FPS for the 4x supersample render.\n0 = disable the FPS limiter (render as fast as possible).\nHigher = smoother but heavier (more GPU/CPU).\nDefault: 10")
         self.supersample_fps_spin.valueChanged.connect(self._on_supersample_fps_changed)
-        vis_layout.addRow("Supersample FPS:", self.supersample_fps_spin)
+        # Hidden: not exposed in the UI, but kept for settings persistence.
 
         vis_group.setLayout(vis_layout)
+        self._vis_group = vis_group  # reorganized into tabs in setup_ui
         layout.addWidget(vis_group)
 
         # Cohort Selections Section
@@ -2127,31 +2431,38 @@ class TagMap3DTab(QWidget):
         label_mode_label.setStyleSheet(f"color: {RED_A};")
         label_mode_row.addWidget(label_mode_label)
         self.cohort_label_mode_combo = QComboBox()
+        # Ordered by performance impact (lightest first)
         self.cohort_label_mode_combo.addItems([
+            "Selected Only",
+            "Selected & N neighbors",
             "Top N largest",
             "Above size threshold",
             "All cohorts",
         ])
         self.cohort_label_mode_combo.setToolTip(
             "Controls which cohort labels are shown to avoid overlap noise.\n"
+            "Selected Only = only the currently selected cohort's label.\n"
+            "Selected & N neighbors = selected cohort + its N nearest neighbors (by centroid distance).\n"
             "Top N largest = only the N biggest cohorts (biggest to smallest).\n"
             "Above size threshold = only cohorts with at least N files.\n"
             "All cohorts = show every cohort label (can be noisy)."
         )
         self.cohort_label_mode_combo.currentTextChanged.connect(self._on_cohort_label_mode_changed)
+        # Default to "Selected & N neighbors" (index 1) on a fresh launch.
+        self.cohort_label_mode_combo.setCurrentIndex(1)
         label_mode_row.addWidget(self.cohort_label_mode_combo)
         label_mode_row.addStretch()
         cohort_layout.addLayout(label_mode_row)
 
-        # N parameter (used by Top N largest / Above size threshold modes)
+        # N parameter (used by Top N / Above threshold / Selected & N neighbors modes)
         n_row = QHBoxLayout()
         n_label = QLabel("N:")
         n_label.setStyleSheet(f"color: {RED_A};")
         n_row.addWidget(n_label)
         self.cohort_label_n_spin = QSpinBox()
         self.cohort_label_n_spin.setRange(1, 500)
-        self.cohort_label_n_spin.setValue(10)
-        self.cohort_label_n_spin.setToolTip("Number of cohort labels to show (Top N largest) or minimum cohort size (Above size threshold).")
+        self.cohort_label_n_spin.setValue(5)
+        self.cohort_label_n_spin.setToolTip("Number of cohort labels to show (Top N largest), minimum cohort size (Above size threshold), or number of neighboring cohorts (Selected & N neighbors).")
         self.cohort_label_n_spin.valueChanged.connect(self._on_cohort_label_n_changed)
         n_row.addWidget(self.cohort_label_n_spin)
         n_row.addStretch()
@@ -2164,7 +2475,7 @@ class TagMap3DTab(QWidget):
         label_size_row.addWidget(label_size_label)
         self.cohort_label_size_spin = QSpinBox()
         self.cohort_label_size_spin.setRange(4, 40)
-        self.cohort_label_size_spin.setValue(14)
+        self.cohort_label_size_spin.setValue(18)
         self.cohort_label_size_spin.setToolTip("Fixed text size for cohort labels.")
         self.cohort_label_size_spin.valueChanged.connect(self._on_cohort_label_size_changed)
         label_size_row.addWidget(self.cohort_label_size_spin)
@@ -2242,6 +2553,7 @@ class TagMap3DTab(QWidget):
         cohort_layout.addLayout(label_color_row)
 
         cohort_group.setLayout(cohort_layout)
+        self._cohort_group = cohort_group  # reorganized into tabs in setup_ui
         layout.addWidget(cohort_group)
 
         # Tag Importance Section
@@ -2267,11 +2579,88 @@ class TagMap3DTab(QWidget):
         importance_layout.addWidget(self.tag_importance_text)
 
         importance_group.setLayout(importance_layout)
+        self._importance_group = importance_group  # reorganized into tabs in setup_ui
         layout.addWidget(importance_group)
 
         layout.addStretch()
         sidebar.setLayout(layout)
         return sidebar
+
+    def _reorganize_sidebars(self):
+        """Reorganize the right sidebar into tabs and move shared widgets.
+
+        Called from setup_ui after both sidebars are built:
+        - Right sidebar gets a tab bar (Actions | Visuals).
+        - Camera Wobble group moves from left panel to the Visuals tab.
+        - Tag query grid moves from "Selected File Info" into Filter Settings (left).
+        - Status label + progress bar are pinned to the left sidebar bottom.
+        - "Send to Tab" is pinned to the right sidebar bottom (below the tabs).
+        """
+        # --- Right sidebar: wrap existing groups in a QTabWidget ---
+        right_layout = self.right_sidebar.layout()
+
+        visuals_tab = QWidget()
+        visuals_lay = QVBoxLayout(visuals_tab)
+        visuals_lay.setContentsMargins(0, 0, 0, 0)
+        visuals_lay.addWidget(self._vis_group)
+        visuals_lay.addWidget(self.wobble_group)      # moved from left panel
+        visuals_lay.addWidget(self._cohort_group)
+
+        actions_tab = QWidget()
+        actions_lay = QVBoxLayout(actions_tab)
+        actions_lay.setContentsMargins(0, 0, 0, 0)
+        actions_lay.addWidget(self._info_group)
+        actions_lay.addWidget(self._selection_tags_group)
+        # Tag importance sits directly under Cohort Tag Data.
+        actions_lay.addWidget(self._importance_group)
+
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: 1px solid {TAB_BORDER};
+                background-color: {TAB_BACKGROUND};
+            }}
+            QTabBar::tab {{
+                background-color: {TAB_BACKGROUND};
+                color: {TAB_TEXT};
+                padding: 6px;
+                font-size: 13px;
+                border: none;
+            }}
+            QTabBar::tab:selected {{
+                background-color: {TAB_SELECTED};
+            }}
+            QTabBar::tab:hover {{
+                background-color: rgb(50, 70, 170);
+            }}
+        """)
+        self.right_tabs.addTab(actions_tab, "Actions")
+        self.right_tabs.addTab(visuals_tab, "Visuals")
+
+        # Insert the tab widget at the top of the right sidebar (before the stretch).
+        right_layout.insertWidget(0, self.right_tabs)
+
+        # --- Pin "Send to Tab" to the bottom of the right sidebar (below tabs) ---
+        # The sidebar layout ends with a stretch; adding after it keeps the group
+        # at the very bottom regardless of tab content height.
+        right_layout.addWidget(self._send_group)
+
+        # --- Move status label + progress bar to the left sidebar bottom ---
+        # The left panel layout ends with a stretch, so widgets added after it
+        # sit at the very bottom of the left sidebar.
+        left_layout = self.left_sidebar.layout()
+        for w in (self.progress_bar, self.phase_label, self.status_label):
+            if w is not None:
+                w.setParent(self.left_sidebar)
+                left_layout.addWidget(w)
+
+        # --- Move tag query grid into Filter Settings (left panel) ---
+        if hasattr(self, '_filter_layout') and getattr(self, 'tag_container', None) is not None:
+            self.tag_container.setParent(None)  # detach from info layout
+            tq_label = QLabel("Tag Query:")
+            tq_label.setStyleSheet(f"color: {RED_A};")
+            self._filter_layout.addRow(tq_label)
+            self._filter_layout.addRow(self.tag_container)
 
     def toggle_sidebar(self):
         """Toggle visibility of the right sidebar."""
@@ -2705,10 +3094,45 @@ class TagMap3DTab(QWidget):
             max_count = max(len(nodes) for nodes in cluster_nodes.values()) if cluster_nodes else 1
             base_size = self.cohort_label_size_spin.value()
 
+            # Resolve the currently selected cohort (a single-node selection
+            # counts as its cohort). Needed by both "Selected Only" mode and
+            # the always-include-selected fallback below.
+            selected_cid = self.selected_cluster_id
+            if selected_cid is None and self.selected_node_index is not None:
+                if 0 <= self.selected_node_index < len(self.node_list):
+                    selected_cid = self.node_list[self.selected_node_index].cluster_id
+
             # Apply label mode filter to avoid overlap noise
             mode = self.cohort_label_mode_combo.currentText()
             n = self.cohort_label_n_spin.value()
-            if mode == "Top N largest":
+            if mode == "Selected Only":
+                # Show only the selected cohort's label (lightest). No-op if none selected.
+                if selected_cid is not None:
+                    cluster_nodes = {cid: nodes for cid, nodes in cluster_nodes.items() if cid == selected_cid}
+                else:
+                    cluster_nodes = {}
+            elif mode == "Selected & N neighbors":
+                # Selected cohort + its N nearest neighbors (by centroid distance).
+                if selected_cid is not None and selected_cid in cluster_nodes:
+                    sel_centroid = np.mean(
+                        [node.position for node in cluster_nodes[selected_cid]], axis=0
+                    )
+                    others = {cid: nodes for cid, nodes in cluster_nodes.items() if cid != selected_cid}
+                    # Rank other cohorts by centroid distance to the selection
+                    def _centroid(nodes):
+                        return np.mean([node.position for node in nodes], axis=0)
+                    ranked = sorted(
+                        others.items(),
+                        key=lambda kv: float(np.linalg.norm(_centroid(kv[1]) - sel_centroid))
+                    )
+                    keep = {selected_cid: cluster_nodes[selected_cid]}
+                    for cid, nodes in ranked[:n]:
+                        keep[cid] = nodes
+                    cluster_nodes = keep
+                else:
+                    # No valid selection -> nothing to anchor neighbors to.
+                    cluster_nodes = {}
+            elif mode == "Top N largest":
                 # Sort cohorts by size descending, keep top N
                 sorted_cohorts = sorted(cluster_nodes.items(), key=lambda kv: len(kv[1]), reverse=True)
                 cluster_nodes = dict(sorted_cohorts[:n])
@@ -2719,11 +3143,7 @@ class TagMap3DTab(QWidget):
 
             # Always include the selected cohort so it gets a label even when
             # the label mode filter excluded it (e.g. outside top N or below
-            # the size threshold). A single-node selection counts as its cohort.
-            selected_cid = self.selected_cluster_id
-            if selected_cid is None and self.selected_node_index is not None:
-                if 0 <= self.selected_node_index < len(self.node_list):
-                    selected_cid = self.node_list[self.selected_node_index].cluster_id
+            # the size threshold).
             if selected_cid is not None and selected_cid not in cluster_nodes:
                 selected_nodes = [node for node in self.node_list if node.cluster_id == selected_cid]
                 if selected_nodes:
@@ -2965,11 +3385,100 @@ class TagMap3DTab(QWidget):
         for btn in (self.cut_button, self.pop_button, self.cluster_button):
             btn.setEnabled(enabled)
 
+    def _release_session_data(self):
+        """Drop all session data and free resources (CPU + GPU).
+
+        Removes GL items from the view, clears cached numpy arrays, node
+        list, scene graph and tag data, then forces a garbage collection.
+        Called before starting a new load to avoid OOM when the previous
+        session's memory is still held while new data is being fetched.
+        """
+        # Stop timers that reference session state
+        for timer in (getattr(self, 'selection_timer', None),
+                      getattr(self, 'cohort_label_blink_timer', None),
+                      getattr(self, 'twinkle_timer', None),
+                      getattr(self, 'time_travel_timer', None)):
+            if timer is not None:
+                try:
+                    timer.stop()
+                except RuntimeError:
+                    pass
+
+        # Remove GL items (frees GPU vertex buffers)
+        self._remove_highlight_item()
+        self._remove_twinkle_item()
+        for item in list(getattr(self, 'cohort_label_items', []) or []):
+            try:
+                self.gl_view.removeItem(item)
+            except (ValueError, KeyError, RuntimeError):
+                pass
+        if getattr(self, 'gl_scatter', None) is not None:
+            try:
+                self.gl_view.removeItem(self.gl_scatter)
+            except (ValueError, KeyError, RuntimeError):
+                pass
+
+        # Clear cached numpy arrays and data structures
+        for attr in ('_base_positions', '_base_sizes', '_base_colors_rgba',
+                     '_base_cluster_ids'):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        self.gl_scatter = None
+        self.node_list = []
+        self.scene_graph = None
+        self.tag_data = None
+        self.tag_interner = None
+        if hasattr(self, 'file_ids'):
+            self.file_ids = []
+
+        # Reset selection state + info panels
+        self.selected_node_index = None
+        self.selected_cluster_id = None
+        self.selection_visible = False
+        self.cohort_label_items = []
+        self.cohort_label_map = {}
+        self.tag_query_states.clear()
+        self._clear_tag_widgets()
+        if hasattr(self, 'info_text'):
+            self.info_text.clear()
+        if hasattr(self, 'selection_tags_text'):
+            self.selection_tags_text.clear()
+        if hasattr(self, 'tag_importance_text'):
+            self.tag_importance_text.clear()
+
+        # Sync split window (clears its grid)
+        if getattr(self, 'split_window', None) is not None:
+            try:
+                self.split_window.clear_grid()
+            except RuntimeError:
+                pass
+
+        import gc
+        gc.collect()
+
+    def clear_session(self):
+        """Clear button handler: drop the current session and free memory."""
+        if self._is_worker_busy():
+            self.status_label.setText("Please wait - a process is already running.")
+            return
+        self._release_session_data()
+        self.recompute_button.setEnabled(False)
+        self.recluster_button.setEnabled(False)
+        self.optimize_button.setEnabled(False)
+        self.send_to_tab_btn.setEnabled(False)
+        self.time_travel_button.setEnabled(False)
+        self._set_cohort_action_buttons(False)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Session cleared - memory freed. Ready for a new load.")
+
     def start_loading(self):
         """Start the data loading and computation process."""
         if self._is_worker_busy():
             self.status_label.setText("Please wait - a process is already running.")
             return
+        # Free the previous session's resources BEFORE starting the query so
+        # old GPU buffers / node objects don't pile up on top of new data (OOM).
+        self._release_session_data()
         self.load_button.setEnabled(False)
         self.recompute_button.setEnabled(False)
         self.recluster_button.setEnabled(False)
@@ -3044,10 +3553,10 @@ class TagMap3DTab(QWidget):
         spread = float(self.spread_spin.value())
         whitelist = [t.strip() for t in self.whitelist_edit.text().split(',') if t.strip()]
         blacklist = [t.strip() for t in self.blacklist_edit.text().split(',') if t.strip()]
-        drop_empty = self.drop_empty_checkbox.isChecked() if hasattr(self, 'drop_empty_checkbox') else False
+        drop_empty = getattr(self, 'drop_empty_files', False)
         query = self.query_edit.text().strip()
         min_doc_freq = self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3
-        drop_universal = self.drop_universal_checkbox.isChecked() if hasattr(self, 'drop_universal_checkbox') else False
+        drop_universal = getattr(self, 'drop_universal', True)
 
         # Connect to client
         self.worker.progress.emit(5, f"Connecting to {client_name}...")
@@ -3272,7 +3781,7 @@ class TagMap3DTab(QWidget):
         min_samples = self.min_samples_spin.value()
         node_size = float(self.min_size_spin.value()) / 10.0
         min_doc_freq = self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3
-        drop_universal = self.drop_universal_checkbox.isChecked() if hasattr(self, 'drop_universal_checkbox') else False
+        drop_universal = getattr(self, 'drop_universal', True)
 
         if not tag_data:
             raise RuntimeError("No tag data available")
@@ -3310,16 +3819,10 @@ class TagMap3DTab(QWidget):
         del red
         del sparse_matrix
 
-        # Cosmetic status: positions are ready, before clustering
-        self.worker.progress.emit(55, "Post-processing positions...")
-
-        # Cluster
-        self.worker.progress.emit(70, "Clustering...")
-        clust = Clusterer(eps=eps, min_samples=min_samples)
-        _t_clust = time.perf_counter()
-        cluster_positions = self._maybe_normalize_positions(positions)
-        cluster_labels = clust.fit_predict(cluster_positions)
-        print(f"[Timing] Clustering took {time.perf_counter() - _t_clust:.2f}s")
+        # Recompute is UMAP-only: skip DBSCAN so the user can tune clustering
+        # separately via "Regroup". Mark all nodes as unclustered (noise).
+        self.worker.progress.emit(70, "Positions ready (use Regroup to cluster)...")
+        cluster_labels = np.full(len(file_ids), -1, dtype=int)
 
         # Build scene graph
         self.worker.progress.emit(85, "Building scene graph...")
@@ -3392,7 +3895,7 @@ class TagMap3DTab(QWidget):
         min_samples = self.min_samples_spin.value()
         node_size = float(self.min_size_spin.value()) / 10.0
         min_doc_freq = self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3
-        drop_universal = self.drop_universal_checkbox.isChecked() if hasattr(self, 'drop_universal_checkbox') else False
+        drop_universal = getattr(self, 'drop_universal', True)
 
         # Vectorize the subset
         self.worker.progress.emit(10, "Vectorizing sub-cohort...")
@@ -3466,20 +3969,22 @@ class TagMap3DTab(QWidget):
             self.status_label.setText("Please wait - a process is already running.")
             return
 
-        removed = [n for n in self.node_list if n.cluster_id == self.selected_cluster_id]
-        remaining = [n for n in self.node_list if n.cluster_id != self.selected_cluster_id]
-        if not remaining:
+        cluster_id = self.selected_cluster_id
+        # Count removed/remaining in one pass (no list allocation of 2M objects)
+        removed_count = sum(1 for n in self.node_list if n.cluster_id == cluster_id)
+        total = len(self.node_list)
+        if total - removed_count <= 0:
             self.status_label.setText("Cannot pop: this is the only cohort in the view.")
             return
 
         # Clear the selection (the cohort is about to disappear)
         self.clear_selection()
 
-        self.status_label.setText(f"Popping cohort {self.selected_cluster_id} ({len(removed)} files)...")
+        self.status_label.setText(f"Popping cohort {cluster_id} ({removed_count} files)...")
         self._set_cohort_action_buttons(False)
 
         def worker_func():
-            return self._pop_compute(remaining)
+            return self._pop_compute(cluster_id, removed_count)
 
         self.worker = WorkerThread(worker_func)
         self.worker.progress.connect(self.update_progress)
@@ -3487,45 +3992,28 @@ class TagMap3DTab(QWidget):
         self.worker.error.connect(self.on_loading_error)
         self.worker.start()
 
-    def _pop_compute(self, remaining_nodes):
-        """Rebuild the scene without the popped cohort (positions unchanged)."""
-        import numpy as np
-        from src.core.models import SceneGraph
+    def _pop_compute(self, cluster_id, removed_count):
+        """Remove the popped cohort from the scene (positions unchanged).
 
-        node_size = float(self.min_size_spin.value()) / 10.0
+        Fast path: reuses existing node/cluster objects via SceneGraph.
+        without_cluster() instead of rebuilding 2M TagNode objects and copying
+        every tag list. Only the popped cohort's file IDs are dropped from
+        tag_data.
+        """
+        self.worker.progress.emit(40, "Removing cohort...")
 
-        file_ids = [n.file_id for n in remaining_nodes]
-        positions = np.array([n.position for n in remaining_nodes])
-        cluster_labels = np.array([n.cluster_id for n in remaining_nodes])
-        tag_data = {}
-        for n in remaining_nodes:
-            tag_data[n.file_id] = list(n.tags)
+        # Reuse existing scene; drop only the popped cluster's nodes/clusters.
+        scene = self.scene_graph.without_cluster(cluster_id)
 
-        self.worker.progress.emit(40, "Rebuilding scene...")
-        reverse_vocab = self.tag_interner.index_to_tag if self.tag_interner else None
-        scene = SceneGraph()
-        scene.build_from_data(
-            file_ids,
-            positions,
-            tag_data,
-            cluster_labels,
-            node_size=node_size,
-            tokenized=bool(self.tag_interner),
-            reverse_vocab=reverse_vocab,
-        )
+        # Filter tag_data: drop only the popped cohort's file IDs (no list copies).
+        if self.tag_data is not None:
+            removed_ids = {fid for fid, node in self.scene_graph.nodes.items()
+                           if node.cluster_id == cluster_id}
+            self.tag_data = {fid: tags for fid, tags in self.tag_data.items()
+                             if fid not in removed_ids}
 
-        # Preserve original colors so the remaining cohorts look unchanged
-        old_nodes = self.scene_graph.nodes if self.scene_graph is not None else {}
-        for node in scene.nodes.values():
-            old = old_nodes.get(node.file_id)
-            if old is not None:
-                node.color = old.color
-
-        # Filter tag_data so recompute works on the remaining files
-        self.tag_data = tag_data
-
-        self.worker.progress.emit(100, "Cohort popped!")
-        return scene, tag_data
+        self.worker.progress.emit(100, f"Cohort popped! ({removed_count} files removed)")
+        return scene, self.tag_data
 
     def _recluster_selection(self):
         """Re-cluster the selected cohort using existing positions.
@@ -3671,25 +4159,6 @@ class TagMap3DTab(QWidget):
         if self.tag_data is not None and hasattr(self, 'node_list') and self.node_list:
             self.start_recluster()
 
-    def _update_recluster_button_state(self):
-        """Grey out the recluster button when target params equal last-used params.
-
-        The button unlocks only after the user changes eps/min_samples away from
-        the values that produced the current clusters, preventing accidental
-        redundant recomputation and teaching the button's purpose.
-        """
-        if not hasattr(self, 'recluster_button'):
-            return
-        if getattr(self, '_last_used_eps', None) is None or getattr(self, '_last_used_min_samples', None) is None:
-            # No data processed yet; keep button disabled until data loads
-            self.recluster_button.setEnabled(False)
-            return
-        current_eps = self.eps_spin.value() / 100.0
-        current_min = self.min_samples_spin.value()
-        same = (abs(current_eps - self._last_used_eps) < 1e-9
-                and current_min == self._last_used_min_samples)
-        self.recluster_button.setEnabled(not same)
-
     def start_recluster(self):
         """Start re-applying DBSCAN on all current positions (no re-reduce)."""
         if self.tag_data is None or not hasattr(self, 'node_list') or not self.node_list:
@@ -3770,7 +4239,7 @@ class TagMap3DTab(QWidget):
         consistently across datasets with different file counts / reducer
         scales. Returns the (possibly normalized) positions array.
         """
-        if not getattr(self, 'normalize_positions', False):
+        if not getattr(self, 'normalize_positions', True):
             return positions
         import numpy as np
         positions = np.asarray(positions, dtype=float)
@@ -3900,29 +4369,30 @@ class TagMap3DTab(QWidget):
         self.worker.progress.emit(100, "DBSCAN optimized!")
         return scene, all_tag_data
 
-    def _save_session(self):
-        """Save the current rendered session to a hybrid .npz archive.
+    def _save_session_to_path(self, save_path):
+        """Save the current scene to a hybrid .npz archive at the given path.
 
         Stores positions and cluster labels as compact numpy arrays, and
         metadata (file_ids, tags, colors, sizes, settings, camera) as JSON.
         This lets a future load skip query, metadata, UMAP, and DBSCAN.
+
+        Returns True on success, False if there is no scene to save.
         """
         import numpy as np
         import json
         from pathlib import Path
 
         if self.scene_graph is None or not hasattr(self, 'node_list') or not self.node_list:
-            self.status_label.setText("Error: No scene to save. Load data first.")
-            return
+            return False
 
         scene = self.scene_graph
         nodes = list(scene.nodes.values())
         if not nodes:
-            self.status_label.setText("Error: Scene has no nodes.")
-            return
+            return False
 
         # Build parallel arrays
-        file_ids = [n.file_id for n in nodes]
+        # Convert file_ids to native Python ints (numpy int64 is not JSON-serializable)
+        file_ids = [int(n.file_id) for n in nodes]
         positions = np.array([n.position for n in nodes])  # (n, 3)
         cluster_labels = np.array([n.cluster_id for n in nodes])  # (n,)
         colors = np.array([n.color for n in nodes])  # (n, 3)
@@ -3946,7 +4416,7 @@ class TagMap3DTab(QWidget):
         clusters_meta = []
         for c in scene.clusters.values():
             clusters_meta.append({
-                "id": c.cluster_id,
+                "id": int(c.cluster_id),
                 "centroid": c.centroid.tolist(),
                 "size": len(c.nodes),
                 "dominant_tags": list(c.dominant_tags),
@@ -3972,7 +4442,7 @@ class TagMap3DTab(QWidget):
             "node_size": float(self.min_size_spin.value()) / 10.0,
             "spread": float(self.spread_spin.value()),
             "min_doc_freq": self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3,
-            "drop_universal_tags": self.drop_universal_checkbox.isChecked() if hasattr(self, 'drop_universal_checkbox') else False,
+            "drop_universal_tags": getattr(self, 'drop_universal', True),
             "tokenized": bool(self.tag_interner),
         }
 
@@ -3995,16 +4465,8 @@ class TagMap3DTab(QWidget):
             "camera": camera_meta,
         }
 
-        # Save as hybrid archive in the sessions/ subfolder with a timestamp name
-        import time as _time
-        from pathlib import Path
-
-        sessions_dir = Path("sessions")
-        sessions_dir.mkdir(exist_ok=True)
-
-        # Use timestamp-based filename (user can rename later)
-        timestamp = _time.strftime("%Y%m%d_%H%M%S")
-        save_path = sessions_dir / f"session_{timestamp}.npz"
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
 
         np.savez_compressed(
             save_path,
@@ -4012,9 +4474,34 @@ class TagMap3DTab(QWidget):
             cluster_labels=cluster_labels,
             metadata=json.dumps(metadata).encode('utf-8'),
         )
+        return True
 
-        self.status_label.setText(f"Session saved to {save_path} ({len(nodes)} nodes)")
-        print(f"[Session] Saved {len(nodes)} nodes to {save_path}")
+    def _auto_save_session(self):
+        """Automatically save the current scene to sessions/latest.npz.
+
+        Called after every successful load/recompute so that "Auto load
+        session" can restore it on next launch without reprocessing.
+        Runs silently (no status label change) and never raises.
+        """
+        try:
+            from pathlib import Path
+            save_path = Path("sessions") / "latest.npz"
+            if self._save_session_to_path(save_path):
+                print(f"[Session] Auto-saved to {save_path}")
+        except Exception as e:
+            print(f"[Session] Auto-save failed: {e}")
+
+    def _save_session(self):
+        """Manual save (legacy; button removed). Saves with a timestamp name."""
+        import time as _time
+        from pathlib import Path
+        sessions_dir = Path("sessions")
+        timestamp = _time.strftime("%Y%m%d_%H%M%S")
+        save_path = sessions_dir / f"session_{timestamp}.npz"
+        if self._save_session_to_path(save_path):
+            self.status_label.setText(f"Session saved to {save_path}")
+        else:
+            self.status_label.setText("Error: No scene to save. Load data first.")
 
     def _get_save_path(self, default_path):
         """Prompt for a save path via QFileDialog."""
@@ -4030,49 +4517,64 @@ class TagMap3DTab(QWidget):
             return None, None
         return Path(filename), None
 
-    def _load_session(self):
+    def _load_session(self, path=None):
         """Load a saved session archive directly (skips reprocessing).
 
         Reconstructs the SceneGraph from the hybrid .npz archive and renders
         it immediately — no query, metadata, UMAP, or DBSCAN needed.
+
+        Args:
+            path: Optional explicit path to load. If None, shows a picker.
         """
         import numpy as np
         import json
         from pathlib import Path
         from src.core.models import SceneGraph, TagNode, Cluster
 
-        # List sessions from the sessions/ subfolder
-        from pathlib import Path
-        sessions_dir = Path("sessions")
-        if not sessions_dir.exists():
-            self.status_label.setText("No sessions folder found.")
-            return
+        if path is not None:
+            filename = Path(path)
+            if not filename.exists():
+                self.status_label.setText(f"No session found at {filename}.")
+                return
+        else:
+            # List sessions from the sessions/ subfolder
+            sessions_dir = Path("sessions")
+            if not sessions_dir.exists():
+                self.status_label.setText("No sessions folder found.")
+                return
 
-        session_files = sorted(sessions_dir.glob("*.npz"), reverse=True)
-        if not session_files:
-            self.status_label.setText("No saved sessions found.")
-            return
+            session_files = sorted(sessions_dir.glob("*.npz"), reverse=True)
+            if not session_files:
+                self.status_label.setText("No saved sessions found.")
+                return
 
-        # Prompt user to pick a session by name (inline filename)
-        from PySide6.QtWidgets import QInputDialog
-        names = [f.name for f in session_files]
-        choice, ok = QInputDialog.getItem(
-            self,
-            "Load Session",
-            "Select a session:",
-            names,
-            0,
-            False,
-        )
-        if not ok or not choice:
-            return
-        filename = sessions_dir / choice
+            # Prompt user to pick a session by name (inline filename)
+            from PySide6.QtWidgets import QInputDialog
+            names = [f.name for f in session_files]
+            choice, ok = QInputDialog.getItem(
+                self,
+                "Load Session",
+                "Select a session:",
+                names,
+                0,
+                False,
+            )
+            if not ok or not choice:
+                return
+            filename = sessions_dir / choice
 
         try:
             data = np.load(filename, allow_pickle=True)
             positions = data['positions']
             cluster_labels = data['cluster_labels']
-            metadata = json.loads(data['metadata'].decode('utf-8'))
+            # metadata is stored as a 0-d object array holding bytes; extract it.
+            meta_raw = data['metadata']
+            if isinstance(meta_raw, np.ndarray):
+                meta_raw = meta_raw.item()
+            if isinstance(meta_raw, bytes):
+                metadata = json.loads(meta_raw.decode('utf-8'))
+            else:
+                metadata = json.loads(str(meta_raw))
 
             file_ids = metadata['file_ids']
             tags_list = metadata['tags']
@@ -4154,7 +4656,7 @@ class TagMap3DTab(QWidget):
             if metric_idx >= 0:
                 self.metric_combo.setCurrentIndex(metric_idx)
             if hasattr(self, 'subsample_checkbox'):
-                self.subsample_checkbox.setChecked(settings_meta.get("subsample_enabled", True))
+                self.subsample_checkbox.setChecked(settings_meta.get("subsample_enabled", False))
             if hasattr(self, 'subsample_size_spin'):
                 self.subsample_size_spin.setValue(settings_meta.get("subsample_size", 70000))
             self.eps_spin.setValue(settings_meta.get("eps", 0.5) * 100.0)
@@ -4164,8 +4666,7 @@ class TagMap3DTab(QWidget):
             self.spread_spin.setValue(settings_meta.get("spread", 1.0))
             if hasattr(self, 'min_doc_freq_spin'):
                 self.min_doc_freq_spin.setValue(settings_meta.get("min_doc_freq", 3))
-            if hasattr(self, 'drop_universal_checkbox'):
-                self.drop_universal_checkbox.setChecked(settings_meta.get("drop_universal_tags", False))
+            self.drop_universal = settings_meta.get("drop_universal_tags", True)
         except Exception as e:
             print(f"Error applying session settings: {e}")
 
@@ -4241,11 +4742,8 @@ class TagMap3DTab(QWidget):
         else:
             self.render_scene(scene)
 
-        # Record the DBSCAN params that produced this scene so the recluster
-        # button greys out until the user changes them.
-        self._last_used_eps = self.eps_spin.value() / 100.0
-        self._last_used_min_samples = self.min_samples_spin.value()
-        self._update_recluster_button_state()
+        # Auto-save session so "Auto load session" can restore it on next launch.
+        self._auto_save_session()
 
     def on_loading_error(self, error_msg):
         """Handle loading error."""
@@ -4267,7 +4765,9 @@ class TagMap3DTab(QWidget):
             if not hasattr(self, 'gl_view') or not hasattr(self, 'gl_scatter'):
                 return
 
-            # Clear existing scatter
+            # Clear existing scatter, highlight, and twinkle items
+            self._remove_highlight_item()
+            self._remove_twinkle_item()
             if self.gl_scatter:
                 self.gl_view.removeItem(self.gl_scatter)
 
@@ -4404,13 +4904,41 @@ class TagMap3DTab(QWidget):
             if w <= 0 or h <= 0:
                 return
 
-            # Render at 4x via renderToArray (returns BGRA uint8)
-            arr = view.renderToArray(size=(w * 4, h * 4))
+            ss = 4
+
+            # pxMode=False point sprites get their pixel size from the widget height,
+            # but we render into a 4x-taller buffer. Scale point sizes up by `ss` so
+            # that after downsampling they appear at normal size (otherwise tiny).
+            saved_sizes = []
+            for name in ('gl_scatter', 'gl_highlight', 'gl_twinkle'):
+                s = getattr(self, name, None)
+                if s is None:
+                    continue
+                try:
+                    orig = s.size
+                    scaled = np.asarray(orig, dtype=np.float32) * ss
+                    s.setData(size=scaled)
+                    saved_sizes.append((s, orig))
+                except Exception:
+                    pass
+
+            try:
+                # Render at 4x via renderToArray (returns BGRA uint8)
+                arr = view.renderToArray(size=(w * ss, h * ss))
+            finally:
+                for s, orig in saved_sizes:
+                    try:
+                        s.setData(size=orig)
+                    except Exception:
+                        pass
             arr = np.ascontiguousarray(arr)
-            # renderToArray returns BGRA; swap R/B for QImage ARGB32
-            bgr = arr[..., 0].copy()
-            arr[..., 0] = arr[..., 2]
-            arr[..., 2] = bgr
+            # renderToArray renders into an FBO that is never cleared, so its alpha
+            # channel is uninitialized garbage. Force it opaque (255).
+            arr[..., 3] = 255
+            # NOTE: no R/B swap here. renderToArray returns BGRA bytes and Qt's
+            # Format_ARGB32 stores pixels as B,G,R,A in memory on little-endian
+            # Windows, so the buffer is consumed AS-IS. Swapping it (as before)
+            # made Qt read red as blue and vice versa.
             img = QImage(arr.data, arr.shape[1], arr.shape[0], QImage.Format.Format_ARGB32)
             img = img.copy()  # detach from numpy buffer
 
@@ -4432,6 +4960,74 @@ class TagMap3DTab(QWidget):
             import traceback
             print(f"Supersample render failed: {e}")
             traceback.print_exc()
+
+    def _take_supersample_screenshot(self):
+        """Render the GL scene at 4x and save it to screenshots/ as a PNG (F12).
+
+        Saves the FULL 4x-resolution image (not downsampled) so the snapshot is
+        crisp. The point sizes are scaled up for the render then restored, same
+        as the live supersample path.
+        """
+        try:
+            from PySide6.QtGui import QImage
+            import numpy as np
+
+            if not hasattr(self, 'gl_view') or self.gl_view is None:
+                self.status_label.setText("No 3D view to capture.")
+                return
+            view = self.gl_view
+            w = view.width()
+            h = view.height()
+            if w <= 0 or h <= 0:
+                self.status_label.setText("3D view not ready yet.")
+                return
+
+            ss = 4
+            # Scale point sizes up for the taller buffer (restored afterwards).
+            saved_sizes = []
+            for name in ('gl_scatter', 'gl_highlight', 'gl_twinkle'):
+                s = getattr(self, name, None)
+                if s is None:
+                    continue
+                try:
+                    orig = s.size
+                    s.setData(size=np.asarray(orig, dtype=np.float32) * ss)
+                    saved_sizes.append((s, orig))
+                except Exception:
+                    pass
+
+            try:
+                arr = view.renderToArray(size=(w * ss, h * ss))
+            finally:
+                for s, orig in saved_sizes:
+                    try:
+                        s.setData(size=orig)
+                    except Exception:
+                        pass
+
+            arr = np.ascontiguousarray(arr)
+            arr[..., 3] = 255  # FBO alpha is uninitialized; force opaque
+            # No R/B swap: renderToArray returns BGRA, which matches Qt's
+            # in-memory ARGB32 layout (B,G,R,A) on little-endian Windows.
+            img = QImage(arr.data, arr.shape[1], arr.shape[0], QImage.Format.Format_ARGB32)
+            img = img.copy()
+
+            # Save to a screenshots/ folder at the project root.
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            out_dir = os.path.join(project_root, "screenshots")
+            os.makedirs(out_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            out_path = os.path.join(out_dir, f"hydruxiom_{stamp}.png")
+            if img.save(out_path, "PNG"):
+                self.status_label.setText(f"Screenshot saved: {out_path}")
+                print(f"Screenshot saved to {out_path} ({img.width()}x{img.height()})")
+            else:
+                self.status_label.setText("Failed to save screenshot.")
+        except Exception as e:
+            import traceback
+            print(f"Screenshot failed: {e}")
+            traceback.print_exc()
+            self.status_label.setText(f"Screenshot failed: {e}")
 
     def _fit_camera_to_data(self, positions):
         """Fit the camera view to the bounding box of the data.
@@ -4571,21 +5167,20 @@ class TagMap3DTab(QWidget):
         self.show_node_info(node_index)
     
     def _toggle_selection_highlight(self):
-        """Toggle the visual highlight for selected node/cluster."""
+        """Toggle the visual highlight for selected node/cluster.
+
+        Uses a separate highlight scatter item (only the selected points)
+        so the blink timer just toggles visibility — zero GPU upload per tick.
+        """
         if self.gl_scatter is None or self.node_list is None:
             return
-        
-        import numpy as np
-        
+
         # Toggle visibility state
         self.selection_visible = not self.selection_visible
-        
-        if self.selected_node_index is not None:
-            # Single node selection
-            self._highlight_single_node(self.selected_node_index)
-        elif self.selected_cluster_id is not None:
-            # Cluster selection
-            self._highlight_cluster(self.selected_cluster_id)
+
+        # Just toggle the highlight item's visibility (no color re-upload)
+        if hasattr(self, 'gl_highlight') and self.gl_highlight is not None:
+            self.gl_highlight.setVisible(self.selection_visible)
     
     def _build_base_scatter(self):
         """Build and cache the base scatter (positions/sizes/base colors/cluster_ids).
@@ -4604,6 +5199,9 @@ class TagMap3DTab(QWidget):
         self._base_positions = positions
         self._base_sizes = sizes
         self._base_colors_rgba = colors_rgba
+        # Re-spawn twinkle nodes if active (positions may have changed)
+        if getattr(self, 'twinkle_active', False):
+            self._spawn_twinkle_nodes()
         return positions, sizes, colors_rgba
 
     def _apply_highlight_colors(self, colors_rgba):
@@ -4613,54 +5211,100 @@ class TagMap3DTab(QWidget):
         self.gl_scatter.setData(color=colors_rgba)
 
     def _highlight_single_node(self, node_index):
-        """Apply or remove highlight for a single node (in-place color update)."""
+        """Apply highlight for a single node using a separate highlight item.
+
+        The base scatter gets dimmed once (persistent). A small highlight
+        scatter shows the selected node. Blink just toggles visibility.
+        """
         if not (0 <= node_index < len(self.node_list)):
             return
         import numpy as np
 
-        # Use cached base colors if available, else build
         if not hasattr(self, '_base_colors_rgba') or self._base_colors_rgba is None:
             self._build_base_scatter()
-        colors_rgba = self._base_colors_rgba.copy()
 
-        # Dimming is persistent while a selection is active (independent of blink).
-        # Vectorized: dim every row's alpha except the selected node.
+        # Dim base scatter (persistent, applied once)
         if self.dim_non_selected_checkbox.isChecked():
+            colors_rgba = self._base_colors_rgba.copy()
             dim_alpha = self.dim_alpha_spin.value()
             mask = np.ones(len(colors_rgba), dtype=bool)
             mask[node_index] = False
             colors_rgba[mask, 3] = dim_alpha
+            self._apply_highlight_colors(colors_rgba)
+        else:
+            self._apply_highlight_colors(self._base_colors_rgba)
 
-        # Blink only the selected node highlight
-        if self.selection_visible:
-            colors_rgba[node_index] = [1.0, 1.0, 0.0, 1.0]  # Bright yellow, fully opaque
-
-        # Update colors in-place (no scatter recreate)
-        self._apply_highlight_colors(colors_rgba)
+        # Create/update highlight item (single point)
+        self._update_highlight_item(
+            positions=self._base_positions[node_index:node_index+1],
+            color=[self.highlight_color[0], self.highlight_color[1], self.highlight_color[2], 1.0]
+        )
 
     def _highlight_cluster(self, cluster_id):
-        """Apply or remove highlight for all nodes in a cluster (in-place)."""
+        """Apply highlight for a cluster using a separate highlight item.
+
+        The base scatter gets dimmed once (persistent). A small highlight
+        scatter shows the selected cluster's points. Blink just toggles visibility.
+        """
         import numpy as np
 
-        # Use cached base colors if available, else build
         if not hasattr(self, '_base_colors_rgba') or self._base_colors_rgba is None:
             self._build_base_scatter()
-        colors_rgba = self._base_colors_rgba.copy()
 
-        # Use cached cluster_ids array (built once in _build_base_scatter).
-        cluster_ids = self._base_cluster_ids
-
-        # Dimming is persistent while a selection is active (independent of blink).
-        # Vectorized: dim every node NOT in the selected cluster.
+        # Dim base scatter (persistent, applied once)
         if self.dim_non_selected_checkbox.isChecked():
+            colors_rgba = self._base_colors_rgba.copy()
+            cluster_ids = self._base_cluster_ids
             colors_rgba[cluster_ids != cluster_id, 3] = self.dim_alpha_spin.value()
+            self._apply_highlight_colors(colors_rgba)
+        else:
+            self._apply_highlight_colors(self._base_colors_rgba)
 
-        # Blink only the selected cluster highlight
-        if self.selection_visible:
-            colors_rgba[cluster_ids == cluster_id] = [0.0, 1.0, 1.0, 1.0]  # Bright cyan, fully opaque
+        # Create/update highlight item (cluster points only)
+        cluster_ids = self._base_cluster_ids
+        mask = cluster_ids == cluster_id
+        self._update_highlight_item(
+            positions=self._base_positions[mask],
+            color=[self.highlight_color[0], self.highlight_color[1], self.highlight_color[2], 1.0]
+        )
 
-        # Update colors in-place (no scatter recreate)
-        self._apply_highlight_colors(colors_rgba)
+    def _update_highlight_item(self, positions, color):
+        """Create or update the separate highlight scatter item.
+
+        Only contains the selected points (not all 2M), so GPU upload
+        is tiny. Blink timer just toggles visibility.
+        """
+        import numpy as np
+        import pyqtgraph.opengl as gl
+
+        if len(positions) == 0:
+            self._remove_highlight_item()
+            return
+
+        # Remove old highlight item if exists
+        self._remove_highlight_item()
+
+        n = len(positions)
+        colors = np.tile(np.array(color, dtype=np.float32), (n, 1))
+        sizes = np.full(n, self.min_size_spin.value() / 10.0 * 1.5)  # Slightly larger
+
+        self.gl_highlight = gl.GLScatterPlotItem(
+            pos=positions,
+            size=sizes,
+            color=colors,
+            pxMode=False
+        )
+        self.gl_highlight.setVisible(self.selection_visible)
+        self.gl_view.addItem(self.gl_highlight)
+
+    def _remove_highlight_item(self):
+        """Remove the highlight scatter item if it exists."""
+        if hasattr(self, 'gl_highlight') and self.gl_highlight is not None:
+            try:
+                self.gl_view.removeItem(self.gl_highlight)
+            except (ValueError, KeyError):
+                pass
+            self.gl_highlight = None
     
     def _update_scatter_plot(self, positions, sizes, colors_rgba):
         """Update the scatter plot with new positions, sizes, and colors."""
@@ -4707,8 +5351,137 @@ class TagMap3DTab(QWidget):
         # Also update the cohort label dim alpha
         self._update_cohort_labels()
 
+    def _pick_highlight_color(self):
+        """Open color picker for the highlight/blink color."""
+        from PySide6.QtWidgets import QColorDialog
+        from PySide6.QtGui import QColor
+        current = QColor(int(self.highlight_color[0]*255), int(self.highlight_color[1]*255), int(self.highlight_color[2]*255))
+        color = QColorDialog.getColor(current, self, "Highlight Color")
+        if color.isValid():
+            self.highlight_color = (color.red()/255.0, color.green()/255.0, color.blue()/255.0)
+            r, g, b = int(color.red()), int(color.green()), int(color.blue())
+            self.highlight_color_btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: black; font-weight: bold;")
+            # Re-apply if a selection is active
+            self._reapply_selection_style()
+
+    # ─── Star Twinkle Effect ───────────────────────────────────────────────
+
+    def _on_twinkle_toggle(self, state):
+        """Start or stop the star twinkle animation."""
+        # Guard: state attrs may not exist yet during early load_settings()
+        if not hasattr(self, 'twinkle_timer'):
+            return
+        self.twinkle_active = bool(state)
+        if self.twinkle_active:
+            if not hasattr(self, '_base_positions') or self._base_positions is None:
+                # No scene loaded yet; disable the checkbox
+                self.twinkle_checkbox.setChecked(False)
+                return
+            self._spawn_twinkle_nodes()
+            self.twinkle_timer.start(33)  # ~30 fps
+        else:
+            self.twinkle_timer.stop()
+            self._remove_twinkle_item()
+
+    def _on_twinkle_param_changed(self):
+        """Restart twinkle with new parameters if active."""
+        if not hasattr(self, 'twinkle_active'):
+            return
+        if self.twinkle_active and hasattr(self, '_base_positions') and self._base_positions is not None:
+            self._spawn_twinkle_nodes()
+
+    def _spawn_twinkle_nodes(self):
+        """Pick a random set of nodes and assign them lifespans/phases."""
+        n_total = len(self._base_positions)
+        if n_total == 0:
+            return
+        count = min(self.twinkle_count_spin.value(), n_total)
+        now = time.perf_counter()
+
+        self.twinkle_indices = np.random.choice(n_total, size=count, replace=False).astype(np.int32)
+        lifespan_min = self.twinkle_lifespan_min_spin.value()
+        lifespan_max = max(self.twinkle_lifespan_max_spin.value(), lifespan_min)
+        # All nodes are born now; the random lifespan distribution naturally staggers
+        # their deaths over time (short-lived ones get replaced first, long-lived later).
+        self.twinkle_birth = np.full(count, now)
+        self.twinkle_lifespan = np.random.uniform(lifespan_min, lifespan_max, size=count)
+        self.twinkle_phase = np.random.uniform(0, 2 * np.pi, size=count)
+
+        # Create the twinkle scatter item (positions are static, colors update per frame)
+        self._remove_twinkle_item()
+        import pyqtgraph.opengl as gl
+        positions = self._base_positions[self.twinkle_indices]
+        node_size = self.min_size_spin.value() / 10.0
+        sizes = np.full(count, node_size * 1.2)
+        # Initial colors: base colors of those nodes
+        base_colors = self._base_colors_rgba[self.twinkle_indices] if hasattr(self, '_base_colors_rgba') else None
+        if base_colors is None:
+            base_colors = np.tile([0.5, 0.5, 0.5, 1.0], (count, 1))
+        self.gl_twinkle = gl.GLScatterPlotItem(
+            pos=positions, size=sizes, color=base_colors, pxMode=False
+        )
+        self.gl_view.addItem(self.gl_twinkle)
+
+    def _update_twinkle(self):
+        """Per-frame twinkle update: compute brightness, replace dead nodes."""
+        if not self.twinkle_active or self.gl_twinkle is None:
+            return
+        now = time.perf_counter()
+        freq = self.twinkle_freq_spin.value()
+        brightness_mult = self.twinkle_brightness_spin.value()
+
+        # Compute per-node blink intensity: 0.5 + 0.5 * sin(2π * freq * t + phase)
+        age = now - self.twinkle_birth
+        intensity = 0.5 + 0.5 * np.sin(2 * np.pi * freq * age + self.twinkle_phase)
+
+        # Get base colors for active nodes
+        if not hasattr(self, '_base_colors_rgba') or self._base_colors_rgba is None:
+            return
+        base = self._base_colors_rgba[self.twinkle_indices]  # (n, 4)
+
+        # Apply brightness: scale RGB by (1 + intensity * brightness_mult), keep alpha high
+        colors = base.copy()
+        rgb_scale = 1.0 + intensity * brightness_mult
+        colors[:, 0] = np.clip(base[:, 0] * rgb_scale, 0, 1)
+        colors[:, 1] = np.clip(base[:, 1] * rgb_scale, 0, 1)
+        colors[:, 2] = np.clip(base[:, 2] * rgb_scale, 0, 1)
+        colors[:, 3] = np.clip(0.5 + intensity * 0.5, 0, 1)
+
+        self.gl_twinkle.setData(color=colors)
+
+        # Replace dead nodes (age > lifespan) with new random ones
+        dead_mask = age > self.twinkle_lifespan
+        if np.any(dead_mask):
+            n_dead = int(np.sum(dead_mask))
+            n_total = len(self._base_positions)
+            # Pick new random indices (avoid current active set for variety)
+            new_indices = np.random.choice(n_total, size=n_dead, replace=False).astype(np.int32)
+            lifespan_min = self.twinkle_lifespan_min_spin.value()
+            lifespan_max = max(self.twinkle_lifespan_max_spin.value(), lifespan_min)
+
+            # Update arrays in place
+            self.twinkle_indices[dead_mask] = new_indices
+            self.twinkle_birth[dead_mask] = now
+            self.twinkle_lifespan[dead_mask] = np.random.uniform(lifespan_min, lifespan_max, size=n_dead)
+            self.twinkle_phase[dead_mask] = np.random.uniform(0, 2 * np.pi, size=n_dead)
+
+            # Update positions in the scatter item (only changed points)
+            new_positions = self._base_positions[new_indices]
+            # Rebuild full position array for setData (cheap: only `count` points)
+            all_positions = self._base_positions[self.twinkle_indices]
+            self.gl_twinkle.setData(pos=all_positions)
+
+    def _remove_twinkle_item(self):
+        """Remove the twinkle scatter item if it exists."""
+        if self.gl_twinkle is not None:
+            try:
+                self.gl_view.removeItem(self.gl_twinkle)
+            except (ValueError, KeyError):
+                pass
+            self.gl_twinkle = None
+
     def toggle_split_window(self):
-        """Toggle the split image preview window (F4)."""
+        """Toggle the media viewer window on/off (F4, works app-wide)."""
         if self.split_window is None:
             self.split_window = TagMap3DSplitWindow(self)
             self.split_window.show()
@@ -4745,6 +5518,8 @@ class TagMap3DTab(QWidget):
     def _load_single_file(self, file_id):
         """Load a single full-res file into the split window asynchronously."""
         self._pending_single_file_id = file_id
+        # This is a node-selection load, not a thumbnail zoom.
+        self._zoom_pending_file_id = None
         self.single_loader = SingleFileLoader(
             self.client_combo.currentText(),
             file_id,
@@ -4754,16 +5529,53 @@ class TagMap3DTab(QWidget):
         self.single_loader.start()
 
     def _on_single_pixmap_ready(self, pixmap, tooltip):
-        """Display a loaded full-res single file (main thread)."""
+        """Display a loaded full-res single file (main thread).
+
+        Two triggers share this handler:
+        - Node selection (single node in 3D view): tied to selected_node_index.
+        - Thumbnail zoom (clicking a grid image): tracked via _zoom_pending_file_id,
+          and NOT tied to any node selection.
+        """
         if self.split_window is None or not self.split_window.isVisible():
             return
-        # Guard: selection may have changed while the file was loading
+
+        fid = getattr(self, '_zoom_pending_file_id', None)
+        if fid is not None:
+            # Thumbnail zoom: show it; clicking again returns to the grid.
+            self._zoom_pending_file_id = None
+            self.split_window.show_single_image(pixmap, tooltip=tooltip, file_id=fid)
+            return
+
+        # Node-selection path: guard against stale loads if selection changed.
         if self.selected_node_index is None:
             return
         file_ids = self._get_selected_file_ids()
         if file_ids and file_ids[0] != getattr(self, '_pending_single_file_id', None):
             return
         self.split_window.show_single_image(pixmap, tooltip=tooltip)
+
+    def _open_file_in_viewer(self, file_id):
+        """Open a single file full-res in the media viewer (thumbnail click)."""
+        if self.split_window is None or not self.split_window.isVisible():
+            return
+        # Remember which file we zoomed into so the ready handler can tag it.
+        self._zoom_pending_file_id = str(file_id)
+        self.single_loader = SingleFileLoader(
+            self.client_combo.currentText(),
+            file_id,
+            parent=self
+        )
+        self.single_loader.pixmap_ready.connect(self._on_single_pixmap_ready)
+        self.single_loader.start()
+
+    def _return_to_grid(self, file_id):
+        """Go back from a zoomed full-res image to the thumbnail grid."""
+        if self.split_window is None or not self.split_window.isVisible():
+            return
+        # Rebuild whatever grid was showing before the zoom (cohort files or
+        # cohort representatives) based on the current selection state.
+        self._zoom_pending_file_id = None
+        self._sync_split_window()
 
     def _load_file_grid(self, file_ids):
         """Load a grid of thumbnails for the given file IDs asynchronously."""
@@ -4782,7 +5594,9 @@ class TagMap3DTab(QWidget):
         """Add a loaded pixmap to the split window (main thread)."""
         if self.split_window is None or not self.split_window.isVisible():
             return
-        self.split_window.add_image(pixmap, tooltip=tooltip)
+        # Pass the file id so the thumbnail can be clicked to open full-res.
+        file_id = tooltip.replace("File ", "") if tooltip.startswith("File ") else None
+        self.split_window.add_image(pixmap, tooltip=tooltip, file_id=file_id)
 
     def _load_cohort_representatives(self):
         """Load one representative image per cohort asynchronously (clickable tiles)."""
@@ -4851,6 +5665,7 @@ class TagMap3DTab(QWidget):
         self.selected_node_index = None
         self.selected_cluster_id = None
         self.selection_visible = False
+        self._remove_highlight_item()
         # Clear tag state and widgets
         self.tag_query_states.clear()
         self._clear_tag_widgets()
@@ -4938,6 +5753,8 @@ class TagMap3DTab(QWidget):
 
             # Set up selection highlight
             self.selected_node_index = node_index
+            self.selection_visible = True
+            self._highlight_single_node(node_index)  # Create highlight item + dim base
             self.selection_timer.start(500)  # 500ms interval for ~2Hz blink
 
             # Update the cohort tag data panel with the node's cluster cohort
@@ -5030,6 +5847,8 @@ class TagMap3DTab(QWidget):
 
             # Set up cluster selection highlight
             self.selected_cluster_id = cluster_id
+            self.selection_visible = True
+            self._highlight_cluster(cluster_id)  # Create highlight item + dim base
             self.selection_timer.start(500)  # 500ms interval for ~2Hz blink
 
             # Enable cut/pop/re-cluster buttons for the selected cohort
@@ -5345,36 +6164,60 @@ class TagMap3DTab(QWidget):
         """Handle wobble enable/disable toggle."""
         from PySide6.QtCore import Qt
         if state == Qt.CheckState.Checked.value:
+            # Capture the current camera angles as the base for oscillation/spin.
+            self._capture_wobble_base()
             self.wobble_timer.start()
             print("Camera wobble enabled")
         else:
             self.wobble_timer.stop()
             print("Camera wobble disabled")
 
+    def _on_wobble_continuous_toggle(self, state):
+        """Handle continuous-spin toggle. Re-base so there is no camera jump."""
+        if hasattr(self, 'gl_view') and self.gl_view is not None:
+            self._capture_wobble_base()
+        # Reset the spin accumulator so continuous mode starts from current azimuth.
+        self.wobble_spin_azim = 0.0
+
+    def _capture_wobble_base(self):
+        """Store the current camera angles as the wobble/spin base."""
+        if hasattr(self, 'gl_view') and self.gl_view is not None:
+            self.wobble_base_azim = self.gl_view.opts.get('azimuth', 45)
+            self.wobble_base_elev = self.gl_view.opts.get('elevation', 30)
+
     def _update_wobble(self):
-        """Update camera position for wobble effect."""
+        """Update camera position for wobble (oscillate) or continuous spin."""
         import numpy as np
-        if not hasattr(self, 'gl_view'):
+        if not hasattr(self, 'gl_view') or self.gl_view is None:
             return
-        
+
+        # Pause while the user is dragging so manual orbit isn't fought.
+        # Time is NOT advanced here, so the animation resumes smoothly on release.
+        if getattr(self, 'wobble_user_interacting', False):
+            return
+
         # Increment time
-        self.wobble_time += 0.016  # ~60fps timestep
-        
+        dt = 0.016  # ~60fps timestep
+        self.wobble_time += dt
+
         # Get wobble parameters
         speed = self.wobble_speed_spin.value()
         azim_range = self.wobble_azim_range_spin.value()
         elev_range = self.wobble_elev_range_spin.value()
-        
-        # Calculate oscillation using sine waves with different frequencies for each axis
+
         t = self.wobble_time * speed
-        
-        # Get current camera state
-        current_elevation = self.gl_view.opts.get('elevation', 30)
-        current_azimuth = self.gl_view.opts.get('azimuth', 45)
-        
-        # Apply wobble offsets (azimuth + elevation rotation for parallax depth)
-        new_elevation = current_elevation + np.sin(t * 0.7) * elev_range
-        new_azimuth = current_azimuth + np.sin(t * 0.5) * azim_range
+
+        if self.wobble_continuous_checkbox.isChecked():
+            # Continuous spin: azimuth rotates in one direction (wraps at 360),
+            # elevation bobs gently so the camera never flips over the top.
+            # The Azim/Elev Range values act as degrees-per-second.
+            self.wobble_spin_azim += azim_range * dt * speed
+            new_azimuth = (self.wobble_base_azim + self.wobble_spin_azim) % 360.0
+            new_elevation = self.wobble_base_elev + np.sin(t * 0.4) * (elev_range * 0.5)
+        else:
+            # Classic sine wobble: oscillate around the base angles for parallax depth.
+            new_azimuth = self.wobble_base_azim + np.sin(t * 0.5) * azim_range
+            new_elevation = self.wobble_base_elev + np.sin(t * 0.7) * elev_range
 
         # Update camera position
         self.gl_view.opts['elevation'] = new_elevation
@@ -5539,7 +6382,7 @@ class TagMap3DTab(QWidget):
             if algo_idx >= 0:
                 self.algorithm_combo.setCurrentIndex(algo_idx)
             self.n_neighbors_spin.setValue(settings.get("n_neighbors", 15))
-            self.min_dist_spin.setValue(settings.get("min_dist", 50))
+            self.min_dist_spin.setValue(settings.get("min_dist", 10))
             metric_idx = self.metric_combo.findText(settings.get("metric", "cosine"))
             if metric_idx >= 0:
                 self.metric_combo.setCurrentIndex(metric_idx)
@@ -5551,7 +6394,7 @@ class TagMap3DTab(QWidget):
             self.whitelist_edit.setText(settings.get("whitelist", ""))
             self.blacklist_edit.setText(settings.get("blacklist", ""))
             self.min_doc_freq_spin.setValue(settings.get("min_doc_freq", 3))
-            self.drop_universal_checkbox.setChecked(settings.get("drop_universal_tags", False))
+            self.drop_universal = settings.get("drop_universal_tags", True)
 
             self.status_label.setText("Loaded last settings, starting data load...")
             self.start_loading()
@@ -5562,7 +6405,12 @@ class TagMap3DTab(QWidget):
             traceback.print_exc()
 
     def _auto_load_last_data(self):
-        """Auto-load the last used data on startup if enabled (timer-triggered)."""
+        """Auto-load the last generated session on startup if enabled.
+
+        Loads sessions/latest.npz directly (skips query, UMAP, DBSCAN).
+        If no saved session exists yet, falls back to reprocessing with the
+        last saved parameters so a session gets created for next time.
+        """
         if not self.auto_load_checkbox.isChecked():
             return
 
@@ -5570,17 +6418,22 @@ class TagMap3DTab(QWidget):
         if self.gl_scatter is not None:
             return
 
+        from pathlib import Path
+        latest = Path("sessions") / "latest.npz"
+        if latest.exists():
+            self.status_label.setText("Auto-loading last session...")
+            self._load_session(path=latest)
+            return
+
+        # No saved session yet — fall back to reprocessing with saved params.
         try:
             if not os.path.exists(SETTINGS_FILE):
                 return
             with open(SETTINGS_FILE, 'r') as f:
                 settings = json.load(f)
-
-            # Verify we have saved params
             if "max_files" not in settings or "client" not in settings:
                 return
-
-            self.status_label.setText("Auto-loading last data...")
+            self.status_label.setText("No saved session found - processing last data...")
             self.start_loading()
         except Exception as e:
             print(f"Auto-load failed: {e}")

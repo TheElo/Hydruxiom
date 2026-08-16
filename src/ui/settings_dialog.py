@@ -15,8 +15,27 @@ import os
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QCheckBox, QSpinBox, QLineEdit, QGroupBox, QFormLayout,
+    QListWidget, QListWidgetItem, QFileDialog, QMessageBox, QInputDialog,
+    QComboBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QFont
+
+
+class _ClientTestWorker(QThread):
+    """Runs a client connection test off the UI thread."""
+    done = Signal(bool, str)
+
+    def __init__(self, func, parent=None):
+        super().__init__(parent)
+        self.func = func
+
+    def run(self):
+        try:
+            ok, msg = self.func()
+        except Exception as e:  # noqa: BLE001 - report any failure to the UI
+            ok, msg = False, f"Failed: {e}"
+        self.done.emit(ok, msg)
 
 
 class TagMap3DSettingsDialog(QDialog):
@@ -34,10 +53,71 @@ class TagMap3DSettingsDialog(QDialog):
         self.use_direct_db = getattr(self.tab, 'use_direct_db', False)
         self.client_db_paths = dict(getattr(self.tab, 'client_db_paths', {}))
         self.tokenize = getattr(self.tab, 'tokenize', True)
+        self.drop_universal = getattr(self.tab, 'drop_universal', True)
+        self.drop_empty_files = getattr(self.tab, 'drop_empty_files', False)
+
+        # Client management state (working copy of clients.json; saved on OK)
+        from src.data.clients import load_clients
+        self._clients = dict(load_clients())
 
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(12)
+
+        # --- Clients group (full CRUD over clients.json) ---
+        clients_group = QGroupBox("Clients")
+        clients_group.setToolTip("Manage Hydrus clients. Changes are saved to clients.json on OK.")
+        cg_layout = QVBoxLayout()
+
+        self.client_list = QListWidget()
+        self.client_list.setMaximumHeight(90)
+        self.client_list.currentRowChanged.connect(self._on_client_selected)
+        cg_layout.addWidget(self.client_list)
+
+        # Field form for the selected client
+        cform = QFormLayout()
+        self.c_label_edit = QLineEdit()
+        self.c_api_url_edit = QLineEdit()
+        self.c_api_key_edit = QLineEdit()
+        self.c_db_dir_edit = QLineEdit()
+        self.c_files_dir_edit = QLineEdit()
+        self.c_thumbs_dir_edit = QLineEdit()
+
+        cform.addRow("Label:", self.c_label_edit)
+        cform.addRow("API URL:", self.c_api_url_edit)
+        cform.addRow("API Key:", self.c_api_key_edit)
+        cform.addRow("DB Dir:", self._browse_row(self.c_db_dir_edit))
+        cform.addRow("Files Dir:", self._browse_row(self.c_files_dir_edit))
+        cform.addRow("Thumbs Dir:", self._browse_row(self.c_thumbs_dir_edit))
+        cg_layout.addLayout(cform)
+
+        # Action buttons
+        btns = QHBoxLayout()
+        self.client_add_btn = QPushButton("+ Add")
+        self.client_add_btn.clicked.connect(self._client_add)
+        self.client_rename_btn = QPushButton("Rename ID…")
+        self.client_rename_btn.clicked.connect(self._client_rename)
+        self.client_remove_btn = QPushButton("Remove")
+        self.client_remove_btn.clicked.connect(self._client_remove)
+        self.client_test_btn = QPushButton("Test Connection")
+        self.client_test_btn.clicked.connect(self._client_test)
+        for b in (self.client_add_btn, self.client_rename_btn, self.client_remove_btn, self.client_test_btn):
+            btns.addWidget(b)
+        cg_layout.addLayout(btns)
+
+        self.client_status = QLabel("")
+        self.client_status.setWordWrap(True)
+        cg_layout.addWidget(self.client_status)
+
+        clients_group.setLayout(cg_layout)
+        main_layout.addWidget(clients_group)
+
+        # Populate the client list from the working copy.
+        for cid in self._clients.keys():
+            self.client_list.addItem(cid)
+        if self.client_list.count() > 0:
+            self.client_list.setCurrentRow(0)
+            self._on_client_selected(0)
 
         # --- Performance group ---
         perf_group = QGroupBox("Performance")
@@ -69,15 +149,63 @@ class TagMap3DSettingsDialog(QDialog):
         )
         perf_layout.addRow(self.tokenize_checkbox)
 
+        self.drop_universal_checkbox = QCheckBox("Drop Universal Tags")
+        self.drop_universal_checkbox.setChecked(self.drop_universal)
+        self.drop_universal_checkbox.setToolTip(
+            "Exclude tags that appear in EVERY loaded file from the vocabulary.\n"
+            "These tags provide zero discriminative power (they are usually\n"
+            "already visible in your query field) and only add noise dimensions.\n"
+            "Useful for large AND queries where all files share the same tags.\n"
+            "Default: ON."
+        )
+        perf_layout.addRow(self.drop_universal_checkbox)
+
+        self.drop_empty_files_checkbox = QCheckBox("Drop empty files")
+        self.drop_empty_files_checkbox.setChecked(self.drop_empty_files)
+        self.drop_empty_files_checkbox.setToolTip(
+            "When enabled, files with no tags remaining after the\n"
+            "whitelist/blacklist filters are excluded from the map.\n"
+            "When disabled (default), they are kept and appear as untagged\n"
+            "nodes at the origin.\n"
+            "Only applies when a whitelist or blacklist is set."
+        )
+        perf_layout.addRow(self.drop_empty_files_checkbox)
+
         perf_group.setLayout(perf_layout)
         main_layout.addWidget(perf_group)
+
+        # --- UI Scale group (applied at startup via QT_SCALE_FACTOR) ---
+        scale_group = QGroupBox("UI Scale")
+        scale_layout = QFormLayout()
+        self.ui_scale_combo = QComboBox()
+        for pct in (100, 125, 150, 200):
+            self.ui_scale_combo.addItem(f"{pct}%", userData=pct)
+        try:
+            current_scale = int(getattr(self.tab, 'ui_scale', 100))
+        except (TypeError, ValueError):
+            current_scale = 100
+        idx = self.ui_scale_combo.findData(current_scale)
+        if idx < 0:
+            # Non-standard saved value: show it as a custom entry so the UI
+            # reflects reality instead of silently resetting to 100%.
+            self.ui_scale_combo.addItem(f"{current_scale}% (custom)", userData=current_scale)
+            idx = self.ui_scale_combo.count() - 1
+        self.ui_scale_combo.setCurrentIndex(idx)
+        self.ui_scale_combo.setToolTip(
+            "Uniformly scales the whole UI (fonts + widgets) for high-DPI displays.\n"
+            "Applied at app startup — restart Hydruxiom after changing it.\n"
+            "Note: this multiplies on top of Windows display scaling."
+        )
+        scale_layout.addRow("Scale:", self.ui_scale_combo)
+        scale_group.setLayout(scale_layout)
+        main_layout.addWidget(scale_group)
 
         # --- DBSCAN Optimizer group ---
         opt_group = QGroupBox("DBSCAN Optimizer")
         opt_layout = QFormLayout()
 
         self.normalize_checkbox = QCheckBox("Normalize positions before DBSCAN")
-        self.normalize_checkbox.setChecked(getattr(self.tab, 'normalize_positions', False))
+        self.normalize_checkbox.setChecked(getattr(self.tab, 'normalize_positions', True))
         self.normalize_checkbox.setToolTip(
             "When enabled, positions are normalized (centered + std-scaled) before\n"
             "DBSCAN clustering. This makes eps a relative measure of local density\n"
@@ -142,27 +270,17 @@ class TagMap3DSettingsDialog(QDialog):
         opt_group.setLayout(opt_layout)
         main_layout.addWidget(opt_group)
 
-        # --- Direct DB group ---
+        # --- Direct DB group (per-client DB paths are now in the Clients section) ---
         db_group = QGroupBox("Direct DB")
         db_layout = QFormLayout()
 
         self.direct_db_checkbox = QCheckBox("Use Direct DB (tag loading)")
         self.direct_db_checkbox.setChecked(self.use_direct_db)
         self.direct_db_checkbox.setToolTip(
-            "When enabled, load tags directly from the Hydrus client DB\ninstead of the API. Much faster at scale (~99%).\nRequires a valid client DB path. Falls back to API if no path set."
+            "When enabled, load tags directly from the Hydrus client DB\ninstead of the API. Much faster at scale (~99%).\n"
+            "Requires a valid DB Dir set for the client (see Clients section). Falls back to API if no path set."
         )
         db_layout.addRow(self.direct_db_checkbox)
-
-        # Per-client DB path fields (populated from clients.json)
-        from src.data.clients import client_ids
-        self.client_db_path_edits = {}
-        for client_id in (client_ids() or []):
-            edit = QLineEdit()
-            edit.setPlaceholderText(f"DB dir for {client_id} (e.g. X:\\HYDRUS\\CLIENT {client_id}\\CLIENT\\db)")
-            edit.setToolTip(f"Path to the Hydrus client DB directory for {client_id}.\nUsed only when Direct DB mode is enabled.")
-            edit.setText(self.client_db_paths.get(client_id, ""))
-            db_layout.addRow(f"{client_id} DB Path:", edit)
-            self.client_db_path_edits[client_id] = edit
 
         db_group.setLayout(db_layout)
         main_layout.addWidget(db_group)
@@ -182,6 +300,39 @@ class TagMap3DSettingsDialog(QDialog):
         score_layout.addRow("Score DB Path:", self.score_db_edit)
         score_group.setLayout(score_layout)
         main_layout.addWidget(score_group)
+
+        # --- Shortcuts group (read-only reference; editable in the future) ---
+        shortcuts_group = QGroupBox("Shortcuts")
+        sc_layout = QVBoxLayout()
+        self.shortcuts_table = QTableWidget(0, 2)
+        _shortcut_rows = [
+            ("F3", "Open settings window"),
+            ("F4", "Toggle media viewer"),
+            ("F5", "Load & Compute"),
+            ("F6", "Recompute (UMAP only)"),
+            ("F7", "Regroup (DBSCAN only)"),
+            ("F12", "4x snapshot screenshot (saved to screenshots/)"),
+            ("Ctrl+X", "Clear session (free memory)"),
+            ("Ctrl+S", "Split group (re-cluster selection)"),
+            ("Ctrl+E", "Cut out selected cohort"),
+            ("Ctrl+T", "Send selection to tab"),
+        ]
+        self.shortcuts_table.setRowCount(len(_shortcut_rows))
+        for r, (key, desc) in enumerate(_shortcut_rows):
+            key_item = QTableWidgetItem(key)
+            key_item.setFont(QFont("Consolas", 10, QFont.Bold))
+            key_item.setFlags(Qt.ItemFlag.NoItemFlags)  # read-only
+            self.shortcuts_table.setItem(r, 0, key_item)
+            desc_item = QTableWidgetItem(desc)
+            desc_item.setFlags(Qt.ItemFlag.NoItemFlags)  # read-only
+            self.shortcuts_table.setItem(r, 1, desc_item)
+        self.shortcuts_table.horizontalHeader().setVisible(False)
+        self.shortcuts_table.verticalHeader().setVisible(False)
+        self.shortcuts_table.setColumnWidth(0, 90)
+        self.shortcuts_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        sc_layout.addWidget(self.shortcuts_table)
+        shortcuts_group.setLayout(sc_layout)
+        main_layout.addWidget(shortcuts_group)
 
         # --- Buttons ---
         button_layout = QHBoxLayout()
@@ -210,6 +361,8 @@ class TagMap3DSettingsDialog(QDialog):
         tab.n_jobs = self.n_jobs_spin.value()
         tab.use_direct_db = self.direct_db_checkbox.isChecked()
         tab.tokenize = self.tokenize_checkbox.isChecked()
+        tab.drop_universal = self.drop_universal_checkbox.isChecked()
+        tab.drop_empty_files = self.drop_empty_files_checkbox.isChecked()
 
         # DBSCAN optimizer parameters
         tab.normalize_positions = self.normalize_checkbox.isChecked()
@@ -224,21 +377,25 @@ class TagMap3DSettingsDialog(QDialog):
         tab.opt_min_samples_min = self.opt_min_samples_min_spin.value()
         tab.opt_min_samples_max = self.opt_min_samples_max_spin.value()
 
-        # Collect per-client DB paths
-        paths = {}
-        for client_id, edit in self.client_db_path_edits.items():
-            path = edit.text().strip()
-            if path:
-                paths[client_id] = path
-        tab.client_db_paths = paths
-
-        # Persist DB paths to clients.json
+        # Persist the full clients working copy (Clients section is authoritative).
+        self._sync_selected_client_to_dict()
         try:
-            from src.data.direct_db import set_client_db_path
-            for client_id, path in paths.items():
-                set_client_db_path(client_id, path)
+            from src.data.clients import save_clients
+            ok = save_clients(self._clients)
+            if not ok:
+                QMessageBox.warning(self, "Clients", "Failed to save clients.json.")
         except Exception as e:
-            print(f"Error saving client DB paths: {e}")
+            print(f"Error saving clients: {e}")
+
+        # Refresh the tab's client combo + per-client DB path cache.
+        paths = {}
+        for cid, cfg in self._clients.items():
+            db_dir = (cfg.get("db_dir") or "").strip()
+            if db_dir:
+                paths[cid] = db_dir
+        tab.client_db_paths = paths
+        if hasattr(tab, "_refresh_client_combo"):
+            tab._refresh_client_combo()
 
         # Optional tag-score weighting
         tab.score_db_path = self.score_db_edit.text().strip()
@@ -248,9 +405,147 @@ class TagMap3DSettingsDialog(QDialog):
         except Exception as e:
             print(f"Error reloading tag scores: {e}")
 
+        # UI scale (applied at startup; restart required to take effect)
+        new_scale = self.ui_scale_combo.currentData() or 100
+        scale_changed = int(getattr(tab, 'ui_scale', 100)) != int(new_scale)
+        tab.ui_scale = int(new_scale)
+
         # Save the rest of the settings JSON
         if hasattr(tab, 'save_settings'):
             tab.save_settings()
+
+        if scale_changed:
+            QMessageBox.information(
+                self, "UI Scale",
+                f"UI scale set to {new_scale}%.\n\nRestart Hydruxiom for it to take effect.",
+            )
+
+    # ── Client management helpers ─────────────────────────────────────────
+
+    def _browse_row(self, edit):
+        """Return a horizontal layout of [edit][Browse…] for a folder path field."""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(edit)
+        btn = QPushButton("…")
+        btn.setFixedWidth(32)
+        btn.setToolTip("Browse for a folder")
+        btn.clicked.connect(lambda _=False, e=edit: self._browse_folder(e))
+        row.addWidget(btn)
+        return row
+
+    def _browse_folder(self, edit):
+        d = QFileDialog.getExistingDirectory(self, "Select folder", edit.text())
+        if d:
+            edit.setText(d)
+
+    def _current_client_id(self):
+        item = self.client_list.currentItem()
+        return item.text() if item else None
+
+    def _on_client_selected(self, row):
+        """Load the selected client's fields into the form."""
+        cid = self._current_client_id()
+        if not cid:
+            return
+        cfg = self._clients.get(cid, {})
+        self.c_label_edit.setText(cfg.get("label", cid))
+        self.c_api_url_edit.setText(cfg.get("api_url", ""))
+        self.c_api_key_edit.setText(cfg.get("api_key", ""))
+        self.c_db_dir_edit.setText(cfg.get("db_dir", ""))
+        self.c_files_dir_edit.setText(cfg.get("files_dir", ""))
+        self.c_thumbs_dir_edit.setText(cfg.get("thumbs_dir", ""))
+
+    def _sync_selected_client_to_dict(self):
+        """Write the current form values back into the working dict for the selected client."""
+        cid = self._current_client_id()
+        if not cid:
+            return
+        cfg = self._clients.setdefault(cid, {})
+        cfg["label"] = self.c_label_edit.text().strip() or cid
+        cfg["api_url"] = self.c_api_url_edit.text().strip()
+        cfg["api_key"] = self.c_api_key_edit.text().strip()
+        cfg["db_dir"] = self.c_db_dir_edit.text().strip()
+        cfg["files_dir"] = self.c_files_dir_edit.text().strip()
+        cfg["thumbs_dir"] = self.c_thumbs_dir_edit.text().strip()
+
+    def _client_add(self):
+        new_id, ok = QInputDialog.getText(self, "Add Client", "New client ID (short, e.g. HE):")
+        if not ok or not new_id.strip():
+            return
+        new_id = new_id.strip()
+        if new_id in self._clients:
+            QMessageBox.warning(self, "Clients", f"Client '{new_id}' already exists.")
+            return
+        self._sync_selected_client_to_dict()  # save current edits first
+        self._clients[new_id] = {
+            "label": new_id, "api_url": "", "api_key": "",
+            "db_dir": "", "files_dir": "", "thumbs_dir": "",
+        }
+        idx = self.client_list.count()
+        self.client_list.insertItem(idx, new_id)
+        self.client_list.setCurrentRow(idx)
+
+    def _client_rename(self):
+        old_id = self._current_client_id()
+        if not old_id:
+            return
+        new_id, ok = QInputDialog.getText(self, "Rename Client", f"New ID for '{old_id}':", text=old_id)
+        if not ok or not new_id.strip():
+            return
+        new_id = new_id.strip()
+        if new_id == old_id:
+            return
+        if new_id in self._clients:
+            QMessageBox.warning(self, "Clients", f"Client '{new_id}' already exists.")
+            return
+        self._sync_selected_client_to_dict()  # save current edits under old id first
+        cfg = self._clients.pop(old_id)
+        cfg["label"] = new_id
+        self._clients[new_id] = cfg
+        row = self.client_list.row(self.client_list.currentItem())
+        self.client_list.item(row).setText(new_id)
+
+    def _client_remove(self):
+        cid = self._current_client_id()
+        if not cid:
+            return
+        reply = QMessageBox.question(
+            self, "Remove Client", f"Remove client '{cid}'? This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        del self._clients[cid]
+        row = self.client_list.row(self.client_list.currentItem())
+        self.client_list.takeItem(row)
+        # Select the first remaining client (if any).
+        if self.client_list.count() > 0:
+            self.client_list.setCurrentRow(0)
+
+    def _client_test(self):
+        """Test the connection using the current form values (in a worker thread)."""
+        cid = self._current_client_id() or "(new)"
+        api_url = self.c_api_url_edit.text().strip()
+        api_key = self.c_api_key_edit.text().strip()
+        if not api_url or not api_key:
+            self.client_status.setText("Enter API URL and API Key first.")
+            return
+        self.client_status.setText(f"Testing {cid}…")
+
+        def _run():
+            try:
+                import hydrus_api
+                client = hydrus_api.Client(access_key=api_key, api_url=api_url)
+                # Light call to verify connectivity.
+                client.get_services()
+                return True, "Connected ✓"
+            except Exception as e:
+                return False, f"Failed: {e}"
+
+        self._test_worker = _ClientTestWorker(_run)
+        self._test_worker.done.connect(lambda ok, msg: self.client_status.setText(msg))
+        self._test_worker.start()
 
     def apply_dark_theme(self):
         """Apply a dark theme matching the rest of the app."""
@@ -287,5 +582,19 @@ class TagMap3DSettingsDialog(QDialog):
             "QLineEdit:hover { border: 2px solid rgb(64, 71, 88); }"
             "QLineEdit:focus { border: 2px solid rgb(91, 101, 124); }"
         )
-        for edit in self.client_db_path_edits.values():
+        for edit in (self.c_label_edit, self.c_api_url_edit, self.c_api_key_edit,
+                     self.c_db_dir_edit, self.c_files_dir_edit, self.c_thumbs_dir_edit):
             edit.setStyleSheet(line_style)
+
+        # Client list widget dark styling
+        self.client_list.setStyleSheet(
+            "QListWidget { background-color: rgb(33, 37, 43); color: rgb(221, 221, 221);"
+            " border: 1px solid rgb(44, 49, 58); }"
+            "QListWidget::item:selected { background-color: rgb(60, 80, 180); color: white; }"
+        )
+
+        # Shortcuts table dark styling (read-only reference)
+        self.shortcuts_table.setStyleSheet(
+            "QTableWidget { background-color: rgb(33, 37, 43); color: rgb(221, 221, 221);"
+            " border: 1px solid rgb(44, 49, 58); gridline-color: rgb(44, 49, 58); }"
+        )

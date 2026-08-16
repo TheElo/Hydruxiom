@@ -24,6 +24,7 @@ NOTE: clients.json contains API keys and local paths. It is gitignored.
 
 import json
 import os
+import shutil
 from typing import Dict, List, Optional
 
 # Project root = parent of src/
@@ -59,9 +60,15 @@ def load_clients(path: Optional[str] = None) -> Dict[str, dict]:
 
 
 def save_clients(clients: Dict[str, dict], path: Optional[str] = None) -> bool:
-    """Write client configs back to the JSON file (atomic)."""
+    """Write client configs back to the JSON file (atomic).
+
+    Keeps a ``.bak`` copy of the previous file before overwriting so a crash or
+    bad edit can be recovered from.
+    """
     p = path or CLIENTS_FILE
     try:
+        if os.path.exists(p):
+            shutil.copy2(p, p + ".bak")
         tmp = p + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(clients, f, indent=2)
@@ -70,6 +77,22 @@ def save_clients(clients: Dict[str, dict], path: Optional[str] = None) -> bool:
     except Exception as e:
         print(f"[Clients] Error saving {p}: {e}")
         return False
+
+
+def rename_client(old_id: str, new_id: str, path: Optional[str] = None) -> bool:
+    """Rename a client ID (re-key the dict entry).
+
+    Returns True on success. No-op (False) if old_id missing or new_id taken.
+    """
+    clients = load_clients(path)
+    if old_id not in clients or new_id in clients:
+        return False
+    clients[new_id] = clients.pop(old_id)
+    # Keep the label in sync with the new ID unless it was customized.
+    cfg = clients.get(new_id, {})
+    if not cfg.get("label") or cfg["label"] == old_id:
+        cfg["label"] = new_id
+    return save_clients(clients, path)
 
 
 def client_ids() -> List[str]:

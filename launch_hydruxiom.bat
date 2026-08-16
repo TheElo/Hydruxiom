@@ -21,4 +21,11 @@ if exist ".venv\Scripts\python.exe" (
 )
 
 .venv\Scripts\python.exe main.py
-pause
+
+REM Close automatically on normal exit; keep the window open only if the app
+REM crashed, so the traceback stays readable.
+if errorlevel 1 (
+    echo.
+    echo Hydruxiom exited with an error (code %errorlevel%). See output above.
+    pause
+)

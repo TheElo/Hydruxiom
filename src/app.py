@@ -4,12 +4,38 @@ Creates the QApplication (dark Fusion style, high-DPI) and shows the main
 window. Called from main.py.
 """
 
+import json
+import os
 import sys
 
 from PySide6.QtWidgets import QApplication
 
 
+def _apply_ui_scale():
+    """Apply the user-configured UI scale factor (settings JSON "ui_scale").
+
+    Must run BEFORE QApplication is constructed: Qt reads QT_SCALE_FACTOR at
+    startup and then uniformly scales fonts + all widgets. A value of 100
+    (default) leaves OS display scaling untouched.
+    """
+    try:
+        settings_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "3d_tag_map_settings.json",
+        )
+        if not os.path.exists(settings_file):
+            return
+        with open(settings_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        scale_pct = float(data.get("ui_scale", 100))
+    except Exception:
+        return
+    if scale_pct > 0 and abs(scale_pct - 100.0) > 0.01:
+        os.environ["QT_SCALE_FACTOR"] = f"{scale_pct / 100.0:.4f}"
+
+
 def run():
+    _apply_ui_scale()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationName("Hydruxiom")
