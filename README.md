@@ -1,0 +1,92 @@
+<p align="center">
+  <img src="icon/hydruxiom_256.png" width="256" alt="Hydruxiom icon">
+</p>
+
+<h1 align="center">Hydruxiom — 3D Tag Space Explorer</h1>
+
+Standalone desktop app that projects a [Hydrus](https://hydrusnetwork.github.io/hydrus/) tag collection into navigable 3D space.
+
+**Pipeline:** TF-IDF vectorization → UMAP/PCA reduction → DBSCAN clustering → interactive 3D point cloud with cohort exploration, relationship lines, and a synced media viewer.
+
+Built with PySide6 + pyqtgraph (OpenGL). Extracted from the HydrusForHydrus plugin as an independent project.
+
+---
+
+## Quick Start (Windows)
+
+1. Install **Python 3.10+** (check "Add to PATH" during install)
+2. Clone this repo
+3. Double-click **`launch_hydruxiom.bat`**
+
+The launcher handles everything: it creates a `.venv/` on first run, installs/updates dependencies from `requirements.txt` on every launch, and starts the app. The window only stays open on crash so you can read the traceback.
+
+### Manual setup (alternative)
+
+```bat
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python main.py
+```
+
+---
+
+## First Run: Configure a Client
+
+The app needs at least one Hydrus client with the **API enabled** (Hydrus → Options → Network → API).
+
+1. Start the app, press **F3** to open Settings
+2. In the **Clients** section: **+ Add**, then fill in:
+   - **Label / ID** — your name for the client
+   - **API URL** — e.g. `http://127.0.0.1:4566/`
+   - **API Key** — from Hydrus's API settings page (no masking; stored locally)
+   - **DB / Files / Thumbs dirs** — only needed for *Direct DB mode* and the media viewer thumbnails-from-disk path
+3. Use **Test Connection** to verify, then **OK**
+
+Client config is stored in `clients.json` at the project root (gitignored; a `.bak` copy is kept before every save).
+
+---
+
+## Usage
+
+1. Pick a client (left panel → Client)
+2. Enter a tag query — supports Hydrus syntax: `tag1, -excluded, [or-tag-a, or-tag-b]`
+   The clickable tag grid in **Filter Settings** builds the query for you (click cycles: neutral → included → excluded → OR)
+3. Press **F5 / Load & Compute** — loads file IDs + tags, runs TF-IDF → UMAP → DBSCAN
+4. Explore: click nodes to select files, right-click clusters, use the media viewer (**F4**) for synced thumbnails
+
+### Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| F3 | Settings window |
+| F4 | Toggle media viewer |
+| F5 | Load & Compute (full pipeline) |
+| F6 | Recompute (UMAP only, keeps clusters) |
+| F7 | Regroup (DBSCAN only, keeps positions) |
+| F12 | 4x supersampled screenshot → `screenshots/` |
+| Ctrl+X | Clear session (frees memory) |
+| Ctrl+S | Split group (re-cluster selection into sub-cohorts) |
+| Ctrl+E | Cut out selected cohort |
+| Ctrl+T | Send selected files to a Hydrus tab |
+
+Ctrl+ combos are skipped while a text field has focus.
+
+### Sessions & persistence
+
+- Every successful load/recompute/pop **auto-saves** the scene to `sessions/latest.npz` (positions, tags, clusters, settings, camera)
+- Enable **"Auto load session"** to skip straight to the last scene on startup (no reprocessing)
+- Settings (incl. window positions/sizes and media-viewer open state) persist in `3d_tag_map_settings.json`, written atomically with a 2 s debounce so they survive crashes
+
+### Performance notes
+
+- **Direct DB mode** reads tags straight from Hydrus's SQLite files instead of the API — much faster for large collections (configure per-client dirs in Settings → Clients)
+- **UMAP subsampling** (on by default, 70K subset): fits UMAP on a random subset, then transforms all points — makes multi-million-file collections feasible
+
+---
+
+## Requirements
+
+- Windows (developed/tested on Win 10/11)
+- Python 3.10+
+- A running Hydrus client with the API enabled
+- See `requirements.txt` for pinned dependencies (PySide6, pyqtgraph, umap-learn, scikit-learn, hydrus-api, …)

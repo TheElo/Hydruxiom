@@ -11,6 +11,19 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 
+# Project root = parent of src/ (icon + settings live here)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ICON_PATH = os.path.join(_PROJECT_ROOT, "icon", "hydruxiom.ico")
+
+
+def _app_icon():
+    """Load the app icon (best effort; None if missing)."""
+    from PySide6.QtGui import QIcon
+    if os.path.exists(ICON_PATH):
+        return QIcon(ICON_PATH)
+    return None
+
+
 def _apply_ui_scale():
     """Apply the user-configured UI scale factor (settings JSON "ui_scale").
 
@@ -39,6 +52,11 @@ def run():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationName("Hydruxiom")
+
+    # App icon (taskbar + window title bar on all top-level windows)
+    icon = _app_icon()
+    if icon is not None:
+        app.setWindowIcon(icon)
 
     # Dark palette
     from PySide6.QtGui import QPalette, QColor

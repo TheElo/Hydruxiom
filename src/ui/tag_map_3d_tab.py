@@ -16,393 +16,18 @@ from PySide6.QtWidgets import (
     QTextEdit, QSplitter, QScrollArea, QLineEdit, QDoubleSpinBox, QCheckBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QGridLayout, QFileDialog, QTabWidget
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent
+from PySide6.QtCore import Qt, QTimer, QEvent
 from PySide6.QtGui import QCloseEvent, QMouseEvent, QVector3D, QFont
 from src.ui.styles import (
     GRAY_40, GRAY_33, RED_A, BLUE_60,
     TAB_BACKGROUND, TAB_TEXT, TAB_SELECTED, TAB_BORDER,
 )
-
-
-class ClickableTag(QLabel):
-    """Clickable tag label that cycles through four visual states.
-    
-    States:
-    - 0 (neutral): White text
-    - 1 (included): Green text (added to query)
-    - 2 (excluded): Red text with "-" prefix (excluded from query)
-    - 3 (OR): Bright blue text (added to OR bracket group)
-    """
-    
-    stateChanged = Signal(str, int)  # tag_name, new_state
-    
-    def __init__(self, tag_name, parent=None):
-        if tag_name is None:
-            tag_name = ""
-        super().__init__(tag_name, parent)
-        self.tag_name = tag_name
-        self.state = 0  # 0=neutral, 1=included, 2=excluded, 3=OR
-        self.setCursor(Qt.PointingHandCursor)
-        self.setStyleSheet(f"""
-            ClickableTag {{
-                background-color: transparent;
-                color: {RED_A};
-                padding: 2px 6px;
-                margin: 1px;
-                border-radius: 3px;
-                font-size: 11px;
-            }}
-            ClickableTag:hover {{
-                background-color: {BLUE_60};
-            }}
-        """)
-        self.setAlignment(Qt.AlignCenter)
-    
-    def mousePressEvent(self, event):
-        """Handle click to cycle through states."""
-        if event.button() == Qt.LeftButton:
-            self.state = (self.state + 1) % 4
-            self._update_appearance()
-            self.stateChanged.emit(self.tag_name, self.state)
-            event.accept()
-        super().mousePressEvent(event)
-    
-    def _update_appearance(self):
-        """Update label text and color based on current state."""
-        if self.state == 0:
-            # Neutral - white text
-            self.setText(self.tag_name)
-            self.setStyleSheet(f"""
-                ClickableTag {{
-                    background-color: transparent;
-                    color: {RED_A};
-                    padding: 2px 6px;
-                    margin: 1px;
-                    border-radius: 3px;
-                    font-size: 11px;
-                }}
-                ClickableTag:hover {{
-                    background-color: {BLUE_60};
-                }}
-            """)
-        elif self.state == 1:
-            # Included - green text
-            self.setText(self.tag_name)
-            self.setStyleSheet(f"""
-                ClickableTag {{
-                    background-color: transparent;
-                    color: #44ff44;
-                    padding: 2px 6px;
-                    margin: 1px;
-                    border-radius: 3px;
-                    font-size: 11px;
-                    font-weight: bold;
-                }}
-                ClickableTag:hover {{
-                    background-color: {BLUE_60};
-                }}
-            """)
-        elif self.state == 2:
-            # Excluded - red text with "-" prefix and strikethrough
-            self.setText(f"-{self.tag_name}")
-            self.setStyleSheet(f"""
-                ClickableTag {{
-                    background-color: transparent;
-                    color: #ff4444;
-                    padding: 2px 6px;
-                    margin: 1px;
-                    border-radius: 3px;
-                    font-size: 11px;
-                    font-weight: bold;
-                    text-decoration: line-through;
-                }}
-                ClickableTag:hover {{
-                    background-color: {BLUE_60};
-                }}
-            """)
-        else:
-            # OR - bright blue text
-            self.setText(self.tag_name)
-            self.setStyleSheet(f"""
-                ClickableTag {{
-                    background-color: transparent;
-                    color: #44aaff;
-                    padding: 2px 6px;
-                    margin: 1px;
-                    border-radius: 3px;
-                    font-size: 11px;
-                    font-weight: bold;
-                }}
-                ClickableTag:hover {{
-                    background-color: {BLUE_60};
-                }}
-            """)
-
-class TagMap3DSplitWindow(QWidget):
-    """Media Viewer: separate window syncing image previews to the 3D tag map.
-
-    Display modes based on selection state:
-    - Single file selected: shows that file
-    - Cohort selected: shows a grid of thumbnails for those files
-    - Nothing selected: shows one representative image per existing cohort
-    """
-
-    def __init__(self, parent_tab):
-        super().__init__()
-        self.parent_tab = parent_tab
-        self.setWindowTitle("Hydruxiom - Media Viewer")
-        self.resize(900, 700)
-        self.setMinimumSize(600, 400)
-
-        # Layout: title bar + control bar + scrollable image grid
-        outer = QVBoxLayout()
-        outer.setContentsMargins(5, 5, 5, 5)
-
-        self.title_label = QLabel("No Selection")
-        self.title_label.setStyleSheet("color: white; font-size: 16px; font-weight: bold; padding: 5px;")
-        outer.addWidget(self.title_label)
-
-        # Control bar for grid settings
-        from PySide6.QtWidgets import QSpinBox, QDoubleSpinBox, QHBoxLayout
-        controls = QHBoxLayout()
-        controls.setSpacing(8)
-
-        controls.addWidget(QLabel("Columns:"))
-        self.columns_spin = QSpinBox()
-        self.columns_spin.setRange(1, 20)
-        self.columns_spin.setValue(4)
-        self.columns_spin.setToolTip("Number of columns in the image grid.")
-        controls.addWidget(self.columns_spin)
-
-        controls.addWidget(QLabel("Max Files:"))
-        self.max_files_spin = QSpinBox()
-        self.max_files_spin.setRange(1, 500)
-        self.max_files_spin.setValue(28)
-        self.max_files_spin.setToolTip("Maximum number of thumbnails to pull.")
-        controls.addWidget(self.max_files_spin)
-
-        controls.addWidget(QLabel("Image Size:"))
-        self.image_size_spin = QSpinBox()
-        self.image_size_spin.setRange(50, 800)
-        self.image_size_spin.setValue(400)
-        self.image_size_spin.setToolTip("Size of each thumbnail in pixels.")
-        controls.addWidget(self.image_size_spin)
-
-        controls.addStretch()
-        outer.addLayout(controls)
-
-        # Load saved split window settings
-        self._load_settings()
-
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.grid_container = QWidget()
-        self.grid_layout = QGridLayout()
-        self.grid_layout.setSpacing(6)
-        self.grid_container.setLayout(self.grid_layout)
-        self.scroll_area.setWidget(self.grid_container)
-        outer.addWidget(self.scroll_area)
-
-        # Single-file view (full-res, scaled to fill the window)
-        self.single_file_label = QLabel()
-        self.single_file_label.setAlignment(Qt.AlignCenter)
-        self.single_file_label.setStyleSheet("background-color: black;")
-        self.single_file_label.hide()
-        self._single_file_pixmap = None
-        outer.addWidget(self.single_file_label, stretch=1)
-
-        self.setLayout(outer)
-
-        # Store clickable cohort tiles for future interaction
-        self.cohort_tiles = []  # list of (cluster_id, QLabel)
-
-        # Zoom state: file id currently shown full-res after a thumbnail click.
-        # None = showing the grid; set = showing one full file (click to go back).
-        self._zoomed_file_id = None
-
-    def clear_grid(self):
-        """Remove all widgets from the grid layout."""
-        while self.grid_layout.count() > 0:
-            item = self.grid_layout.takeAt(0)
-            if item and hasattr(item, 'widget'):
-                widget = item.widget()
-                if widget:
-                    widget.setParent(None)
-                    widget.deleteLater()
-        self.cohort_tiles = []
-        # Reset zoom + single-file view
-        self._zoomed_file_id = None
-        self._single_file_pixmap = None
-        self.single_file_label.clear()
-        self.single_file_label.hide()
-        self.scroll_area.show()
-
-    def show_single_image(self, pixmap, tooltip="", file_id=None):
-        """Show a single full-res image scaled to fill the window.
-
-        If ``file_id`` is given (thumbnail zoom), clicking the image again goes
-        back to the grid; otherwise (node selection) it just displays.
-        """
-        self._single_file_pixmap = pixmap
-        self.single_file_label.setToolTip(tooltip)
-        self._zoomed_file_id = file_id
-        if file_id is not None:
-            self.single_file_label.setCursor(Qt.PointingHandCursor)
-        else:
-            self.single_file_label.unsetCursor()
-        self.scroll_area.hide()
-        self.single_file_label.show()
-        self._scale_single_image()
-
-    def _scale_single_image(self):
-        """Scale the full-res pixmap to fit the label (keep aspect ratio)."""
-        if self._single_file_pixmap is None or self._single_file_pixmap.isNull():
-            return
-        avail_w = self.single_file_label.width()
-        avail_h = self.single_file_label.height()
-        if avail_w <= 0 or avail_h <= 0:
-            return
-        scaled = self._single_file_pixmap.scaled(
-            avail_w, avail_h,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        self.single_file_label.setPixmap(scaled)
-
-    def resizeEvent(self, event):
-        """Re-scale the single-file image when the window is resized."""
-        super().resizeEvent(event)
-        if self.single_file_label.isVisible():
-            self._scale_single_image()
-
-    def _load_settings(self):
-        """Load split window settings from the 3D tag map settings file."""
-        import json, os
-        settings_file = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            "3d_tag_map_settings.json",
-        )
-        try:
-            if os.path.exists(settings_file):
-                with open(settings_file, "r") as f:
-                    settings = json.load(f)
-                self.columns_spin.setValue(settings.get("split_columns", 4))
-                self.max_files_spin.setValue(settings.get("split_max_files", 28))
-                self.image_size_spin.setValue(settings.get("split_image_size", 400))
-                # Restore window position/size (best effort)
-                if hasattr(self.parent_tab, '_restore_window_geometry'):
-                    self.parent_tab._restore_window_geometry(
-                        settings, "split_window_geometry", self
-                    )
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
-
-    def _save_settings(self):
-        """Save split window settings to the 3D tag map settings file."""
-        import json, os
-        settings_file = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            "3d_tag_map_settings.json",
-        )
-        try:
-            settings = {}
-            if os.path.exists(settings_file):
-                with open(settings_file, "r") as f:
-                    settings = json.load(f)
-            settings["split_columns"] = self.columns_spin.value()
-            settings["split_max_files"] = self.max_files_spin.value()
-            settings["split_image_size"] = self.image_size_spin.value()
-            with open(settings_file, "w") as f:
-                json.dump(settings, f, indent=2)
-        except (OSError, TypeError):
-            pass
-
-    def closeEvent(self, event):
-        """Save settings (incl. window geometry) when the media viewer closes."""
-        try:
-            if hasattr(self.parent_tab, '_persist_split_window_geometry'):
-                self.parent_tab._persist_split_window_geometry()
-        except Exception:
-            pass
-        # Clear the tab's reference so F4 re-opens a fresh instance next time
-        # (closing via X must behave like closing via the toggle).
-        try:
-            if getattr(self.parent_tab, 'split_window', None) is self:
-                self.parent_tab.split_window = None
-        except Exception:
-            pass
-        self._save_settings()
-        super().closeEvent(event)
-
-    def set_title(self, text):
-        """Update the title bar text."""
-        self.title_label.setText(text)
-
-    def add_image(self, pixmap, tooltip="", file_id=None):
-        """Add a single image label to the grid using configured columns/size.
-
-        Thumbnails are clickable: clicking one opens that file full-res in this
-        window (click again to return to the grid). ``file_id`` is stored as a
-        widget property so mousePressEvent can look it up.
-        """
-        from PySide6.QtWidgets import QLabel
-        size = self.image_size_spin.value() if hasattr(self, 'image_size_spin') else 200
-        label = QLabel()
-        label.setPixmap(pixmap)
-        label.setFixedSize(size, size)
-        label.setAlignment(Qt.AlignCenter)
-        label.setStyleSheet("border: 1px solid #4050a0;")
-        if tooltip:
-            label.setToolTip(tooltip)
-        if file_id is not None:
-            label.setProperty("file_id", str(file_id))
-            label.setCursor(Qt.PointingHandCursor)
-        cols = self.columns_spin.value() if hasattr(self, 'columns_spin') else 4
-        index = self.grid_layout.count()
-        row = index // cols
-        col = index % cols
-        self.grid_layout.addWidget(label, row, col)
-        return label
-
-    def add_cohort_tile(self, cluster_id, pixmap, tooltip=""):
-        """Add a clickable cohort representative tile."""
-        label = self.add_image(pixmap, tooltip)
-        label.setProperty("cluster_id", cluster_id)
-        label.setCursor(Qt.PointingHandCursor)
-        self.cohort_tiles.append((cluster_id, label))
-        return label
-
-    def mousePressEvent(self, event):
-        """Handle clicks in the media viewer.
-
-        - Full-res image shown via thumbnail zoom: click to go back to the grid.
-        - Thumbnail with a file_id: click to open that file full-res here.
-        - Cohort representative tile: click to move the 3D camera to it.
-        """
-        if event.button() == Qt.LeftButton:
-            # Zoomed-out state: clicking the big image returns to the grid.
-            if self._zoomed_file_id is not None and self.single_file_label.isVisible():
-                fid = self._zoomed_file_id
-                self._zoomed_file_id = None
-                self.parent_tab._return_to_grid(fid)
-                event.accept()
-                return
-
-            widget = self.childAt(event.position().toPoint())
-            if widget is not None:
-                # Cohort representative tile -> move camera to that cohort.
-                cluster_id = widget.property("cluster_id")
-                if cluster_id is not None and cluster_id != -1:
-                    self.parent_tab._move_camera_to_cluster(cluster_id)
-                    event.accept()
-                    return
-                # Regular thumbnail with a file id -> open full-res here.
-                fid = widget.property("file_id")
-                if fid is not None:
-                    self.parent_tab._open_file_in_viewer(fid)
-                    event.accept()
-                    return
-        super().mousePressEvent(event)
+from src.ui.media_viewer import TagMap3DSplitWindow, SplitWindowLoader, SingleFileLoader
+from src.ui.workers import WorkerThread
+from src.ui.panels.tag_query import (
+    ClickableTag, split_query_preserving_brackets,
+    query_to_api_tags, parse_query_tag_states,
+)
 
 # Settings file path (relative to project root)
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "3d_tag_map_settings.json")
@@ -521,95 +146,6 @@ def _get_multiline_text_item_class():
     return _MULTILINE_TEXT_ITEM_CLASS
 
 
-class WorkerThread(QThread):
-    """Background worker thread for data processing."""
-    progress = Signal(int, str)  # percentage, message
-    finished = Signal(object)  # result
-    error = Signal(str)  # error message
-
-    def __init__(self, func, *args, **kwargs):
-        super().__init__()
-        self.func = func
-        self.args = args
-        self.kwargs = kwargs
-
-    def run(self):
-        try:
-            result = self.func(*self.args, **self.kwargs)
-            self.finished.emit(result)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class SplitWindowLoader(QThread):
-    """Background worker for loading thumbnails into the split window."""
-    pixmap_ready = Signal(object, str)  # pixmap, tooltip
-    finished = Signal()
-
-    def __init__(self, client_name, file_ids, image_size, parent=None):
-        super().__init__(parent)
-        self.client_name = client_name
-        self.file_ids = file_ids
-        self.image_size = image_size
-
-    def run(self):
-        try:
-            from src.utils.utility_functions import ConnectToClient
-            from src.utils.image_loader import load_pixmap_with_lanczos
-            client = ConnectToClient(self.client_name)
-            for file_id in self.file_ids:
-                try:
-                    response = client.get_thumbnail(file_id=file_id)
-                    if response and hasattr(response, 'content'):
-                        pixmap = load_pixmap_with_lanczos(response.content, max_size=self.image_size)
-                        if pixmap:
-                            self.pixmap_ready.emit(pixmap, f"File {file_id}")
-                except Exception as e:
-                    print(f"Error loading file {file_id}: {e}")
-        except Exception as e:
-            print(f"Error loading thumbnails: {e}")
-        self.finished.emit()
-
-
-class SingleFileLoader(QThread):
-    """Background worker for loading a single full-res file from Hydrus.
-
-    Uses client.get_file() (full resolution) instead of get_thumbnail().
-    The in-memory pixmap is capped at 4096px on the longest side to keep
-    memory bounded; the split window scales it to fit for display.
-    """
-    pixmap_ready = Signal(object, str)  # pixmap, tooltip
-    finished = Signal()
-
-    MAX_PIXELS = 4096
-
-    def __init__(self, client_name, file_id, parent=None):
-        super().__init__(parent)
-        self.client_name = client_name
-        self.file_id = file_id
-
-    def run(self):
-        try:
-            from PySide6.QtGui import QPixmap
-            from src.utils.utility_functions import ConnectToClient
-            client = ConnectToClient(self.client_name)
-            response = client.get_file(file_id=self.file_id)
-            if response and hasattr(response, 'content'):
-                pixmap = QPixmap()
-                if pixmap.loadFromData(response.content):
-                    # Cap in-memory size (longest side) to bound memory
-                    if max(pixmap.width(), pixmap.height()) > self.MAX_PIXELS:
-                        pixmap = pixmap.scaled(
-                            self.MAX_PIXELS, self.MAX_PIXELS,
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation
-                        )
-                    self.pixmap_ready.emit(pixmap, f"File {self.file_id}")
-        except Exception as e:
-            print(f"Error loading full-res file {self.file_id}: {e}")
-        self.finished.emit()
-
-
 class TagMap3DTab(QWidget):
     """Main tab widget for 3D tag space visualization."""
 
@@ -666,6 +202,8 @@ class TagMap3DTab(QWidget):
         self.twinkle_timer = QTimer(self)
         self.twinkle_timer.timeout.connect(self._update_twinkle)
 
+        # Default before load_settings (which may set it from the saved state)
+        self._restore_media_viewer_open = False
         self.load_settings()
         self._load_client_db_path()
         self._connect_settings_signals()
@@ -696,6 +234,18 @@ class TagMap3DTab(QWidget):
         # The handler (_auto_load_last_data) is a no-op unless the checkbox is
         # enabled and no data is loaded yet, so this is safe to always start.
         self.auto_load_timer.start(1000)
+
+        # Restore media viewer open state (if it was open at last exit).
+        # Deferred until after the main window has been shown once so the
+        # saved geometry can be applied correctly.
+        if getattr(self, '_restore_media_viewer_open', False):
+            self._media_viewer_restore_timer = QTimer(self)
+            self._media_viewer_restore_timer.setSingleShot(True)
+            self._media_viewer_restore_timer.timeout.connect(
+                lambda: (self.toggle_split_window(),
+                         setattr(self, '_restore_media_viewer_open', False))
+            )
+            self._media_viewer_restore_timer.start(1500)
 
         # Time Travel animation
         self.time_travel_timer = QTimer(self)
@@ -917,6 +467,9 @@ class TagMap3DTab(QWidget):
             if hasattr(self, 'tab_name_edit'):
                 self.tab_name_edit.setText(settings.get("tab_name", ""))
 
+            # Media viewer open/closed state (applied after the window is shown)
+            self._restore_media_viewer_open = bool(settings.get("media_viewer_open", False))
+
             # Window geometry (main window + splitter sizes)
             main_window = getattr(self, 'main_window', None)
             if main_window is not None:
@@ -1010,17 +563,23 @@ class TagMap3DTab(QWidget):
     def save_settings(self):
         """Save current settings to JSON file (atomic write)."""
         try:
-            # Read existing settings to preserve values for widgets that may not exist
-            # (e.g., split window closed -> self.split_window is None)
+            # Start from the EXISTING file contents so keys written by other
+            # code paths survive (e.g. "split_window_geometry" is persisted by
+            # _persist_split_window_geometry() on media-viewer close, and
+            # "settings_dialog_geometry" by the settings window). Rebuilding a
+            # fresh dict here used to silently drop them on every auto-save.
             existing = {}
             if os.path.exists(SETTINGS_FILE):
                 try:
                     with open(SETTINGS_FILE, 'r') as f:
-                        existing = json.load(f)
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        existing = loaded
                 except (json.JSONDecodeError, OSError):
                     pass
 
-            settings = {
+            settings = dict(existing)
+            settings.update({
                 "client": self.client_combo.currentText(),
                 "chunk_size": self.chunk_size_spin.value(),
                 "max_files": self.max_files_spin.value(),
@@ -1091,6 +650,8 @@ class TagMap3DTab(QWidget):
                 "cohort_label_max_tags": self.cohort_label_max_tags_spin.value(),
                 # Smart labels settings (merged into mode combo; "Raw" = disabled)
                 "smart_label_mode": self.smart_label_mode_combo.currentText(),
+                # Media viewer open/closed state (restored on startup)
+                "media_viewer_open": bool(getattr(self, 'split_window', None)),
                 # Split window settings (image preview)
                 # Fall back to previously saved values when the split window is closed
                 "split_columns": self.split_window.columns_spin.value() if hasattr(self, 'split_window') and self.split_window else existing.get("split_columns", 4),
@@ -1105,7 +666,7 @@ class TagMap3DTab(QWidget):
                 "tab_name": self.tab_name_edit.text() if hasattr(self, 'tab_name_edit') else "",
                 # Auto-load last data setting
                 "auto_load_last_data": self.auto_load_checkbox.isChecked() if hasattr(self, 'auto_load_checkbox') else True,
-            }
+            })
 
             # Window geometry (main window + splitter sizes)
             main_window = getattr(self, 'main_window', None)
@@ -1154,7 +715,12 @@ class TagMap3DTab(QWidget):
 
     @staticmethod
     def _restore_window_geometry(settings, key, widget):
-        """Restore a window's geometry from the settings dict (best effort)."""
+        """Restore a window's geometry from the settings dict (best effort).
+
+        If the saved position lies on a monitor that no longer exists (e.g. a
+        second screen was unplugged), re-center the window on the primary
+        screen instead of leaving it stranded off-screen.
+        """
         try:
             from PySide6.QtCore import QByteArray, QCoreApplication
             raw = settings.get(key)
@@ -1166,6 +732,10 @@ class TagMap3DTab(QWidget):
             geo = widget.geometry()
             screens = QCoreApplication.screens()
             if ok and screens and not any(s.availableGeometry().intersects(geo) for s in screens):
+                primary = QCoreApplication.primaryScreen()
+                if primary is not None:
+                    c = primary.availableGeometry().center()
+                    widget.move(c.x() - widget.width() // 2, c.y() - widget.height() // 2)
                 return False
             return bool(ok)
         except Exception:
@@ -1184,8 +754,14 @@ class TagMap3DTab(QWidget):
             settings = {}
             if os.path.exists(SETTINGS_FILE):
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    settings = json.load(f)
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    settings = loaded
             self._save_window_geometry(settings, "split_window_geometry", self.split_window)
+            # The viewer is closing -> record the closed state so a restart
+            # does not re-open it (this path runs before the tab's reference
+            # is cleared and no debounced save_settings() may follow).
+            settings["media_viewer_open"] = False
             settings_dir = os.path.dirname(SETTINGS_FILE) or '.'
             tmp_fd, tmp_path = tempfile.mkstemp(dir=settings_dir, suffix='.tmp')
             try:
@@ -1272,10 +848,45 @@ class TagMap3DTab(QWidget):
         self.tag_service_combo.blockSignals(False)
 
     def open_settings_dialog(self):
-        """Open the advanced settings window for the 3D tag map tab."""
+        """Open the advanced settings window for the 3D tag map tab.
+
+        Window size/position are persisted to the settings file under
+        "settings_dialog_geometry" (survives save_settings() because it now
+        starts from the existing file contents).
+        """
         from src.ui.settings_dialog import TagMap3DSettingsDialog
         dialog = TagMap3DSettingsDialog(self)
+        # Restore last size/position (best effort; no-op if never saved)
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, 'r') as f:
+                    self._restore_window_geometry(json.load(f), "settings_dialog_geometry", dialog)
+        except Exception:
+            pass
         dialog.exec()
+        # Persist new size/position for next time
+        try:
+            settings = {}
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, 'r') as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    settings = loaded
+            self._save_window_geometry(settings, "settings_dialog_geometry", dialog)
+            settings_dir = os.path.dirname(SETTINGS_FILE) or '.'
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=settings_dir, suffix='.tmp')
+            try:
+                with os.fdopen(tmp_fd, 'w') as f:
+                    json.dump(settings, f, indent=2)
+                os.replace(tmp_path, SETTINGS_FILE)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception:
+            pass
 
     def _refresh_client_combo(self):
         """Rebuild the client combo from clients.json, preserving selection.
@@ -5982,83 +5593,16 @@ class TagMap3DTab(QWidget):
         self.query_edit.setText(query_text)
 
     def _split_query_preserving_brackets(self, query):
-        """Split a query string by commas, keeping bracket groups intact.
-
-        Returns:
-            list: Parts split by top-level commas (bracket groups stay whole strings).
-        """
-        parts = []
-        depth = 0
-        current = []
-        for ch in query:
-            if ch == '[':
-                depth += 1
-                current.append(ch)
-            elif ch == ']':
-                depth -= 1
-                current.append(ch)
-            elif ch == ',' and depth == 0:
-                parts.append(''.join(current).strip())
-                current = []
-            else:
-                current.append(ch)
-        if current:
-            parts.append(''.join(current).strip())
-        return parts
+        """Split a query string by commas, keeping bracket groups intact."""
+        return split_query_preserving_brackets(query)
 
     def _query_to_api_tags(self, query):
-        """Convert a query string to API-ready tags list.
-
-        Bracket groups (OR segments) are converted to nested lists so the
-        Hydrus API interprets them as OR groups.
-        """
-        parts = self._split_query_preserving_brackets(query)
-        api_tags = []
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-            if part.startswith('[') and part.endswith(']'):
-                inner = part[1:-1].strip()
-                tags = [t.strip() for t in inner.split(',') if t.strip()]
-                api_tags.append(tags)
-            else:
-                api_tags.append(part)
-        return api_tags
+        """Convert a query string to API-ready tags list (OR groups as nested lists)."""
+        return query_to_api_tags(query)
 
     def _get_query_tag_states(self):
-        """Parse the current query_edit into included/excluded/OR tag sets.
-
-        Returns:
-            tuple: (included_tags, excluded_tags, or_tags) sets parsed from the query.
-        """
-        query = self.query_edit.text().strip()
-        included = set()
-        excluded = set()
-        or_tags = set()
-        if not query:
-            return included, excluded, or_tags
-        for part in self._split_query_preserving_brackets(query):
-            part = part.strip()
-            if not part:
-                continue
-            # Handle OR bracket group
-            if part.startswith('[') and part.endswith(']'):
-                inner = part[1:-1].strip()
-                for tag in inner.split(','):
-                    tag = tag.strip()
-                    if not tag:
-                        continue
-                    if tag.startswith('-'):
-                        excluded.add(tag[1:].strip())
-                    else:
-                        or_tags.add(tag.strip())
-                continue
-            if part.startswith('-'):
-                excluded.add(part[1:].strip())
-            else:
-                included.add(part.strip())
-        return included, excluded, or_tags
+        """Parse the current query_edit into included/excluded/OR tag sets."""
+        return parse_query_tag_states(self.query_edit.text())
 
     def _on_size_changed(self):
         """Handle size parameter changes to update scatter dynamically."""

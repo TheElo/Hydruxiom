@@ -37,6 +37,9 @@ ENV/
 Thumbs.db
 desktop.ini
 
+# Icon source art (large original; derived .ico + 256px png are tracked)
+icon/gen1.png
+
 # Project
 *.db
 *.sqlite
