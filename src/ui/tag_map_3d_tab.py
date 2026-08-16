@@ -686,6 +686,8 @@ class TagMap3DTab(QWidget):
             metric_idx = self.metric_combo.findText(settings.get("metric", "cosine"))
             if metric_idx >= 0:
                 self.metric_combo.setCurrentIndex(metric_idx)
+            self.subsample_checkbox.setChecked(settings.get("subsample_enabled", True))
+            self.subsample_size_spin.setValue(settings.get("subsample_size", 70000))
 
             # Advanced settings (low RAM, CPU cores)
             self.low_memory = settings.get("low_memory", False)
@@ -887,6 +889,8 @@ class TagMap3DTab(QWidget):
                 "n_epochs": self.n_epochs_spin.value(),
                 "learning_rate": self.learning_rate_spin.value(),
                 "metric": self.metric_combo.currentText(),
+                "subsample_enabled": self.subsample_checkbox.isChecked(),
+                "subsample_size": self.subsample_size_spin.value(),
                 "eps": self.eps_spin.value(),
                 "min_samples": self.min_samples_spin.value(),
                 "sub_eps": self.sub_eps_spin.value(),
@@ -1254,6 +1258,24 @@ class TagMap3DTab(QWidget):
         self.metric_combo.addItems(["cosine", "euclidean"])
         self.metric_combo.setToolTip("UMAP distance metric.\ncosine = Angle-based similarity (default, good for TF-IDF).\neuclidean = Straight-line distance (faster, different clustering).")
         algo_layout.addRow("Metric:", self.metric_combo)
+
+        # UMAP Subsampling (for large datasets)
+        self.subsample_checkbox = QCheckBox("Subsample")
+        self.subsample_checkbox.setChecked(True)
+        self.subsample_checkbox.setToolTip("Fit UMAP on a random subset, then transform all points.\n"
+                                           "Essential for 1M+ files to avoid memory allocation failures.\n"
+                                           "The subset size controls accuracy vs. speed tradeoff.")
+        algo_layout.addRow("Subsample:", self.subsample_checkbox)
+
+        self.subsample_size_spin = QSpinBox()
+        self.subsample_size_spin.setRange(10000, 1000000)
+        self.subsample_size_spin.setValue(70000)
+        self.subsample_size_spin.setSingleStep(10000)
+        self.subsample_size_spin.setToolTip("Number of samples to use for UMAP fitting.\n"
+                                            "All points are still transformed into 3D space.\n"
+                                            "Higher = more accurate layout, more memory.\n"
+                                            "Default: 70000")
+        algo_layout.addRow("Subset Size:", self.subsample_size_spin)
 
         algo_group.setLayout(algo_layout)
         layout.addWidget(algo_group)
@@ -3154,6 +3176,7 @@ class TagMap3DTab(QWidget):
 
         # Reduce dimensionality
         self.worker.progress.emit(60, f"Applying {algorithm.upper()}...")
+        subsample_size = self.subsample_size_spin.value() if self.subsample_checkbox.isChecked() else None
         red = Reducer(
             algorithm=algorithm,
             n_neighbors=n_neighbors,
@@ -3162,7 +3185,8 @@ class TagMap3DTab(QWidget):
             learning_rate=learning_rate,
             low_memory=low_memory,
             metric=metric,
-            n_jobs=n_jobs
+            n_jobs=n_jobs,
+            subsample_size=subsample_size
         )
         _t_red = time.perf_counter()
         positions = red.fit_transform(sparse_matrix)
@@ -3263,6 +3287,7 @@ class TagMap3DTab(QWidget):
 
         # Reduce dimensionality
         self.worker.progress.emit(40, f"Applying {algorithm.upper()}...")
+        subsample_size = self.subsample_size_spin.value() if self.subsample_checkbox.isChecked() else None
         red = Reducer(
             algorithm=algorithm,
             n_neighbors=n_neighbors,
@@ -3271,7 +3296,8 @@ class TagMap3DTab(QWidget):
             learning_rate=learning_rate,
             low_memory=low_memory,
             metric=metric,
-            n_jobs=n_jobs
+            n_jobs=n_jobs,
+            subsample_size=subsample_size
         )
         _t_red = time.perf_counter()
         positions = red.fit_transform(sparse_matrix)
@@ -3378,6 +3404,7 @@ class TagMap3DTab(QWidget):
 
         # Reduce dimensionality
         self.worker.progress.emit(40, f"Applying {algorithm.upper()}...")
+        subsample_size = self.subsample_size_spin.value() if self.subsample_checkbox.isChecked() else None
         red = Reducer(
             algorithm=algorithm,
             n_neighbors=n_neighbors,
@@ -3386,7 +3413,8 @@ class TagMap3DTab(QWidget):
             learning_rate=learning_rate,
             low_memory=low_memory,
             metric=metric,
-            n_jobs=n_jobs
+            n_jobs=n_jobs,
+            subsample_size=subsample_size
         )
         _t_red = time.perf_counter()
         positions = red.fit_transform(sparse_matrix)
@@ -3937,6 +3965,8 @@ class TagMap3DTab(QWidget):
             "low_memory": self.low_memory,
             "n_jobs": self.n_jobs,
             "metric": self.metric_combo.currentText() if hasattr(self, 'metric_combo') else 'cosine',
+            "subsample_enabled": self.subsample_checkbox.isChecked() if hasattr(self, 'subsample_checkbox') else True,
+            "subsample_size": self.subsample_size_spin.value() if hasattr(self, 'subsample_size_spin') else 70000,
             "eps": self.eps_spin.value() / 100.0,
             "min_samples": self.min_samples_spin.value(),
             "node_size": float(self.min_size_spin.value()) / 10.0,
@@ -4123,6 +4153,10 @@ class TagMap3DTab(QWidget):
             metric_idx = self.metric_combo.findText(settings_meta.get("metric", "cosine"))
             if metric_idx >= 0:
                 self.metric_combo.setCurrentIndex(metric_idx)
+            if hasattr(self, 'subsample_checkbox'):
+                self.subsample_checkbox.setChecked(settings_meta.get("subsample_enabled", True))
+            if hasattr(self, 'subsample_size_spin'):
+                self.subsample_size_spin.setValue(settings_meta.get("subsample_size", 70000))
             self.eps_spin.setValue(settings_meta.get("eps", 0.5) * 100.0)
             self.min_samples_spin.setValue(settings_meta.get("min_samples", 10))
             node_size_actual = settings_meta.get("node_size", settings_meta.get("min_size", 0.02))

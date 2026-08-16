@@ -11,7 +11,7 @@ class Reducer:
 
     def __init__(self, algorithm='umap', n_components=3, n_neighbors=15, min_dist=0.1,
                  n_epochs=None, low_memory=False, learning_rate=1.0, metric='cosine',
-                 n_jobs=None):
+                 n_jobs=None, subsample_size=None):
         """Initialize the reducer.
 
         Args:
@@ -24,6 +24,9 @@ class Reducer:
             learning_rate: Initial learning rate for optimization (default: 1.0)
             metric: Distance metric for UMAP ('cosine' or 'euclidean', default: 'cosine')
             n_jobs: Number of CPU cores for UMAP parallel NN-descent (default: None = auto)
+            subsample_size: If set, fit UMAP on a random subset of this size,
+                then transform all points. Reduces memory and time at scale.
+                (default: None = no subsampling)
         """
         self.algorithm = algorithm.lower().replace(' ', '')
         # Normalize "gpu umap" -> "gpu"
@@ -37,6 +40,7 @@ class Reducer:
         self.learning_rate = learning_rate
         self.metric = metric
         self.n_jobs = n_jobs
+        self.subsample_size = subsample_size
         self.model = None
 
     def fit_transform(self, sparse_matrix):
@@ -63,11 +67,15 @@ class Reducer:
     def _umap_transform(self, sparse_matrix):
         """Apply UMAP dimensionality reduction.
 
+        Supports optional subsampling: fit on a random subset, then transform
+        all points. This makes UMAP feasible at 2M+ samples by reducing peak
+        memory from O(n) to O(subsample_size).
+
         Args:
             sparse_matrix: Sparse matrix of shape (n_samples, n_features)
 
         Returns:
-            np.ndarray: 3D coordinates
+            np.ndarray: 3D coordinates for ALL samples
 
         Raises:
             ImportError: If umap-learn is not installed.
@@ -78,9 +86,17 @@ class Reducer:
         except ImportError:
             raise ImportError("UMAP is not installed. Install with: pip install umap-learn")
 
-        print(f"Applying UMAP (n_neighbors={self.n_neighbors}, min_dist={self.min_dist}, "
-              f"n_epochs={self.n_epochs}, learning_rate={self.learning_rate}, low_memory={self.low_memory}, "
-              f"metric={self.metric})...")
+        n_samples = sparse_matrix.shape[0]
+        use_subsample = (self.subsample_size is not None and n_samples > self.subsample_size)
+
+        if use_subsample:
+            print(f"Applying UMAP with subsampling ({self.subsample_size}/{n_samples}) "
+                  f"(n_neighbors={self.n_neighbors}, min_dist={self.min_dist}, "
+                  f"n_epochs={self.n_epochs}, metric={self.metric})...")
+        else:
+            print(f"Applying UMAP (n_neighbors={self.n_neighbors}, min_dist={self.min_dist}, "
+                  f"n_epochs={self.n_epochs}, learning_rate={self.learning_rate}, low_memory={self.low_memory}, "
+                  f"metric={self.metric})...")
 
         reducer = umap.UMAP(
             n_components=self.n_components,
@@ -94,10 +110,22 @@ class Reducer:
             verbose=False
         )
 
-        # UMAP can work directly with sparse matrices
-        positions = reducer.fit_transform(sparse_matrix)
-        self.model = reducer
+        if use_subsample:
+            # Fit on a random subset, then transform all points
+            rng = np.random.default_rng(42)
+            subset_idx = rng.choice(n_samples, size=self.subsample_size, replace=False)
+            subset_matrix = sparse_matrix[subset_idx]
 
+            print(f"  Fitting UMAP on {self.subsample_size} samples...")
+            reducer.fit(subset_matrix)
+
+            print(f"  Transforming all {n_samples} samples...")
+            positions = reducer.transform(sparse_matrix)
+        else:
+            # Standard path: fit_transform on full data
+            positions = reducer.fit_transform(sparse_matrix)
+
+        self.model = reducer
         print(f"UMAP reduction complete: {positions.shape}")
         return positions
 
