@@ -4485,10 +4485,10 @@ class TagMap3DTab(QWidget):
         clip = pos_h @ m.T  # (n, 4)
 
         # Perspective divide
-        w = clip[:, 3:4]
+        w = clip[:, 3]  # (n,)
         # Avoid division by zero
-        w_safe = np.where(np.abs(w) < 1e-10, 1e-10, w)
-        ndc = clip[:, :3] / w_safe  # (n, 3)
+        w_safe = np.where(np.abs(w) < 1e-10, 1e-10, w)  # (n,)
+        ndc = clip[:, :3] / w_safe[:, np.newaxis]  # (n, 3)
 
         # Filter: behind camera or outside NDC z range
         valid = (ndc[:, 2] >= 0) & (ndc[:, 2] <= 1) & (w > 0)
