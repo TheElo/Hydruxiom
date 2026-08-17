@@ -2254,6 +2254,22 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             key = {Qt.Key_W: 'W', Qt.Key_S: 'S', Qt.Key_A: 'A', Qt.Key_D: 'D',
                    Qt.Key_Q: 'Q', Qt.Key_E: 'E'}.get(event.key())
             if key is not None:
+                # While Explore is running, Q/E steer the tour (previous / next
+                # cohort), W/S adjust camera distance to the cohort. These take
+                # priority over WASD travel-history navigation.
+                if getattr(self, '_explore_active', False):
+                    if key in ('Q', 'E'):
+                        self._explore_jump(1 if key == 'E' else -1)
+                        event.accept()
+                        return
+                    if key in ('W', 'S'):
+                        # W = closer (reduce orbit radius), S = farther (increase).
+                        # Multiplicative for consistent feel at any zoom level.
+                        factor = 0.85 if key == 'W' else 1.18
+                        self._explore_orbit_radius = max(
+                            0.5, self._explore_orbit_radius * factor)
+                        event.accept()
+                        return
                 self._wasd_mode = True
                 self._wasd_handle_key(key)
                 event.accept()
@@ -2614,6 +2630,25 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         if hasattr(self, 'selection_timer') and self.selected_cluster_id not in (None, -1):
             self.selection_timer.start(500)
         self.status_label.setText("Explore stopped")
+
+    def _explore_jump(self, direction):
+        """Jump the Explore tour to the next (+1) or previous (-1) cohort.
+
+        Bound to E (next) / Q (previous) while Explore is running. Moves along the
+        remembered visit path and starts a fresh approach from wherever the camera
+        currently is — so it banks into the new orbit with momentum, same as the
+        automatic advance when an orbit completes.
+        """
+        if not getattr(self, '_explore_active', False):
+            return
+        path = getattr(self, '_explore_path', []) or []
+        n = len(path)
+        if n == 0:
+            return
+        idx = (getattr(self, '_explore_path_index', 0) + direction) % n
+        self._explore_path_index = idx
+        self._explore_begin_target(path[idx])
+        self._explore_draw_path_preview()
 
     def _explore_begin_target(self, target):
         """Start approaching a new cohort: select it, compute the orbit geometry.

@@ -61,6 +61,7 @@ Press the **Explore** button to fly the camera on an automated tour of your coho
 - **Mode:** Random (shuffled), Linear Path (spatial sweep), or Contrast (farthest-point sampling)
 - **Orbit Speed / Cycles / Elevation / Radius** — all tunable in Settings → Explore
 - A bright red marker shows which cohort is being orbited; an optional path preview draws the planned route
+- While running, press **E** to jump to the next cohort or **Q** to go back to the previous one (the camera banks into each new orbit with momentum). Press **W** / **S** to zoom closer / farther from the current cohort.
 
 ### WASD Cohort Navigation
 
@@ -84,7 +85,7 @@ With a scene loaded, press **W/S/A/D** to jump between neighboring cohorts (scre
 Ctrl+ combos are skipped while a text field has focus.
 
 | W/S/A/D | Navigate to nearest cohort in that screen direction |
-| Q / E | Step back / forward through travel history |
+| Q / E | Step back / forward through travel history (or previous / next Explore cohort while Explore is running) |
 
 ### Sessions & persistence
 
