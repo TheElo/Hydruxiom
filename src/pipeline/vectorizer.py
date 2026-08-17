@@ -6,7 +6,7 @@ Builds tag vocabulary and creates TF-IDF sparse vectors for files.
 import numpy as np
 from scipy.sparse import csr_matrix
 from collections import defaultdict
-from src.utils.query_comperator import ExternalTagScores
+from src.core.tag_scores import ExternalTagScores
 
 
 class Vectorizer:

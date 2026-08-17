@@ -28,6 +28,7 @@ from src.ui.panels.tag_query import (
     ClickableTag, split_query_preserving_brackets,
     query_to_api_tags, parse_query_tag_states,
 )
+from src.ui.tag_map_utils import compile_tag_patterns, ease_in_out
 
 # Settings file path (relative to project root)
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "3d_tag_map_settings.json")
@@ -170,6 +171,9 @@ class TagMap3DTab(QWidget):
         self.tokenize = True
         self.drop_universal = True  # Drop universal tags (managed in settings dialog)
         self.drop_empty_files = False  # Drop empty files (managed in settings dialog)
+        # When on, right-click both re-centers the camera AND selects the cohort
+        # under the cursor (faster navigation). Managed in the settings dialog.
+        self.right_click_select_cohort = False
 
         # DBSCAN optimizer settings (managed by the settings dialog)
         self.opt_max_cohort_size = 500
@@ -390,6 +394,7 @@ class TagMap3DTab(QWidget):
             self.blacklist_edit.setText(settings.get("blacklist", ""))
             self.tokenize = settings.get("tokenize", True)
             self.drop_empty_files = settings.get("drop_empty_files", False)
+            self.right_click_select_cohort = bool(settings.get("right_click_select_cohort", False))
             self.min_doc_freq_spin.setValue(settings.get("min_doc_freq", 3))
             self.drop_universal = settings.get("drop_universal_tags", True)
 
@@ -616,6 +621,7 @@ class TagMap3DTab(QWidget):
                 "blacklist": self.blacklist_edit.text(),
                 "tokenize": getattr(self, 'tokenize', True),
                 "drop_empty_files": getattr(self, 'drop_empty_files', False),
+                "right_click_select_cohort": bool(getattr(self, 'right_click_select_cohort', False)),
                 "min_doc_freq": self.min_doc_freq_spin.value(),
                 "drop_universal_tags": self.drop_universal,
                 "node_size": self.min_size_spin.value() / 10.0,
@@ -1546,7 +1552,12 @@ class TagMap3DTab(QWidget):
                         traceback.print_exc()
                 
                 def handle_set_camera_center(self, event: QMouseEvent):
-                    """Handle right-click to set the camera center to the clicked node (vectorized)."""
+                    """Handle right-click to set the camera center to the clicked node (vectorized).
+
+                    If "Right-click also selects cohort" is enabled in settings, this
+                    ALSO selects the cohort under the cursor so you can navigate +
+                    inspect in one gesture.
+                    """
                     try:
                         import numpy as np
                         from PySide6.QtGui import QVector3D
@@ -1558,6 +1569,9 @@ class TagMap3DTab(QWidget):
                             self.opts['center'] = QVector3D(float(center[0]), float(center[1]), float(center[2]))
                             self.update()
                             print(f"Camera center set to ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})")
+                            # Optional: also select the cohort under the cursor.
+                            if getattr(self.parent_tab, 'right_click_select_cohort', False):
+                                self.parent_tab.show_cluster_info(closest_idx)
                     except Exception as e:
                         print(f"Error in set camera center: {e}")
                         import traceback
@@ -2343,8 +2357,9 @@ class TagMap3DTab(QWidget):
         # Determine the selected cohort's cluster_id
         selected_cid = self.selected_cluster_id
         if selected_cid is None and self.selected_node_index is not None:
-            if hasattr(self, 'node_list') and 0 <= self.selected_node_index < len(self.node_list):
-                selected_cid = self.node_list[self.selected_node_index].cluster_id
+            scene = getattr(self, 'scene_graph', None)
+            if scene is not None and 0 <= self.selected_node_index < len(scene.file_ids):
+                selected_cid = int(scene.cluster_ids[self.selected_node_index])
         # Swap only the selected cohort's label color; keep all others visible.
         # The custom paint() reads self.color (a QColor), so set that and
         # request a repaint via update().
@@ -2478,12 +2493,15 @@ class TagMap3DTab(QWidget):
         """
         from collections import Counter
         count = len(nodes)
+        scene = self.scene_graph
+        tag_data = self.tag_data or {}
         tag_counter = Counter()
-        for node in nodes:
+        for i in nodes:
+            tags = tag_data.get(scene.file_ids[i], [])
             if self.tag_interner:
-                tag_counter.update(self.tag_interner.strings_to_list(node.tags))
+                tag_counter.update(self.tag_interner.strings_to_list(tags))
             else:
-                tag_counter.update(node.tags)
+                tag_counter.update(tags)
 
         shared_tags = self._get_query_shared_tags()
         threshold = self.cohort_threshold_spin.value()
@@ -2517,12 +2535,15 @@ class TagMap3DTab(QWidget):
             list: All non-shared tags in dominance order (tag, count) tuples.
         """
         from collections import Counter
+        scene = self.scene_graph
+        tag_data = self.tag_data or {}
         tag_counter = Counter()
-        for node in nodes:
+        for i in nodes:
+            tags = tag_data.get(scene.file_ids[i], [])
             if self.tag_interner:
-                tag_counter.update(self.tag_interner.strings_to_list(node.tags))
+                tag_counter.update(self.tag_interner.strings_to_list(tags))
             else:
-                tag_counter.update(node.tags)
+                tag_counter.update(tags)
 
         shared_tags = self._get_query_shared_tags()
 
@@ -2565,14 +2586,14 @@ class TagMap3DTab(QWidget):
         mode = self.smart_label_mode_combo.currentText()
 
         # Precompute per-cohort data: centroid, size, full ranked tag list
+        scene = self.scene_graph
         cohort_info = {}
-        for cid, nodes in cluster_nodes.items():
-            positions = np.array([node.position for node in nodes])
-            centroid = positions.mean(axis=0)
-            ranked = self._get_cohort_dominant_tags_full(nodes)
+        for cid, idx in cluster_nodes.items():
+            centroid = scene.positions[idx].mean(axis=0)
+            ranked = self._get_cohort_dominant_tags_full(idx)
             cohort_info[cid] = {
                 "centroid": centroid,
-                "size": len(nodes),
+                "size": len(idx),
                 "ranked": ranked,
             }
 
@@ -2687,13 +2708,14 @@ class TagMap3DTab(QWidget):
             if not hasattr(self, 'node_list') or not self.node_list:
                 return
 
-            # Group nodes by cluster
+            # Group member indices by cluster (vectorized; skip noise)
+            scene = self.scene_graph
+            cids_arr = scene.cluster_ids
             cluster_nodes = {}
-            for node in self.node_list:
-                cid = node.cluster_id
-                if cid == -1:
+            for cid in np.unique(cids_arr):
+                if int(cid) == -1:
                     continue  # Skip noise
-                cluster_nodes.setdefault(cid, []).append(node)
+                cluster_nodes[int(cid)] = np.where(cids_arr == cid)[0]
 
             if not cluster_nodes:
                 return
@@ -2710,8 +2732,8 @@ class TagMap3DTab(QWidget):
             # the always-include-selected fallback below.
             selected_cid = self.selected_cluster_id
             if selected_cid is None and self.selected_node_index is not None:
-                if 0 <= self.selected_node_index < len(self.node_list):
-                    selected_cid = self.node_list[self.selected_node_index].cluster_id
+                if 0 <= self.selected_node_index < len(scene.file_ids):
+                    selected_cid = int(scene.cluster_ids[self.selected_node_index])
 
             # Apply label mode filter to avoid overlap noise
             mode = self.cohort_label_mode_combo.currentText()
@@ -2725,13 +2747,11 @@ class TagMap3DTab(QWidget):
             elif mode == "Selected & N neighbors":
                 # Selected cohort + its N nearest neighbors (by centroid distance).
                 if selected_cid is not None and selected_cid in cluster_nodes:
-                    sel_centroid = np.mean(
-                        [node.position for node in cluster_nodes[selected_cid]], axis=0
-                    )
-                    others = {cid: nodes for cid, nodes in cluster_nodes.items() if cid != selected_cid}
+                    sel_centroid = scene.positions[cluster_nodes[selected_cid]].mean(axis=0)
+                    others = {cid: idx for cid, idx in cluster_nodes.items() if cid != selected_cid}
                     # Rank other cohorts by centroid distance to the selection
-                    def _centroid(nodes):
-                        return np.mean([node.position for node in nodes], axis=0)
+                    def _centroid(idx):
+                        return scene.positions[idx].mean(axis=0)
                     ranked = sorted(
                         others.items(),
                         key=lambda kv: float(np.linalg.norm(_centroid(kv[1]) - sel_centroid))
@@ -2756,9 +2776,9 @@ class TagMap3DTab(QWidget):
             # the label mode filter excluded it (e.g. outside top N or below
             # the size threshold).
             if selected_cid is not None and selected_cid not in cluster_nodes:
-                selected_nodes = [node for node in self.node_list if node.cluster_id == selected_cid]
-                if selected_nodes:
-                    cluster_nodes[selected_cid] = selected_nodes
+                sel_idx = np.where(scene.cluster_ids == selected_cid)[0]
+                if len(sel_idx) > 0:
+                    cluster_nodes[selected_cid] = sel_idx
 
             # Smart labels: resolve duplicate labels across cohorts
             smart_label_mode = self.smart_label_mode_combo.currentText()
@@ -2773,10 +2793,9 @@ class TagMap3DTab(QWidget):
                     smart_label_map = None
 
             self.cohort_label_items = []
-            for cid, nodes in cluster_nodes.items():
-                # Compute centroid (center of cohort)
-                positions = np.array([node.position for node in nodes])
-                centroid = positions.mean(axis=0)
+            for cid, idx in cluster_nodes.items():
+                # Compute centroid (center of cohort) from member indices
+                centroid = scene.positions[idx].mean(axis=0)
                 spread = float(self.spread_spin.value())
                 centroid = centroid * spread
 
@@ -2866,14 +2885,16 @@ class TagMap3DTab(QWidget):
         if not hasattr(self, 'selection_tags_text'):
             return
 
-        if not cluster_nodes:
+        if len(cluster_nodes) == 0:
             self.selection_tags_text.setText("No files in selection.")
             return
 
-        # Count tag occurrences across the selected files
+        # Count tag occurrences across the selected files (cluster_nodes = member indices)
+        scene = self.scene_graph
+        tag_data = self.tag_data or {}
         tag_counts = {}
-        for n in cluster_nodes:
-            for tag in n.tags:
+        for i in cluster_nodes:
+            for tag in tag_data.get(scene.file_ids[i], []):
                 # Resolve tokenized indices back to strings for display
                 if self.tag_interner and isinstance(tag, int):
                     tag = self.tag_interner.index_to_string(tag)
@@ -2969,11 +2990,11 @@ class TagMap3DTab(QWidget):
         if self.selected_node_index is not None and hasattr(self, 'file_ids'):
             if self.selected_node_index < len(self.file_ids):
                 file_ids.append(self.file_ids[self.selected_node_index])
-        # Cluster selection
-        elif self.selected_cluster_id is not None and hasattr(self, 'node_list'):
-            for node in self.node_list:
-                if getattr(node, 'cluster_id', None) == self.selected_cluster_id:
-                    file_ids.append(node.file_id)  # TagNode has file_id (singular)
+        # Cluster selection (vectorized mask over the scene's label array)
+        elif self.selected_cluster_id is not None and getattr(self, 'scene_graph', None) is not None:
+            import numpy as np
+            idx = np.where(self.scene_graph.cluster_ids == self.selected_cluster_id)[0]
+            file_ids.extend(int(self.scene_graph.file_ids[i]) for i in idx)
         return file_ids
 
     def _is_worker_busy(self):
@@ -3116,24 +3137,9 @@ class TagMap3DTab(QWidget):
     def _compile_tag_patterns(tag_list):
         """Split a tag list into exact-match set and compiled wildcard patterns.
 
-        Args:
-            tag_list: List of tag strings (may contain wildcards like 'system:*')
-
-        Returns:
-            tuple: (exact_set, compiled_patterns)
-                - exact_set: set of lowercase exact tag names (no wildcards)
-                - compiled_patterns: list of compiled regex for wildcard patterns
+        Thin wrapper around :func:`src.ui.tag_map_utils.compile_tag_patterns`.
         """
-        import fnmatch
-        import re
-        exact = set()
-        patterns = []
-        for pattern in tag_list:
-            if '*' in pattern or '?' in pattern or '[' in pattern:
-                patterns.append(re.compile(fnmatch.translate(pattern.lower())))
-            else:
-                exact.add(pattern.lower())
-        return exact, patterns
+        return compile_tag_patterns(tag_list)
 
     def _load_and_compute(self):
         """Load data and compute 3D positions."""
@@ -3463,18 +3469,21 @@ class TagMap3DTab(QWidget):
             self.status_label.setText("Please wait - a process is already running.")
             return
 
-        # Collect nodes in the selected cohort
-        cluster_nodes = [n for n in self.node_list if n.cluster_id == self.selected_cluster_id]
-        if len(cluster_nodes) < 2:
+        # Collect member indices of the selected cohort (vectorized mask)
+        import numpy as np
+        idx = np.where(self.scene_graph.cluster_ids == self.selected_cluster_id)[0]
+        if len(idx) < 2:
             self.status_label.setText("Cohort too small to cut out (need 2+ files).")
             return
 
-        # Build sub tag_data from the cohort's nodes
+        # Build sub tag_data from the cohort's members (tags live in self.tag_data)
         sub_tag_data = {}
-        for node in cluster_nodes:
-            sub_tag_data[node.file_id] = list(node.tags)
+        for i in idx:
+            fid = self.scene_graph.file_ids[i]
+            tags = (self.tag_data or {}).get(fid, [])
+            sub_tag_data[fid] = list(tags)
 
-        self.status_label.setText(f"Cutting out cohort {self.selected_cluster_id} ({len(cluster_nodes)} files)...")
+        self.status_label.setText(f"Cutting out cohort {self.selected_cluster_id} ({len(idx)} files)...")
         self._set_cohort_action_buttons(False)
 
         def worker_func():
@@ -3581,9 +3590,10 @@ class TagMap3DTab(QWidget):
             return
 
         cluster_id = self.selected_cluster_id
-        # Count removed/remaining in one pass (no list allocation of 2M objects)
-        removed_count = sum(1 for n in self.node_list if n.cluster_id == cluster_id)
-        total = len(self.node_list)
+        # Count removed/remaining via the label array (no per-node iteration)
+        import numpy as np
+        removed_count = int(np.sum(self.scene_graph.cluster_ids == cluster_id))
+        total = len(self.scene_graph.file_ids)
         if total - removed_count <= 0:
             self.status_label.setText("Cannot pop: this is the only cohort in the view.")
             return
@@ -3606,9 +3616,9 @@ class TagMap3DTab(QWidget):
     def _pop_compute(self, cluster_id, removed_count):
         """Remove the popped cohort from the scene (positions unchanged).
 
-        Fast path: reuses existing node/cluster objects via SceneGraph.
-        without_cluster() instead of rebuilding 2M TagNode objects and copying
-        every tag list. Only the popped cohort's file IDs are dropped from
+        Fast path: slices the SoA arrays once via SceneGraph.without_cluster()
+        (no per-node object creation) and remaps surviving cluster indices.
+        Only the popped cohort's file IDs are dropped from
         tag_data.
         """
         self.worker.progress.emit(40, "Removing cohort...")
@@ -3618,8 +3628,9 @@ class TagMap3DTab(QWidget):
 
         # Filter tag_data: drop only the popped cohort's file IDs (no list copies).
         if self.tag_data is not None:
-            removed_ids = {fid for fid, node in self.scene_graph.nodes.items()
-                           if node.cluster_id == cluster_id}
+            import numpy as np
+            idx = np.where(self.scene_graph.cluster_ids == cluster_id)[0]
+            removed_ids = {self.scene_graph.file_ids[i] for i in idx}
             self.tag_data = {fid: tags for fid, tags in self.tag_data.items()
                              if fid not in removed_ids}
 
@@ -3640,7 +3651,8 @@ class TagMap3DTab(QWidget):
             self.status_label.setText("Please wait - a process is already running.")
             return
 
-        cluster_nodes = [n for n in self.node_list if n.cluster_id == self.selected_cluster_id]
+        import numpy as np
+        cluster_nodes = np.where(self.scene_graph.cluster_ids == self.selected_cluster_id)[0]
         if len(cluster_nodes) < 2:
             self.status_label.setText("Cohort too small to re-cluster (need 2+ files).")
             return
@@ -3672,10 +3684,9 @@ class TagMap3DTab(QWidget):
         min_samples = self.min_samples_spin.value()
         node_size = float(self.min_size_spin.value()) / 10.0
 
-        # Use existing positions (no re-reduce)
-        positions = np.array([node.position for node in cluster_nodes])
+        # Use existing positions (no re-reduce); cluster_nodes are array indices
         spread = float(self.spread_spin.value())
-        positions = positions * spread
+        positions = self.scene_graph.positions[cluster_nodes] * spread
 
         # Use SEPARATE sub-clustering settings (independent from global eps/min).
         # The selected cohort is already a dense sub-region; the global eps would
@@ -3686,52 +3697,48 @@ class TagMap3DTab(QWidget):
         self.worker.progress.emit(40, "Clustering selection (sub-cohorts)...")
         clust = Clusterer(eps=sub_eps, min_samples=sub_min_samples)
         cluster_positions = self._maybe_normalize_positions(positions)
-        cluster_labels = clust.fit_predict(cluster_positions)
+        cluster_labels = np.asarray(clust.fit_predict(cluster_positions))
 
-        # Build sub tag_data from the selected nodes
+        # Build sub tag_data from the selected members (tags live in self.tag_data)
+        file_ids_arr = self.scene_graph.file_ids
         sub_tag_data = {}
-        for node in cluster_nodes:
-            sub_tag_data[node.file_id] = list(node.tags)
+        for i in cluster_nodes:
+            fid = file_ids_arr[i]
+            tags = (self.tag_data or {}).get(fid, [])
+            sub_tag_data[fid] = list(tags)
 
         # Build a FULL scene: keep all nodes, only re-label the selected cohort.
         # Non-selected nodes keep their original positions and cluster labels.
-        all_file_ids = []
-        all_positions = []
-        all_labels = []
-        all_tag_data = {}
+        n = len(file_ids_arr)
+        all_file_ids = list(file_ids_arr)
+        all_positions = self.scene_graph.positions * spread
+        all_tag_data = {fid: list((self.tag_data or {}).get(fid, [])) for fid in file_ids_arr}
 
-        selected_ids = {n.file_id for n in cluster_nodes}
-        # Map selected node -> new sub-cohort label
+        selected_ids = set(int(file_ids_arr[i]) for i in cluster_nodes)
+        # Map selected node -> new sub-cohort label (by index into the selection)
         selected_label_map = {}
-        for node, new_label in zip(cluster_nodes, cluster_labels):
-            selected_label_map[node.file_id] = new_label
+        for k, i in enumerate(cluster_nodes):
+            selected_label_map[int(file_ids_arr[i])] = int(cluster_labels[k])
 
         # Remap sub-cohort labels to UNIQUE IDs that don't collide with existing
         # cluster IDs of non-selected nodes. DBSCAN returns 0-based labels which
         # may overlap with existing cluster IDs, causing color/group confusion.
-        existing_ids = {n.cluster_id for n in self.node_list if n.cluster_id != -1}
+        existing_ids = set(np.unique(self.scene_graph.cluster_ids[self.scene_graph.cluster_ids != -1]).tolist())
         max_existing = max(existing_ids) if existing_ids else -1
         sub_label_remap = {}
         next_id = max_existing + 1
         for label in cluster_labels:
-            if label == -1:
-                sub_label_remap[label] = -1
-            elif label not in sub_label_remap:
-                sub_label_remap[label] = next_id
+            lab = int(label)
+            if lab == -1:
+                sub_label_remap[lab] = -1
+            elif lab not in sub_label_remap:
+                sub_label_remap[lab] = next_id
                 next_id += 1
 
-        for node in self.node_list:
-            all_file_ids.append(node.file_id)
-            all_positions.append(node.position)
-            all_tag_data[node.file_id] = list(node.tags)
-            if node.file_id in selected_ids:
-                # Re-labeled sub-cohort (new unique label from DBSCAN)
-                all_labels.append(sub_label_remap[selected_label_map[node.file_id]])
-            else:
-                # Keep original cluster label
-                all_labels.append(node.cluster_id)
-
-        all_positions = np.array(all_positions) * spread
+        # New labels: selected members get remapped sub-cohort ids, others keep theirs.
+        all_labels = self.scene_graph.cluster_ids.astype(np.int32).copy()
+        for k, i in enumerate(cluster_nodes):
+            all_labels[i] = sub_label_remap[int(cluster_labels[k])]
 
         self.worker.progress.emit(90, "Building sub-scene...")
         reverse_vocab = self.tag_interner.index_to_tag if self.tag_interner else None
@@ -3740,7 +3747,7 @@ class TagMap3DTab(QWidget):
             all_file_ids,
             all_positions,
             all_tag_data,
-            np.array(all_labels),
+            all_labels,
             node_size=node_size,
             tokenized=bool(self.tag_interner),
             reverse_vocab=reverse_vocab,
@@ -3749,12 +3756,13 @@ class TagMap3DTab(QWidget):
         # Preserve original colors for non-selected nodes so their appearance
         # stays exactly the same; only the split sub-cohorts get new colors.
         if self.scene_graph is not None:
-            old_nodes = self.scene_graph.nodes
-            for node in scene.nodes.values():
-                if node.file_id not in selected_ids:
-                    old = old_nodes.get(node.file_id)
-                    if old is not None:
-                        node.color = old.color
+            old = self.scene_graph
+            for i in range(n):
+                fid = all_file_ids[i]
+                if int(fid) not in selected_ids:
+                    oi = old.file_id_to_index.get(fid)
+                    if oi is not None:
+                        scene.colors[i] = old.colors[oi]
 
         self.worker.progress.emit(100, "Re-cluster complete!")
         return scene, all_tag_data
@@ -3810,15 +3818,10 @@ class TagMap3DTab(QWidget):
         node_size = float(self.min_size_spin.value()) / 10.0
         spread = float(self.spread_spin.value())
 
-        # Use existing positions for ALL nodes (no re-reduce)
-        all_file_ids = []
-        all_positions = []
-        all_tag_data = {}
-        for node in self.node_list:
-            all_file_ids.append(node.file_id)
-            all_positions.append(node.position)
-            all_tag_data[node.file_id] = list(node.tags)
-        all_positions = np.array(all_positions) * spread
+        # Use existing positions for ALL nodes (no re-reduce) — direct array access
+        all_file_ids = list(self.scene_graph.file_ids)
+        all_positions = self.scene_graph.positions * spread
+        all_tag_data = {fid: list((self.tag_data or {}).get(fid, [])) for fid in all_file_ids}
 
         self.worker.progress.emit(40, "Clustering all positions...")
         _t_clust = time.perf_counter()
@@ -3911,15 +3914,10 @@ class TagMap3DTab(QWidget):
         node_size = float(self.min_size_spin.value()) / 10.0
         spread = float(self.spread_spin.value())
 
-        # Use existing positions for ALL nodes (no re-reduce)
-        all_file_ids = []
-        all_positions = []
-        all_tag_data = {}
-        for node in self.node_list:
-            all_file_ids.append(node.file_id)
-            all_positions.append(node.position)
-            all_tag_data[node.file_id] = list(node.tags)
-        all_positions = np.array(all_positions) * spread
+        # Use existing positions for ALL nodes (no re-reduce) — direct array access
+        all_file_ids = list(self.scene_graph.file_ids)
+        all_positions = self.scene_graph.positions * spread
+        all_tag_data = {fid: list((self.tag_data or {}).get(fid, [])) for fid in all_file_ids}
 
         self.worker.progress.emit(30, "Searching DBSCAN parameters...")
 
@@ -3997,31 +3995,32 @@ class TagMap3DTab(QWidget):
             return False
 
         scene = self.scene_graph
-        nodes = list(scene.nodes.values())
-        if not nodes:
+        n = len(scene.file_ids)
+        if n == 0:
             return False
 
-        # Build parallel arrays
+        # Build parallel arrays (direct access to the SoA arrays)
         # Convert file_ids to native Python ints (numpy int64 is not JSON-serializable)
-        file_ids = [int(n.file_id) for n in nodes]
-        positions = np.array([n.position for n in nodes])  # (n, 3)
-        cluster_labels = np.array([n.cluster_id for n in nodes])  # (n,)
-        colors = np.array([n.color for n in nodes])  # (n, 3)
-        sizes = np.array([n.size for n in nodes])  # (n,)
+        file_ids = [int(fid) for fid in scene.file_ids]
+        positions = scene.positions  # (n, 3)
+        cluster_labels = scene.cluster_ids  # (n,)
+        colors = scene.colors  # (n, 3)
+        sizes = scene.sizes  # (n,)
 
         # Build tag metadata (resolve tokenized tags to strings for portability)
         tags_list = []
-        for n in nodes:
+        for fid in scene.file_ids:
+            raw_tags = (scene.tag_data or {}).get(fid, [])
             if scene.tokenized and scene.reverse_vocab:
                 resolved = []
-                for t in n.tags:
-                    if isinstance(t, int) and t < len(scene.reverse_vocab):
+                for t in raw_tags:
+                    if isinstance(t, int) and 0 <= t < len(scene.reverse_vocab):
                         resolved.append(scene.reverse_vocab[t])
                     else:
                         resolved.append(str(t))
                 tags_list.append(resolved)
             else:
-                tags_list.append(list(n.tags))
+                tags_list.append(list(raw_tags))
 
         # Build cluster metadata
         clusters_meta = []
@@ -4029,7 +4028,7 @@ class TagMap3DTab(QWidget):
             clusters_meta.append({
                 "id": int(c.cluster_id),
                 "centroid": c.centroid.tolist(),
-                "size": len(c.nodes),
+                "size": c.size,
                 "dominant_tags": list(c.dominant_tags),
                 "color": list(c.color),
                 "label": c.label,
@@ -4066,7 +4065,7 @@ class TagMap3DTab(QWidget):
         # Build metadata JSON
         metadata = {
             "version": 1,
-            "node_count": len(nodes),
+            "node_count": n,
             "file_ids": file_ids,
             "tags": tags_list,
             "colors": colors.tolist(),
@@ -4140,7 +4139,7 @@ class TagMap3DTab(QWidget):
         import numpy as np
         import json
         from pathlib import Path
-        from src.core.models import SceneGraph, TagNode, Cluster
+        from src.core.models import SceneGraph
 
         if path is not None:
             filename = Path(path)
@@ -4195,39 +4194,22 @@ class TagMap3DTab(QWidget):
             settings_meta = metadata['settings']
             camera_meta = metadata['camera']
 
-            # Reconstruct SceneGraph
+            # Reconstruct SceneGraph directly into the SoA arrays (no per-node objects).
+            # Tags are stored as strings in the session, so build with tokenized=False.
+            tag_data = {fid: list(tags_list[i]) for i, fid in enumerate(file_ids)}
             scene = SceneGraph()
-            scene.tokenized = False  # tags stored as strings
-            scene.reverse_vocab = None
+            scene.build_from_data(
+                file_ids,
+                np.asarray(positions),
+                tag_data,
+                np.asarray(cluster_labels, dtype=np.int32),
+                node_size=float(sizes[0]) if len(sizes) else 0.02,
+                tokenized=False,
+            )
 
-            nodes = []
-            for i, fid in enumerate(file_ids):
-                node = TagNode(
-                    file_id=fid,
-                    position=positions[i],
-                    tags=tags_list[i],
-                    score=0.0,  # recomputed on demand; not persisted
-                    cluster_id=int(cluster_labels[i]),
-                    color=tuple(colors[i]),
-                    size=sizes[i],
-                )
-                nodes.append(node)
-            scene.add_nodes(nodes)
-
-            # Reconstruct clusters
-            for cmeta in clusters_meta:
-                cid = cmeta['id']
-                cluster_nodes = [n for n in nodes if n.cluster_id == cid]
-                cluster = Cluster(
-                    cluster_id=cid,
-                    centroid=np.array(cmeta['centroid']),
-                    nodes=cluster_nodes,
-                    dominant_tags=list(cmeta['dominant_tags']),
-                    color=tuple(cmeta['color']),
-                    label=cmeta['label'],
-                    density=cmeta['density'],
-                )
-                scene.add_cluster(cluster)
+            # Restore the exact saved colors (build_from_data assigns by cluster;
+            # a session may carry custom scheme colors).
+            scene.colors = np.asarray(colors, dtype=np.uint8)
 
             # Restore camera
             scene.camera_position = np.array(camera_meta['position'])
@@ -4237,11 +4219,12 @@ class TagMap3DTab(QWidget):
             self._apply_session_settings(settings_meta)
 
             self.scene_graph = scene
-            self.node_list = list(scene.nodes.values())
-            self.tag_data = None  # not persisted; recompute needs re-query
+            self.node_list = scene.get_file_ids()
+            self.tag_data = tag_data  # tags ARE persisted in the session (strings)
 
-            self.status_label.setText(f"Session loaded: {len(nodes)} nodes")
-            print(f"[Session] Loaded {len(nodes)} nodes from {filename}")
+            n_loaded = len(file_ids)
+            self.status_label.setText(f"Session loaded: {n_loaded} nodes")
+            print(f"[Session] Loaded {n_loaded} nodes from {filename}")
             self.render_scene(scene)
 
         except Exception as e:
@@ -4346,7 +4329,7 @@ class TagMap3DTab(QWidget):
         # (much lighter than full render_scene, avoids UI lock on 55k nodes).
         if getattr(self, '_pending_recluster', False):
             self._pending_recluster = False
-            self.node_list = list(scene.nodes.values())
+            self.node_list = scene.get_file_ids()
             self._build_base_scatter()
             self._apply_highlight_colors(self._base_colors_rgba)
             self._update_cohort_labels()
@@ -4388,17 +4371,13 @@ class TagMap3DTab(QWidget):
             spread = float(self.spread_spin.value())
             positions = positions * spread
 
-            # V5: Apply color scheme to node colors
-            cluster_ids_set = set()
-            for node in scene.nodes.values():
-                cluster_ids_set.add(node.cluster_id)
+            # V5: Apply color scheme to node colors (vectorized over the label array)
+            cluster_ids_arr = scene.cluster_ids
+            cluster_ids_set = set(np.unique(cluster_ids_arr).tolist())
             total_clusters = len(cluster_ids_set) if cluster_ids_set else 1
 
-            # Generate colors based on scheme
-            colors_list = []
-            for node in scene.nodes.values():
-                color = self._get_color_for_cluster(node.cluster_id, total_clusters)
-                colors_list.append(color)
+            # Generate colors based on scheme (one per node, by its cluster)
+            colors_list = [self._get_color_for_cluster(int(cid), total_clusters) for cid in cluster_ids_arr]
             colors = np.array(colors_list)
 
             sizes = scene.get_node_sizes()
@@ -4424,9 +4403,9 @@ class TagMap3DTab(QWidget):
                 pass  # sigClicked not available in this PyQtGraph version
             self.gl_view.addItem(self.gl_scatter)
 
-            # Store file IDs for click handling
+            # Store file IDs for click handling (node_list == file ids, same index order)
             self.file_ids = scene.get_file_ids()
-            self.node_list = list(scene.nodes.values())
+            self.node_list = scene.get_file_ids()
 
             # Build base scatter cache for efficient highlight updates
             self._build_base_scatter()
@@ -4799,14 +4778,15 @@ class TagMap3DTab(QWidget):
         Returns the base colors_rgba array (no highlight/dim).
         """
         import numpy as np
-        positions = np.array([node.position for node in self.node_list]) * float(self.spread_spin.value())
+        scene = self.scene_graph
+        positions = scene.positions * float(self.spread_spin.value())
         node_size = self.min_size_spin.value() / 10.0
-        sizes = np.full(len(self.node_list), node_size)
-        colors = np.array([node.color for node in self.node_list]) / 255.0
+        sizes = np.full(len(scene.file_ids), node_size)
+        colors = scene.colors.astype(np.float64) / 255.0
         alpha = self.transparency_spin.value()
         colors_rgba = np.column_stack([colors, alpha * np.ones(len(colors))])
         # Cache cluster_ids as numpy array (avoids O(n) Python loop per blink tick)
-        self._base_cluster_ids = np.array([node.cluster_id for node in self.node_list], dtype=np.int32)
+        self._base_cluster_ids = scene.cluster_ids.astype(np.int32)
         self._base_positions = positions
         self._base_sizes = sizes
         self._base_colors_rgba = colors_rgba
@@ -5192,14 +5172,21 @@ class TagMap3DTab(QWidget):
         """Load a grid of thumbnails for the given file IDs asynchronously."""
         max_files = self.split_window.max_files_spin.value() if hasattr(self.split_window, 'max_files_spin') else 60
         image_size = self.split_window.image_size_spin.value() if hasattr(self.split_window, 'image_size_spin') else 200
-        self.split_loader = SplitWindowLoader(
+        loader = SplitWindowLoader(
             self.client_combo.currentText(),
             file_ids[:max_files],
             image_size,
             parent=self
         )
-        self.split_loader.pixmap_ready.connect(self._on_split_pixmap_ready)
-        self.split_loader.start()
+        # Identity guard: drop emissions from a superseded loader so leftover
+        # thumbnails from a previous selection don't pile onto the current grid.
+        def _ready(pixmap, tooltip, _l=loader):
+            if self.split_loader is not _l:
+                return
+            self._on_split_pixmap_ready(pixmap, tooltip)
+        loader.pixmap_ready.connect(_ready)
+        self.split_loader = loader
+        loader.start()
 
     def _on_split_pixmap_ready(self, pixmap, tooltip):
         """Add a loaded pixmap to the split window (main thread)."""
@@ -5210,39 +5197,66 @@ class TagMap3DTab(QWidget):
         self.split_window.add_image(pixmap, tooltip=tooltip, file_id=file_id)
 
     def _load_cohort_representatives(self):
-        """Load one representative image per cohort asynchronously (clickable tiles)."""
-        # Group nodes by cluster
-        cluster_nodes = {}
-        for node in self.node_list:
-            if node.cluster_id != -1:
-                cluster_nodes.setdefault(node.cluster_id, []).append(node)
+        """Load one representative image per cohort asynchronously (clickable tiles).
 
-        # Build representative file IDs with cluster info
+        Capped by the media viewer's "Max Files" spin so a scene with thousands of
+        cohorts does not flood the grid / issue thousands of thumbnail requests.
+        Largest cohorts are shown first.
+        """
+        import numpy as np
+        scene = self.scene_graph
+        max_files = self.split_window.max_files_spin.value() if hasattr(self.split_window, 'max_files_spin') else 28
+
+        # Group member indices by cluster (skip noise)
+        cids_arr = scene.cluster_ids
+        cluster_nodes = {}
+        for cid in np.unique(cids_arr):
+            if int(cid) == -1:
+                continue
+            cluster_nodes[int(cid)] = np.where(cids_arr == cid)[0]
+
+        # Largest cohorts first, then cap to max_files representatives.
+        ordered = sorted(cluster_nodes.items(), key=lambda kv: len(kv[1]), reverse=True)[:max_files]
+
+        # Build representative file IDs with cluster info (first member of each cohort)
         rep_file_ids = []
         cluster_map = {}  # file_id -> cluster_id
-        for cluster_id, nodes in cluster_nodes.items():
-            rep_node = nodes[0]
-            rep_file_ids.append(rep_node.file_id)
-            cluster_map[rep_node.file_id] = cluster_id
+        for cluster_id, idx in ordered:
+            if len(idx) == 0:
+                continue
+            rep_fid = scene.file_ids[idx[0]]
+            rep_file_ids.append(rep_fid)
+            cluster_map[rep_fid] = cluster_id
 
         image_size = self.split_window.image_size_spin.value() if hasattr(self.split_window, 'image_size_spin') else 200
-        self.split_loader = SplitWindowLoader(
+        loader = SplitWindowLoader(
             self.client_combo.currentText(),
             rep_file_ids,
             image_size,
             parent=self
         )
-        self.split_loader.pixmap_ready.connect(self._on_cohort_pixmap_ready)
-        self.split_loader.start()
+        # Identity guard (same as _load_file_grid): drop emissions from a
+        # superseded loader so stale tiles don't accumulate.
+        def _ready(pixmap, tooltip, _l=loader):
+            if self.split_loader is not _l:
+                return
+            self._on_cohort_pixmap_ready(pixmap, tooltip)
+        loader.pixmap_ready.connect(_ready)
+        self.split_loader = loader
+        loader.start()
         self._cohort_cluster_map = cluster_map
 
     def _on_cohort_pixmap_ready(self, pixmap, tooltip):
         """Add a cohort representative tile to the split window (main thread)."""
         if self.split_window is None or not self.split_window.isVisible():
             return
-        # Extract file_id from tooltip to look up cluster
-        file_id = tooltip.replace("File ", "")
-        cluster_id = self._cohort_cluster_map.get(file_id)
+        # Extract file_id from tooltip to look up cluster (keys are int hash_ids)
+        raw_fid = tooltip.replace("File ", "")
+        try:
+            fid_key = int(raw_fid)
+        except (ValueError, TypeError):
+            fid_key = raw_fid
+        cluster_id = self._cohort_cluster_map.get(fid_key)
         if cluster_id is not None:
             self.split_window.add_cohort_tile(cluster_id, pixmap, tooltip=tooltip)
 
@@ -5251,11 +5265,11 @@ class TagMap3DTab(QWidget):
         if not hasattr(self, 'node_list') or not self.node_list:
             return
         import numpy as np
-        cluster_nodes = [n for n in self.node_list if n.cluster_id == cluster_id]
-        if not cluster_nodes:
+        scene = self.scene_graph
+        idx = np.where(scene.cluster_ids == int(cluster_id))[0]
+        if len(idx) == 0:
             return
-        positions = np.array([n.position for n in cluster_nodes])
-        centroid = positions.mean(axis=0)
+        centroid = scene.positions[idx].mean(axis=0)
         spread = float(self.spread_spin.value())
         centroid = centroid * spread
         self._set_camera_to_waypoint(centroid, 1.0)
@@ -5313,29 +5327,34 @@ class TagMap3DTab(QWidget):
         if not hasattr(self, 'node_list') or not self.node_list:
             return
         
-        if 0 <= node_index < len(self.node_list):
-            node = self.node_list[node_index]
-            
+        scene = self.scene_graph
+        if 0 <= node_index < len(scene.file_ids):
+            fid = scene.file_ids[node_index]
+            cluster_id = int(scene.cluster_ids[node_index])
+            score = float(scene.scores[node_index])
+            pos = scene.positions[node_index]
+
             # Clear tag state for new selection
             self.tag_query_states.clear()
             self._clear_tag_widgets()
-            
+
             # Update text info (without tags)
             info_lines = [
-                f"File ID: {node.file_id}",
-                f"Cluster: {node.cluster_id}",
-                f"Score: {node.score:.2f}",
-                f"Position: ({node.position[0]:.1f}, {node.position[1]:.1f}, {node.position[2]:.1f})",
+                f"File ID: {fid}",
+                f"Cluster: {cluster_id}",
+                f"Score: {score:.2f}",
+                f"Position: ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})",
             ]
             self.info_text.setText("\n".join(info_lines))
-            
-            # Create clickable tag widgets
-            tags_to_show = node.tags[:50]  # Limit to 50 tags for performance
+
+            # Create clickable tag widgets (tags live in self.tag_data)
+            node_tags = (self.tag_data or {}).get(fid, [])
+            tags_to_show = list(node_tags[:50])  # Limit to 50 tags for performance
             if self.tag_interner:
                 tags_to_show = self.tag_interner.strings_to_list(tags_to_show)
-            if len(node.tags) > 50:
+            if len(node_tags) > 50:
                 # Add a label to indicate more tags exist
-                more_label = QLabel(f"... and {len(node.tags) - 50} more tags")
+                more_label = QLabel(f"... and {len(node_tags) - 50} more tags")
                 more_label.setStyleSheet(f"color: {GRAY_33}; font-size: 10px; font-style: italic;")
                 self.tag_grid.addWidget(more_label, 0, 0)
                 self._tag_widgets.append(more_label)
@@ -5368,9 +5387,10 @@ class TagMap3DTab(QWidget):
             self._highlight_single_node(node_index)  # Create highlight item + dim base
             self.selection_timer.start(500)  # 500ms interval for ~2Hz blink
 
-            # Update the cohort tag data panel with the node's cluster cohort
-            cluster_nodes = [n for n in self.node_list if n.cluster_id == node.cluster_id]
-            self._update_selection_tags(cluster_nodes)
+            # Update the cohort tag data panel with the node's cluster cohort (member indices)
+            import numpy as np
+            cluster_idx = np.where(scene.cluster_ids == cluster_id)[0]
+            self._update_selection_tags(cluster_idx)
 
             # Ensure the selected node's cohort gets a label
             self._update_cohort_labels()
@@ -5390,24 +5410,26 @@ class TagMap3DTab(QWidget):
         if not hasattr(self, 'node_list') or not self.node_list:
             return
         
-        if 0 <= node_index < len(self.node_list):
-            clicked_node = self.node_list[node_index]
-            cluster_id = clicked_node.cluster_id
-            
-            # Find all nodes in the same cluster
-            cluster_nodes = [n for n in self.node_list if n.cluster_id == cluster_id]
-            
-            if not cluster_nodes:
+        scene = self.scene_graph
+        if 0 <= node_index < len(scene.file_ids):
+            cluster_id = int(scene.cluster_ids[node_index])
+
+            # Find all member indices in the same cluster
+            import numpy as np
+            cluster_nodes = np.where(scene.cluster_ids == cluster_id)[0]
+
+            if len(cluster_nodes) == 0:
                 return
-            
+
             # Clear tag state for new selection
             self.tag_query_states.clear()
             self._clear_tag_widgets()
-            
-            # Count tag occurrences across files in cluster
+
+            # Count tag occurrences across files in cluster (tags live in self.tag_data)
+            tag_data = self.tag_data or {}
             tag_counts = {}
-            for n in cluster_nodes:
-                for tag in n.tags:
+            for i in cluster_nodes:
+                for tag in tag_data.get(scene.file_ids[i], []):
                     if self.tag_interner and isinstance(tag, int):
                         tag = self.tag_interner.index_to_string(tag)
                     if tag is None:
@@ -5613,13 +5635,14 @@ class TagMap3DTab(QWidget):
             alpha = self.transparency_spin.value()
             
             # Uniform node size
-            sizes = np.full(len(self.node_list), node_size)
-            
+            scene = self.scene_graph
+            sizes = np.full(len(scene.file_ids), node_size)
+
             # Remove old scatter and create new one with updated sizes
             self.gl_view.removeItem(self.gl_scatter)
-            
-            positions = np.array([node.position for node in self.node_list])
-            colors = np.array([node.color for node in self.node_list]) / 255.0
+
+            positions = scene.positions
+            colors = scene.colors.astype(np.float64) / 255.0
             colors_rgba = np.column_stack([colors, alpha * np.ones(len(colors))])
             
             self.gl_scatter = gl.GLScatterPlotItem(
@@ -5647,10 +5670,11 @@ class TagMap3DTab(QWidget):
             node_size = self.min_size_spin.value() / 10.0
             alpha = self.transparency_spin.value()
             
-            # Recalculate positions with spread
-            positions = np.array([node.position for node in self.node_list]) * spread
-            sizes = np.full(len(self.node_list), node_size)
-            colors = np.array([node.color for node in self.node_list]) / 255.0
+            # Recalculate positions with spread (direct SoA array access)
+            scene = self.scene_graph
+            positions = scene.positions * spread
+            sizes = np.full(len(scene.file_ids), node_size)
+            colors = scene.colors.astype(np.float64) / 255.0
             colors_rgba = np.column_stack([colors, alpha * np.ones(len(colors))])
             
             # Remove old scatter and create new one
@@ -5680,10 +5704,11 @@ class TagMap3DTab(QWidget):
             node_size = self.min_size_spin.value() / 10.0
             alpha = self.transparency_spin.value()
             
-            # Recalculate positions with spread
-            positions = np.array([node.position for node in self.node_list]) * spread
-            sizes = np.full(len(self.node_list), node_size)
-            colors = np.array([node.color for node in self.node_list]) / 255.0
+            # Recalculate positions with spread (direct SoA array access)
+            scene = self.scene_graph
+            positions = scene.positions * spread
+            sizes = np.full(len(scene.file_ids), node_size)
+            colors = scene.colors.astype(np.float64) / 255.0
             colors_rgba = np.column_stack([colors, alpha * np.ones(len(colors))])
             
             # Remove old scatter and create new one
@@ -5851,34 +5876,28 @@ class TagMap3DTab(QWidget):
         if not hasattr(self, 'node_list') or not self.node_list:
             return
 
-        # Count unique clusters for normalization
-        cluster_ids = set()
-        for node in self.node_list:
-            cluster_ids.add(node.cluster_id)
-        total_clusters = len(cluster_ids) if cluster_ids else 1
-
         import numpy as np
         import pyqtgraph.opengl as gl
+
+        scene = self.scene_graph
+        # Count unique clusters for normalization (vectorized)
+        cluster_ids_set = set(np.unique(scene.cluster_ids).tolist())
+        total_clusters = len(cluster_ids_set) if cluster_ids_set else 1
 
         spread = float(self.spread_spin.value())
         node_size = self.min_size_spin.value() / 10.0
         alpha = self.transparency_spin.value()
 
-        # Recalculate positions
-        positions = np.array([node.position for node in self.node_list]) * spread
-        sizes = np.full(len(self.node_list), node_size)
+        # Recalculate positions (direct SoA array access)
+        positions = scene.positions * spread
+        sizes = np.full(len(scene.file_ids), node_size)
 
-        # Generate new colors based on scheme
-        colors = []
-        for node in self.node_list:
-            color = self._get_color_for_cluster(node.cluster_id, total_clusters)
-            colors.append(color)
-        colors = np.array(colors) / 255.0
+        # Generate new colors based on scheme (one per node, by its cluster)
+        colors = np.array([self._get_color_for_cluster(int(cid), total_clusters) for cid in scene.cluster_ids]) / 255.0
         colors_rgba = np.column_stack([colors, alpha * np.ones(len(colors))])
 
-        # Update node colors in the data for future reference
-        for i, node in enumerate(self.node_list):
-            node.color = tuple(int(c * 255) for c in colors[i])
+        # Update node colors in the data for future reference (bulk array write)
+        scene.colors[:] = (colors * 255).astype(np.uint8)
 
         # Remove old scatter and create new one
         if self.gl_scatter:
@@ -6000,11 +6019,14 @@ class TagMap3DTab(QWidget):
             import numpy as np
             from collections import defaultdict
 
-            # Group nodes by cluster and compute centroids
+            scene = self.scene_graph
+            # Group member indices by cluster and compute centroids (skip noise)
+            cids_arr = scene.cluster_ids
             cluster_data = defaultdict(list)
-            for node in self.node_list:
-                if node.cluster_id != -1:  # Skip noise
-                    cluster_data[node.cluster_id].append(node)
+            for cid in np.unique(cids_arr):
+                if int(cid) == -1:  # Skip noise
+                    continue
+                cluster_data[int(cid)] = np.where(cids_arr == cid)[0]
 
             if len(cluster_data) < 2:
                 self.status_label.setText("Need at least 2 clusters for Explore")
@@ -6012,11 +6034,10 @@ class TagMap3DTab(QWidget):
 
             # Calculate centroids and sort by cluster size (largest first)
             centroids = []
-            for cluster_id, nodes in cluster_data.items():
-                positions = np.array([n.position for n in nodes])
-                centroid = np.mean(positions, axis=0)
+            for cluster_id, idx in cluster_data.items():
+                centroid = scene.positions[idx].mean(axis=0)
                 spread = float(self.spread_spin.value())
-                centroids.append((cluster_id, len(nodes), centroid * spread))
+                centroids.append((cluster_id, len(idx), centroid * spread))
 
             # Sort by size descending, take top 10
             centroids.sort(key=lambda x: x[1], reverse=True)
@@ -6159,14 +6180,17 @@ class TagMap3DTab(QWidget):
             from PySide6.QtGui import QVector3D
             import numpy as np
 
-            current_center = self.gl_view.opts.get('center', np.array([0, 0, 0]))
-            # Convert current_center to a numpy array (it may be a QVector3D)
-            if not isinstance(current_center, np.ndarray):
-                current_center = np.array([
-                    float(current_center[0]),
-                    float(current_center[1]),
-                    float(current_center[2]),
-                ])
+            current_center = self.gl_view.opts.get('center', np.array([0.0, 0.0, 0.0]))
+            # Convert current_center to a numpy array. It may be a QVector3D (set by
+            # right-click camera-centering) which is NOT subscriptable — use .x/.y/.z.
+            if isinstance(current_center, np.ndarray):
+                pass
+            elif hasattr(current_center, 'x'):  # QVector3D / QQuaternion-like
+                current_center = np.array([float(current_center.x()),
+                                           float(current_center.y()),
+                                           float(current_center.z())])
+            else:
+                current_center = np.array([float(v) for v in current_center])
 
             # Blend between current center and target
             if blend_t < 1.0:
@@ -6182,16 +6206,9 @@ class TagMap3DTab(QWidget):
     def _ease_in_out(self, t):
         """Smooth ease-in-out function for smooth transitions.
 
-        Args:
-            t: Value between 0.0 and 1.0.
-
-        Returns:
-            Eased t value with smooth acceleration/deceleration.
+        Thin wrapper around :func:`src.ui.tag_map_utils.ease_in_out`.
         """
-        if t <= 0.5:
-            return 2.0 * t * t
-        else:
-            return 1.0 - 2.0 * (1.0 - t) ** 2
+        return ease_in_out(t)
 
     # Tag Importance Ranking (Chi-Square)
 
@@ -6207,12 +6224,10 @@ class TagMap3DTab(QWidget):
             import numpy as np
             from collections import defaultdict, Counter
 
-            # Get cluster labels and tag data
-            cluster_labels = []
-            file_tags = []
-            for node in self.node_list:
-                cluster_labels.append(node.cluster_id)
-                file_tags.append(node.tags)
+            scene = self.scene_graph
+            # Get cluster labels and tag data (direct array access + tag_data dict)
+            cluster_labels = scene.cluster_ids.astype(np.int64).copy()
+            file_tags = [list((self.tag_data or {}).get(fid, [])) for fid in scene.file_ids]
 
             cluster_labels = np.array(cluster_labels)
             num_files = len(cluster_labels)

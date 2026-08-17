@@ -171,6 +171,17 @@ class TagMap3DSettingsDialog(QDialog):
         )
         perf_layout.addRow(self.drop_empty_files_checkbox)
 
+        self.right_click_select_cohort_checkbox = QCheckBox("Right-click also selects cohort")
+        self.right_click_select_cohort_checkbox.setChecked(
+            getattr(self.tab, 'right_click_select_cohort', False)
+        )
+        self.right_click_select_cohort_checkbox.setToolTip(
+            "When enabled, right-clicking the 3D view both re-centers the camera\n"
+            "AND selects the cohort under the cursor (navigate + inspect in one\n"
+            "gesture). When disabled (default), right-click only moves the camera."
+        )
+        perf_layout.addRow(self.right_click_select_cohort_checkbox)
+
         perf_group.setLayout(perf_layout)
         main_layout.addWidget(perf_group)
 
@@ -363,6 +374,7 @@ class TagMap3DSettingsDialog(QDialog):
         tab.tokenize = self.tokenize_checkbox.isChecked()
         tab.drop_universal = self.drop_universal_checkbox.isChecked()
         tab.drop_empty_files = self.drop_empty_files_checkbox.isChecked()
+        tab.right_click_select_cohort = self.right_click_select_cohort_checkbox.isChecked()
 
         # DBSCAN optimizer parameters
         tab.normalize_positions = self.normalize_checkbox.isChecked()
@@ -400,7 +412,7 @@ class TagMap3DSettingsDialog(QDialog):
         # Optional tag-score weighting
         tab.score_db_path = self.score_db_edit.text().strip()
         try:
-            from src.utils.query_comperator import reload_external_tag_scores
+            from src.core.tag_scores import reload_external_tag_scores
             reload_external_tag_scores(tab.score_db_path or None)
         except Exception as e:
             print(f"Error reloading tag scores: {e}")
