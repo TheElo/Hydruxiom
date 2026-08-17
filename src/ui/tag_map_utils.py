@@ -6,7 +6,15 @@ reused and unit-tested without instantiating the (large) widget. They take no
 """
 
 import fnmatch
+import os
 import re
+
+# Settings file path (relative to project root). Shared by the 3D tag map tab
+# and its mixins, so it lives here rather than in any single module.
+SETTINGS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "3d_tag_map_settings.json",
+)
 
 
 def compile_tag_patterns(tag_list):
