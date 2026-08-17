@@ -8,6 +8,7 @@ import numpy as np
 
 from PySide6.QtCore import Qt
 
+from src.ui.styles import BLUE_60
 from src.ui.gl_text_items import get_multiline_text_item_class as _get_multiline_text_item_class
 
 
