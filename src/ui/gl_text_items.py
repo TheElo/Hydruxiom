@@ -133,11 +133,12 @@ def get_multiline_text_item_class():
                 | QPainter.RenderHint.TextAntialiasing
             )
 
-            # Outline pass (drawn first, underneath the fill)
+            # Outline pass (drawn first, underneath the fill). Skipped when no
+            # outline color is set OR the width is 0 (acts as an "off" switch).
             outline_color = getattr(self, 'outline_color', None)
-            if outline_color is not None:
+            ow = getattr(self, 'outline_width', 3.0) * ss
+            if outline_color is not None and ow > 0:
                 from PySide6.QtGui import QPen
-                ow = getattr(self, 'outline_width', 3.0) * ss
                 pen = QPen(outline_color, ow)
                 pen.setJoinStyle(_Qt.PenJoinStyle.RoundJoin)
                 painter.setPen(pen)
