@@ -34,6 +34,10 @@ ENV/
 
 # Agent tooling (local, not tracked)
 agent/
+.kilocodeignore
+
+# Tests (local, not for public repo)
+tests/
 
 # OS
 .DS_Store
