@@ -172,6 +172,20 @@ class UIConstructionMixin:
         self.settings_button.clicked.connect(self.open_settings_dialog)
         layout.addWidget(self.settings_button)
 
+        # Smart Scale master toggle: when on, after data loads the app picks a
+        # profile by file count and overwrites UMAP/DBSCAN/visualization settings.
+        # Profiles are managed in Settings -> Smart Scale tab.
+        self.smart_scale_checkbox = QCheckBox("Smart Scale")
+        self.smart_scale_checkbox.setChecked(getattr(self, 'smart_scale_enabled', False))
+        self.smart_scale_checkbox.setToolTip(
+            "When enabled, after Load & Compute the app selects a settings profile\n"
+            "based on the number of files and overwrites UMAP / DBSCAN / node size /\n"
+            "transparency / spread with that profile's values.\n"
+            "Configure the profiles (size ranges + their settings) in Settings -> Smart Scale."
+        )
+        self.smart_scale_checkbox.stateChanged.connect(self._on_smart_scale_toggled)
+        layout.addWidget(self.smart_scale_checkbox)
+
         # Client Selection Group
         client_group = QGroupBox("Client Settings")
         client_group.setToolTip("Settings for connecting to your Hydrus/ManuelNightmare instance.")
@@ -229,26 +243,26 @@ class UIConstructionMixin:
 
         self.n_neighbors_spin = QSpinBox()
         self.n_neighbors_spin.setRange(5, 50)
-        self.n_neighbors_spin.setValue(15)
+        self.n_neighbors_spin.setValue(12)
         self.n_neighbors_spin.setToolTip("UMAP parameter: Number of neighboring points to consider.\nLower (5-10) = tighter, more clusters.\nHigher (20-50) = smoother, fewer clusters.\nDefault: 15")
         algo_layout.addRow("N Neighbors:", self.n_neighbors_spin)
 
         self.min_dist_spin = QSpinBox()
         self.min_dist_spin.setRange(0, 100)
-        self.min_dist_spin.setValue(10)
+        self.min_dist_spin.setValue(1)
         self.min_dist_spin.setSuffix("%")
         self.min_dist_spin.setToolTip("UMAP parameter: Minimum distance between points (0-100%).\nLower (0-20%) = points packed tightly together.\nHigher (50-100%) = more spread out, easier to see individual points.\nDefault: 10%")
         algo_layout.addRow("Min Dist:", self.min_dist_spin)
 
         self.n_epochs_spin = QSpinBox()
         self.n_epochs_spin.setRange(0, 5000)
-        self.n_epochs_spin.setValue(0)
+        self.n_epochs_spin.setValue(64)
         self.n_epochs_spin.setToolTip("UMAP parameter: Number of training epochs (0 = auto).\nAuto typically gives 500-1000 epochs based on data size.\nHigher = more accurate but slower.\nDefault: 0 (auto)")
         algo_layout.addRow("Epochs:", self.n_epochs_spin)
 
         self.learning_rate_spin = QDoubleSpinBox()
         self.learning_rate_spin.setRange(0.01, 10.0)
-        self.learning_rate_spin.setValue(1.0)
+        self.learning_rate_spin.setValue(2.0)
         self.learning_rate_spin.setDecimals(2)
         self.learning_rate_spin.setSingleStep(0.1)
         self.learning_rate_spin.setToolTip("UMAP parameter: Initial learning rate for optimization.\nHigher = faster convergence but may overshoot.\nLower = slower but more stable.\nDefault: 1.0")
@@ -286,14 +300,14 @@ class UIConstructionMixin:
 
         self.eps_spin = QSpinBox()
         self.eps_spin.setRange(1, 200)
-        self.eps_spin.setValue(50)
+        self.eps_spin.setValue(12)
         self.eps_spin.setSingleStep(1)
         self.eps_spin.setToolTip("DBSCAN parameter: Maximum distance between points in same cluster (as % of data spread).\nLower (10-30%) = many small, tight clusters.\nHigher (100-200%) = few large clusters.\nDefault: 50%")
         cluster_layout.addRow("EPS (%):", self.eps_spin)
 
         self.min_samples_spin = QSpinBox()
         self.min_samples_spin.setRange(2, 100)
-        self.min_samples_spin.setValue(10)
+        self.min_samples_spin.setValue(8)
         self.min_samples_spin.setToolTip("DBSCAN parameter: Minimum points to form a cluster.\nLower (2-5) = more clusters, even small groups count.\nHigher (20-50) = only large dense groups become clusters.\nDefault: 10")
         cluster_layout.addRow("Min Samples:", self.min_samples_spin)
 
@@ -316,14 +330,14 @@ class UIConstructionMixin:
         # a factor but independently.
         self.sub_eps_spin = QSpinBox()
         self.sub_eps_spin.setRange(1, 200)
-        self.sub_eps_spin.setValue(20)
+        self.sub_eps_spin.setValue(12)
         self.sub_eps_spin.setSingleStep(5)
         self.sub_eps_spin.setToolTip("Sub-cluster EPS (%): DBSCAN distance for splitting a selected cohort into sub-cohorts.\nLower = finer/smaller sub-cohorts. Independent from global EPS.")
         cluster_layout.addRow("Sub EPS (%):", self.sub_eps_spin)
 
         self.sub_min_samples_spin = QSpinBox()
         self.sub_min_samples_spin.setRange(2, 100)
-        self.sub_min_samples_spin.setValue(4)
+        self.sub_min_samples_spin.setValue(10)
         self.sub_min_samples_spin.setToolTip("Sub-cluster Min Samples: minimum points for a sub-cohort.\nIndependent from global Min Samples.")
         cluster_layout.addRow("Sub Min Samples:", self.sub_min_samples_spin)
 
@@ -353,9 +367,9 @@ class UIConstructionMixin:
         # backed by the self.drop_empty_files attribute.
 
         self.min_doc_freq_spin = QSpinBox()
-        self.min_doc_freq_spin.setRange(1, 100)
-        self.min_doc_freq_spin.setValue(3)
-        self.min_doc_freq_spin.setToolTip("Vectorizer: Minimum documents a tag must appear in\nto be included in the vocabulary.\nHigher = fewer rare tags, faster UMAP.\nLower = more tags, slower but more detailed.\nDefault: 3")
+        self.min_doc_freq_spin.setRange(0, 100)
+        self.min_doc_freq_spin.setValue(5)
+        self.min_doc_freq_spin.setToolTip("Vectorizer: Minimum documents a tag must appear in\nto be included in the vocabulary.\nHigher = fewer rare tags, faster UMAP.\nLower = more tags, slower but more detailed.\n0 = disabled (keep every tag).\nDefault: 5")
         filter_layout.addRow("Min Doc Freq:", self.min_doc_freq_spin)
 
         # Tag query builder is reparented here from the right sidebar after both
@@ -638,6 +652,12 @@ class UIConstructionMixin:
                             elif key == Qt.Key_PageDown:
                                 pass
                             self.keyTimer.start(16)
+                        # Camera moved -> refresh WASD preview paths (screen-space).
+                        if getattr(self.parent_tab, '_wasd_mode', False):
+                            try:
+                                self.parent_tab._on_camera_moved()
+                            except Exception:
+                                pass
                     else:
                         self.keyTimer.stop()
                 
@@ -653,6 +673,10 @@ class UIConstructionMixin:
                     # Pause wobble while the user interacts so manual orbit works.
                     if hasattr(self.parent_tab, 'wobble_user_interacting'):
                         self.parent_tab.wobble_user_interacting = True
+
+                    # Any manual camera grab interrupts an in-flight smooth glide.
+                    if event.button() != Qt.MouseButton.RightButton:
+                        self.parent_tab._cancel_center_animation()
 
                     # Handle left-click for cohort selection
                     if event.button() == Qt.MouseButton.LeftButton:
@@ -709,6 +733,9 @@ class UIConstructionMixin:
                 def handle_set_camera_center(self, event: QMouseEvent):
                     """Handle right-click to set the camera center to the clicked node (vectorized).
 
+                    If "Smooth center transition" is enabled in settings, the camera
+                    glides to the new center instead of teleporting.
+
                     If "Right-click also selects cohort" is enabled in settings, this
                     ALSO selects the cohort under the cursor so you can navigate +
                     inspect in one gesture.
@@ -721,8 +748,12 @@ class UIConstructionMixin:
                             scatter = self.parent_tab.gl_scatter
                             positions = scatter.pos if isinstance(scatter.pos, np.ndarray) else np.array(scatter.pos)
                             center = positions[closest_idx]
-                            self.opts['center'] = QVector3D(float(center[0]), float(center[1]), float(center[2]))
-                            self.update()
+                            # Smooth glide vs. instant teleport (settings toggle).
+                            if getattr(self.parent_tab, 'smooth_center_transition', False):
+                                self.parent_tab._start_center_animation(center)
+                            else:
+                                self.opts['center'] = QVector3D(float(center[0]), float(center[1]), float(center[2]))
+                                self.update()
                             print(f"Camera center set to ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})")
                             # Optional: also select the cohort under the cursor.
                             if getattr(self.parent_tab, 'right_click_select_cohort', False):
@@ -761,6 +792,18 @@ class UIConstructionMixin:
                         self.parent_tab._pop_selected_cohort()
                         event.accept()
                         return
+                    else:
+                        # WASD/QE: screen-space cohort navigation (no modifiers held).
+                        # Handled here because the GL view holds keyboard focus while
+                        # orbiting with arrow keys; paths refresh as the camera moves.
+                        wasd = {Qt.Key_W: 'W', Qt.Key_S: 'S', Qt.Key_A: 'A', Qt.Key_D: 'D',
+                                Qt.Key_Q: 'Q', Qt.Key_E: 'E'}.get(event.key())
+                        if wasd is not None and not (event.modifiers() & Qt.ControlModifier) \
+                                and not (event.modifiers() & Qt.ShiftModifier):
+                            self.parent_tab._wasd_mode = True
+                            self.parent_tab._wasd_handle_key(wasd)
+                            event.accept()
+                            return
                     super().keyPressEvent(event)
             
             # Create the custom view widget
@@ -790,29 +833,6 @@ class UIConstructionMixin:
             fallback_layout.addWidget(label)
             return fallback
 
-    def create_info_panel(self):
-        """Create the info panel for selected file details."""
-        panel = QGroupBox("Selected File Info")
-        panel.setStyleSheet(f"QGroupBox {{ color: {RED_A}; }}")
-        layout = QVBoxLayout()
-
-        self.info_text = QTextEdit()
-        self.info_text.setReadOnly(True)
-        self.info_text.setMaximumHeight(150)
-        self.info_text.setStyleSheet(f"""
-            QTextEdit {{
-                background-color: {GRAY_40};
-                color: {RED_A};
-                border: 1px solid {BLUE_60};
-                padding: 5px;
-            }}
-        """)
-        self.info_text.setPlaceholderText("Left: cohort | Ctrl+Left: node | Right: move camera")
-        layout.addWidget(self.info_text)
-
-        panel.setLayout(layout)
-        return panel
-
     def create_right_sidebar(self):
         """Create the right sidebar with actions panel."""
         sidebar = QWidget()
@@ -833,21 +853,21 @@ class UIConstructionMixin:
         self.info_layout.setSpacing(5)
         info_layout.addWidget(self.info_container)
 
-        # Text area for non-tag info (file id, cluster, score, position)
+        # Text area for non-tag info (file id, cluster, score, position).
+        # No fixed height and no inner border — the groupbox already frames it,
+        # so an empty selection doesn't leave a big dead box at the top.
         self.info_text = QTextEdit()
-        self.info_text.setMinimumHeight(60)
         self.info_text.setReadOnly(True)
-        self.info_text.setMaximumHeight(80)
         self.info_text.setStyleSheet(f"""
             QTextEdit {{
-                background-color: {GRAY_40};
+                background-color: transparent;
                 color: {RED_A};
-                border: 1px solid {BLUE_60};
-                padding: 5px;
-                font-size: 11px;
+                border: none;
+                padding: 0px;
+                font-size: 12px;
             }}
         """)
-        self.info_text.setPlaceholderText("Left: cohort | Ctrl+Left: node | Right: move camera")
+        self.info_text.setPlaceholderText("Left-click a node or cohort to inspect it.")
         self.info_layout.addWidget(self.info_text)
 
         # Clickable tags container - direct vertical list (no scroll area, more reliable)
@@ -872,20 +892,22 @@ class UIConstructionMixin:
         selection_tags_layout = QVBoxLayout()
         selection_tags_layout.setSpacing(8)
 
+        # Rendered as a styled HTML table (see render_cohort_tags_html); no
+        # inner border — the groupbox frames it and rows carry their own bg.
         self.selection_tags_text = QTextEdit()
         self.selection_tags_text.setReadOnly(True)
-        self.selection_tags_text.setMaximumHeight(200)
+        self.selection_tags_text.setMinimumHeight(80)
+        self.selection_tags_text.setMaximumHeight(260)
         self.selection_tags_text.setStyleSheet(f"""
             QTextEdit {{
-                background-color: {GRAY_40};
+                background-color: {GRAY_33};
                 color: {RED_A};
-                border: 1px solid {BLUE_60};
-                padding: 5px;
-                font-size: 11px;
-                font-family: Consolas, monospace;
+                border: none;
+                padding: 4px;
+                font-size: 12px;
             }}
         """)
-        self.selection_tags_text.setPlaceholderText("Top 20 tags for the selected cohort will appear here...")
+        self.selection_tags_text.setPlaceholderText("Select a cohort to see its most common tags...")
         selection_tags_layout.addWidget(self.selection_tags_text)
 
         selection_tags_group.setLayout(selection_tags_layout)
@@ -1102,6 +1124,17 @@ class UIConstructionMixin:
         self.highlight_color_btn.setToolTip("Color used to highlight the selected cluster or node.\nClick to choose a custom color.")
         vis_layout.addRow("Highlight Color:", self.highlight_color_btn)
 
+        # Reset the persistent WASD travel trail (translucent turquoise line of
+        # every cohort visited via W/S/A/D navigation).
+        self.reset_trail_btn = QPushButton("Reset Travel Trail")
+        self.reset_trail_btn.clicked.connect(self._reset_wasd_trail)
+        self.reset_trail_btn.setToolTip(
+            "Clear the persistent WASD travel trail — the translucent turquoise line\n"
+            "connecting every cohort you've visited with W/S/A/D navigation.\n"
+            "The trail is also cleared automatically when a new scene loads."
+        )
+        vis_layout.addRow(self.reset_trail_btn)
+
         # Star twinkle effect (random nodes blink in their own color)
         self.twinkle_checkbox = QCheckBox("Star Twinkle")
         self.twinkle_checkbox.setChecked(False)
@@ -1135,7 +1168,7 @@ class UIConstructionMixin:
 
         self.twinkle_freq_spin = QDoubleSpinBox()
         self.twinkle_freq_spin.setRange(0.1, 20.0)
-        self.twinkle_freq_spin.setValue(2.0)
+        self.twinkle_freq_spin.setValue(0.5)
         self.twinkle_freq_spin.setDecimals(1)
         self.twinkle_freq_spin.valueChanged.connect(self._on_twinkle_param_changed)
         self.twinkle_freq_spin.setToolTip("Blink frequency (Hz): how fast each node pulses.\nDefault: 2.0")
@@ -1200,7 +1233,7 @@ class UIConstructionMixin:
 
         # Cohort label toggle
         self.show_cohort_labels_checkbox = QCheckBox("Show Cohort Labels")
-        self.show_cohort_labels_checkbox.setChecked(False)
+        self.show_cohort_labels_checkbox.setChecked(True)
         self.show_cohort_labels_checkbox.setToolTip("Display dominant-tag labels centered on each cohort in the 3D view.")
         self.show_cohort_labels_checkbox.stateChanged.connect(self._on_show_cohort_labels_toggled)
         cohort_layout.addWidget(self.show_cohort_labels_checkbox)
@@ -1241,7 +1274,7 @@ class UIConstructionMixin:
         n_row.addWidget(n_label)
         self.cohort_label_n_spin = QSpinBox()
         self.cohort_label_n_spin.setRange(1, 500)
-        self.cohort_label_n_spin.setValue(5)
+        self.cohort_label_n_spin.setValue(7)
         self.cohort_label_n_spin.setToolTip("Number of cohort labels to show (Top N largest), minimum cohort size (Above size threshold), or number of neighboring cohorts (Selected & N neighbors).")
         self.cohort_label_n_spin.valueChanged.connect(self._on_cohort_label_n_changed)
         n_row.addWidget(self.cohort_label_n_spin)
@@ -1255,7 +1288,7 @@ class UIConstructionMixin:
         label_size_row.addWidget(label_size_label)
         self.cohort_label_size_spin = QSpinBox()
         self.cohort_label_size_spin.setRange(4, 40)
-        self.cohort_label_size_spin.setValue(18)
+        self.cohort_label_size_spin.setValue(15)
         self.cohort_label_size_spin.setToolTip("Fixed text size for cohort labels.")
         self.cohort_label_size_spin.valueChanged.connect(self._on_cohort_label_size_changed)
         label_size_row.addWidget(self.cohort_label_size_spin)
@@ -1269,12 +1302,39 @@ class UIConstructionMixin:
         max_tags_row.addWidget(max_tags_label)
         self.cohort_label_max_tags_spin = QSpinBox()
         self.cohort_label_max_tags_spin.setRange(1, 20)
-        self.cohort_label_max_tags_spin.setValue(5)
+        self.cohort_label_max_tags_spin.setValue(2)
         self.cohort_label_max_tags_spin.setToolTip("Maximum number of dominant tags to show per cohort label.")
         self.cohort_label_max_tags_spin.valueChanged.connect(self._on_cohort_label_max_tags_changed)
         max_tags_row.addWidget(self.cohort_label_max_tags_spin)
         max_tags_row.addStretch()
         cohort_layout.addLayout(max_tags_row)
+
+        # Fade label transitions: when switching selection in "Selected & N
+        # neighbors" mode, labels that drop out fade to transparent over the set
+        # duration instead of vanishing instantly (less disorienting).
+        self.label_fade_checkbox = QCheckBox("Fade label transitions")
+        self.label_fade_checkbox.setChecked(True)
+        self.label_fade_checkbox.setToolTip(
+            "When enabled, in 'Selected & N neighbors' mode the labels that drop out\n"
+            "as you switch selection fade to transparent over the duration below instead\n"
+            "of disappearing instantly."
+        )
+        self.label_fade_checkbox.stateChanged.connect(self._on_label_fade_toggled)
+        cohort_layout.addWidget(self.label_fade_checkbox)
+
+        fade_dur_row = QHBoxLayout()
+        fade_dur_label = QLabel("Fade Duration:")
+        fade_dur_label.setStyleSheet(f"color: {RED_A};")
+        fade_dur_row.addWidget(fade_dur_label)
+        self.label_fade_duration_spin = QSpinBox()
+        self.label_fade_duration_spin.setRange(50, 60000)
+        self.label_fade_duration_spin.setValue(2000)
+        self.label_fade_duration_spin.setSingleStep(100)
+        self.label_fade_duration_spin.setSuffix(" ms")
+        self.label_fade_duration_spin.setToolTip("How long the fade-out takes when a label drops out (milliseconds).")
+        fade_dur_row.addWidget(self.label_fade_duration_spin)
+        fade_dur_row.addStretch()
+        cohort_layout.addLayout(fade_dur_row)
 
         # Smart Label Mode (merged toggle + mode into one dropdown)
         smart_mode_row = QHBoxLayout()
@@ -1364,17 +1424,19 @@ class UIConstructionMixin:
         importance_layout = QVBoxLayout()
         importance_layout.setSpacing(8)
 
+        # Rendered as a styled HTML table (see render_importance_html); no inner
+        # border — the groupbox frames it and rows carry their own bg.
         self.tag_importance_text = QTextEdit()
         self.tag_importance_text.setReadOnly(True)
-        self.tag_importance_text.setMaximumHeight(200)
+        self.tag_importance_text.setMinimumHeight(80)
+        self.tag_importance_text.setMaximumHeight(260)
         self.tag_importance_text.setStyleSheet(f"""
             QTextEdit {{
-                background-color: {GRAY_40};
+                background-color: {GRAY_33};
                 color: {RED_A};
-                border: 1px solid {BLUE_60};
-                padding: 5px;
-                font-size: 11px;
-                font-family: Consolas, monospace;
+                border: none;
+                padding: 4px;
+                font-size: 12px;
             }}
         """)
         self.tag_importance_text.setPlaceholderText("Tag importance will appear here after rendering...")

@@ -70,7 +70,22 @@ class ClientServicesMixin:
         """
         from src.ui.settings_dialog import TagMap3DSettingsDialog
         from src.ui.tag_map_utils import SETTINGS_FILE
+
+        # F3 toggles the settings window: if one is already open, closing it counts
+        # as "OK" (apply + save) rather than opening a second dialog. This fires
+        # re-entrantly from within the modal exec() event loop.
+        existing = getattr(self, '_settings_dialog', None)
+        if existing is not None and existing.isVisible():
+            try:
+                existing.apply_settings()  # write values back to tab + save settings
+            except Exception as e:
+                print(f"Error applying settings on close: {e}")
+            existing.accept()              # closes the dialog (exec returns)
+            self._settings_dialog = None
+            return
+
         dialog = TagMap3DSettingsDialog(self)
+        self._settings_dialog = dialog
         # Restore last size/position (best effort; no-op if never saved)
         try:
             if os.path.exists(SETTINGS_FILE):

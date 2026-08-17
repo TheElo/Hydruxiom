@@ -28,6 +28,14 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent):
         """Save settings and close the split/media window on exit."""
+        # Wait for a pending background session auto-save so the latest scene
+        # isn't lost (the tab's own closeEvent may not fire when the main
+        # window closes).
+        try:
+            if hasattr(self.tab, '_wait_pending_auto_save'):
+                self.tab._wait_pending_auto_save()
+        except Exception:
+            pass
         try:
             if hasattr(self.tab, 'save_settings'):
                 self.tab.save_settings()

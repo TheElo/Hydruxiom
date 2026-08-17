@@ -54,6 +54,18 @@ Client config is stored in `clients.json` at the project root (gitignored; a `.b
 3. Press **F5 / Load & Compute** — loads file IDs + tags, runs TF-IDF → UMAP → DBSCAN
 4. Explore: click nodes to select files, right-click clusters, use the media viewer (**F4**) for synced thumbnails
 
+### Explore Mode (Helicopter Orbit)
+
+Press the **Explore** button to fly the camera on an automated tour of your cohorts. The camera accelerates toward each target, banks smoothly into a circular orbit (with momentum — no stops or hard turns), circles it for a configurable number of laps, then flies on to the next cohort.
+
+- **Mode:** Random (shuffled), Linear Path (spatial sweep), or Contrast (farthest-point sampling)
+- **Orbit Speed / Cycles / Elevation / Radius** — all tunable in Settings → Explore
+- A bright red marker shows which cohort is being orbited; an optional path preview draws the planned route
+
+### WASD Cohort Navigation
+
+With a scene loaded, press **W/S/A/D** to jump between neighboring cohorts (screen-relative directions). Preview arrows show where each key will take you. **Q/E** step back/forward through your travel history, leaving a persistent trail.
+
 ### Keyboard shortcuts
 
 | Key | Action |
@@ -71,6 +83,9 @@ Client config is stored in `clients.json` at the project root (gitignored; a `.b
 
 Ctrl+ combos are skipped while a text field has focus.
 
+| W/S/A/D | Navigate to nearest cohort in that screen direction |
+| Q / E | Step back / forward through travel history |
+
 ### Sessions & persistence
 
 - Every successful load/recompute/pop **auto-saves** the scene to `sessions/latest.npz` (positions, tags, clusters, settings, camera)
@@ -81,6 +96,7 @@ Ctrl+ combos are skipped while a text field has focus.
 
 - **Direct DB mode** reads tags straight from Hydrus's SQLite files instead of the API — much faster for large collections (configure per-client dirs in Settings → Clients)
 - **UMAP subsampling** (on by default, 70K subset): fits UMAP on a random subset, then transforms all points — makes multi-million-file collections feasible
+- **Smart Scale:** automatically picks optimal UMAP/DBSCAN/visualization parameters based on file count (Settings → Smart Scale tab)
 
 ---
 

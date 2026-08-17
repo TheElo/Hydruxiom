@@ -51,6 +51,9 @@ sessions/
 *.npz
 screenshots/
 
+# Benchmarks (local perf experiments + generated reports, not for public repo)
+benchmarks/
+
 # Sensitive: contains Hydrus API keys + local paths
 clients.json
 clients.json.bak

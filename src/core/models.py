@@ -123,15 +123,22 @@ class SceneGraph:
         # Uniform node size
         self.sizes = np.full(n, float(node_size), dtype=np.float32)
 
-        # Colors by cluster (vectorized via the label array)
+        # Colors by cluster: one lookup-table gather instead of an O(n x k)
+        # per-cluster mask pass. Rows are indexed by raw label (0..max); noise
+        # (-1) is handled separately below.
+        max_cid = int(self.cluster_ids.max()) if n else 0
+        lut_rows = np.arange(max_cid + 1)
+        colors_lut = np.asarray(
+            [self.CLUSTER_COLORS[c % len(self.CLUSTER_COLORS)] for c in lut_rows],
+            dtype=np.uint8,
+        )
         colors = np.empty((n, 3), dtype=np.uint8)
         noise_mask = self.cluster_ids == -1
-        colors[noise_mask] = self.NOISE_COLOR
-        for cid in np.unique(self.cluster_ids):
-            if cid == -1:
-                continue
-            m = self.cluster_ids == cid
-            colors[m] = self.CLUSTER_COLORS[int(cid) % len(self.CLUSTER_COLORS)]
+        if noise_mask.any():
+            colors[noise_mask] = self.NOISE_COLOR
+        nn = ~noise_mask
+        if nn.any():
+            colors[nn] = colors_lut[self.cluster_ids[nn]]
         self.colors = colors
 
         # Scores from external tag weights (one-time O(total tags))
@@ -151,12 +158,45 @@ class SceneGraph:
         return tag
 
     def _compute_scores(self) -> np.ndarray:
-        """Per-node score = sum of ExternalTagScores over its tags."""
+        """Per-node score = sum of ExternalTagScores over its tags.
+
+        Vectorized for tokenized mode (the default): one gather + bincount
+        instead of a Python loop over every file's tags. String mode keeps the
+        original loop (rare path; scores are usually empty anyway).
+        """
         from src.core.tag_scores import ExternalTagScores
         n = len(self.file_ids)
         scores = np.zeros(n, dtype=np.float32)
         if not ExternalTagScores or self.tag_data is None:
             return scores
+
+        if self.tokenized and self.reverse_vocab is not None:
+            # Per-tag score lookup table indexed by interner index.
+            vocab_len = len(self.reverse_vocab)
+            tag_scores = np.zeros(vocab_len, dtype=np.float64)
+            for i, name in enumerate(self.reverse_vocab):
+                s = ExternalTagScores.get(name)
+                if s:
+                    tag_scores[i] = s
+
+            rows_list = []
+            cols_list = []
+            for i, fid in enumerate(self.file_ids):
+                tags = self.tag_data.get(fid)
+                if tags:
+                    m = len(tags)
+                    rows_list.extend([i] * m)
+                    cols_list.extend(tags)
+            if cols_list:
+                rows = np.asarray(rows_list, dtype=np.int32)
+                cols = np.asarray(cols_list, dtype=np.int32)
+                valid = (cols >= 0) & (cols < vocab_len)
+                if valid.any():
+                    contrib = tag_scores[cols[valid]]
+                    scores += np.bincount(rows[valid], weights=contrib, minlength=n).astype(np.float32)
+            return scores
+
+        # String-mode fallback (original behavior)
         for i, fid in enumerate(self.file_ids):
             tags = self.tag_data.get(fid)
             if not tags:
@@ -164,25 +204,38 @@ class SceneGraph:
             total = 0.0
             for tag in tags:
                 s = ExternalTagScores.get(tag)
-                if s is None and self.tokenized and self.reverse_vocab is not None \
-                        and 0 <= tag < len(self.reverse_vocab):
-                    s = ExternalTagScores.get(self.reverse_vocab[tag])
                 if s:
                     total += s
             scores[i] = total
         return scores
 
     def _build_clusters(self, top_n):
-        """Build Cluster objects (node_indices + centroid + dominant tags)."""
-        self.clusters = {}
-        for cid in np.unique(self.cluster_ids):
-            idx = np.where(self.cluster_ids == cid)[0]  # member array indices
-            if len(idx) == 0:
-                continue
+        """Build Cluster objects (node_indices + centroid + dominant tags).
 
+        Vectorized: one argsort pass yields every cluster's member indices and
+        centroids; dominant tags come from a single sparse tag-count matrix.
+        Replaces the old O(n x k) per-cluster mask scans and per-member Python
+        loops, which dominated scene-build time at scale.
+        """
+        self.clusters = {}
+        n = len(self.file_ids)
+        if n == 0:
+            return
+
+        labels = self.cluster_ids
+        order = np.argsort(labels, kind="stable")
+        sorted_labels = labels[order]
+        # Boundaries where the label changes (plus the end).
+        change = np.flatnonzero(sorted_labels[1:] != sorted_labels[:-1]) + 1
+        starts = np.concatenate(([0], change))
+        ends = np.concatenate((change, [n]))
+
+        for s, e in zip(starts, ends):
+            cid = int(sorted_labels[s])
+            idx = order[s:e]  # member array indices (stable within cluster)
             centroid = self.positions[idx].mean(axis=0)
 
-            if int(cid) == -1:
+            if cid == -1:
                 cluster = Cluster(
                     cluster_id=-1,
                     centroid=centroid,
@@ -191,40 +244,51 @@ class SceneGraph:
                     label="Noise",
                 )
             else:
-                # Dominant tags from the UI's tag_data over this cluster's members
-                dominant_tags = self._dominant_tags(idx, top_n)
-
-                # Density (points per unit volume)
+                # Density (points per unit volume) — same formula as before.
                 distances = np.linalg.norm(self.positions[idx] - centroid, axis=1)
                 avg_distance = float(distances.mean()) if len(distances) else 0.0
                 density = len(idx) / (avg_distance ** 3 + 1e-6) if avg_distance > 0 else float(len(idx))
 
                 cluster = Cluster(
-                    cluster_id=int(cid),
+                    cluster_id=cid,
                     centroid=centroid,
                     node_indices=idx,
-                    dominant_tags=dominant_tags,
-                    color=self.CLUSTER_COLORS[int(cid) % len(self.CLUSTER_COLORS)],
-                    label=f"Cluster {int(cid)}",
+                    dominant_tags=[],  # filled below from the shared tag matrix
+                    color=self.CLUSTER_COLORS[cid % len(self.CLUSTER_COLORS)],
+                    label=f"Cluster {cid}",
                     density=density,
                 )
             self.clusters[cluster.cluster_id] = cluster
 
-    def _dominant_tags(self, member_indices: np.ndarray, top_n: int) -> List[str]:
-        """Top-N most common tags among a cluster's members (resolved to strings)."""
+        # Dominant tags for all non-noise clusters in one sparse pass.
+        if any(c.cluster_id != -1 for c in self.clusters.values()):
+            self._fill_dominant_tags(top_n)
+
+    def _fill_dominant_tags(self, top_n: int):
+        """Populate dominant_tags on every non-noise cluster.
+
+        Per-cluster Counter over the members (original algorithm — benched in
+        agent/tools/_bench_dominant_tags.py and found faster than both a
+        single-pass variant and a scipy sparse-matrix variant at realistic
+        scales, so it is kept as-is).
+        """
         if self.tag_data is None:
-            return []
-        counts = Counter()
-        for i in member_indices:
-            tags = self.tag_data.get(self.file_ids[i])
-            if tags:
-                counts.update(tags)
-        result = []
-        for tag, _count in counts.most_common(top_n):
-            s = self._resolve_tag(tag)
-            if s is not None:
-                result.append(s)
-        return result
+            return
+
+        for cid, cluster in self.clusters.items():
+            if cid == -1:
+                continue
+            counts = Counter()
+            for i in cluster.node_indices:
+                tags = self.tag_data.get(self.file_ids[i])
+                if tags:
+                    counts.update(tags)
+            result = []
+            for tag, _count in counts.most_common(top_n):
+                s = self._resolve_tag(tag)
+                if s is not None:
+                    result.append(s)
+            cluster.dominant_tags = result
 
     # ------------------------------------------------------------- accessors
 

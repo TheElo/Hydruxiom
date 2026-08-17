@@ -561,6 +561,12 @@ class CohortOpsMixin:
         all_positions = self.scene_graph.positions * spread
         all_tag_data = {fid: list((self.tag_data or {}).get(fid, [])) for fid in all_file_ids}
 
+        # Normalize ONCE and use the same space for both the parameter search and
+        # the final apply run. Previously the search ran on raw positions while the
+        # apply run normalized — so an eps found optimal in raw space was not
+        # necessarily optimal in normalized space (the "normalization gap").
+        cluster_positions = self._maybe_normalize_positions(all_positions)
+
         self.worker.progress.emit(30, "Searching DBSCAN parameters...")
 
         def progress_callback(attempt, total, message):
@@ -569,7 +575,7 @@ class CohortOpsMixin:
 
         clust = Clusterer(eps=eps_min, min_samples=min_samples_min)
         best = clust.optimize(
-            all_positions,
+            cluster_positions,
             max_cohort_size=max_cohort_size,
             max_noise_ratio=max_noise_ratio,
             eps_min=eps_min,
@@ -588,11 +594,11 @@ class CohortOpsMixin:
         self.eps_spin.setValue(int(round(best_eps * 100.0)))
         self.min_samples_spin.setValue(best_min_samples)
 
-        # Re-run DBSCAN with the best settings on current positions
+        # Re-run DBSCAN with the best settings in the SAME space used for the
+        # search (cluster_positions), so the applied eps is consistent.
         self.worker.progress.emit(90, "Applying best DBSCAN settings...")
         _t_clust = time.perf_counter()
         clust = Clusterer(eps=best_eps, min_samples=best_min_samples)
-        cluster_positions = self._maybe_normalize_positions(all_positions)
         cluster_labels = clust.fit_predict(cluster_positions)
         print(f"[Timing] DBSCAN optimize re-cluster took {time.perf_counter() - _t_clust:.2f}s")
 

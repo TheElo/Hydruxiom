@@ -28,6 +28,10 @@ class CohortLabelsMixin:
             else:
                 self.cohort_label_blink_timer.stop()
 
+    def _on_label_fade_toggled(self, state):
+        """Toggle whether dropping labels fade out on selection switch."""
+        self.label_fade_enabled = bool(state)
+
     def _toggle_cohort_label_blink(self):
         """Blink the selected cohort's label between the two label colors."""
         self.cohort_label_blink_visible = not self.cohort_label_blink_visible
@@ -396,6 +400,90 @@ class CohortLabelsMixin:
 
         return labels
 
+    def _capture_dropping_labels(self, target_cid=None):
+        """Start fading out labels that are about to drop due to a selection switch.
+
+        Must be called BEFORE the old labels are removed (i.e. before
+        clear_selection / _remove_cohort_labels). Only active when:
+          - "Fade label transitions" is enabled, and
+          - label mode is "Selected & N neighbors", and
+          - there's a current selection with existing labels.
+
+        It computes which cohorts will remain after the switch (selected + its N
+        nearest) and fades out every currently-shown label that won't be in that
+        set. Kept labels are rebuilt fresh by _update_cohort_labels as usual.
+
+        Args:
+            target_cid: the cohort being selected next. When provided, it's used
+                to compute the keep-set (the selection state may not have been
+                updated yet at call time). If None, resolved from current state.
+        """
+        if not getattr(self, 'label_fade_enabled', True):
+            return
+        try:
+            import numpy as np
+            mode = self.cohort_label_mode_combo.currentText()
+            if mode != "Selected & N neighbors":
+                return
+            old_map = getattr(self, 'cohort_label_map', {}) or {}
+            if not old_map:
+                return
+            scene = getattr(self, 'scene_graph', None)
+            if scene is None or not hasattr(self, 'node_list') or not self.node_list:
+                return
+
+            # Resolve the (new) selected cohort. Prefer the explicit target so this
+            # works when called before the selection state has been updated.
+            selected_cid = target_cid
+            if selected_cid is None:
+                selected_cid = self.selected_cluster_id
+                if selected_cid is None and self.selected_node_index is not None:
+                    if 0 <= self.selected_node_index < len(scene.file_ids):
+                        selected_cid = int(scene.cluster_ids[self.selected_node_index])
+            if selected_cid is None or selected_cid == -1:
+                return
+
+            # Build the set of cohorts that will remain after the switch.
+            cids_arr = scene.cluster_ids
+            n = self.cohort_label_n_spin.value()
+            cluster_nodes = {}
+            for cid in np.unique(cids_arr):
+                if int(cid) == -1:
+                    continue
+                cluster_nodes[int(cid)] = np.where(cids_arr == cid)[0]
+
+            keep = set()
+            if selected_cid in cluster_nodes:
+                sel_centroid = scene.positions[cluster_nodes[selected_cid]].mean(axis=0)
+                others = {cid: idx for cid, idx in cluster_nodes.items() if cid != selected_cid}
+
+                def _centroid(idx):
+                    return scene.positions[idx].mean(axis=0)
+
+                ranked = sorted(
+                    others.items(),
+                    key=lambda kv: float(np.linalg.norm(_centroid(kv[1]) - sel_centroid))
+                )
+                keep.add(selected_cid)
+                for cid, _nodes in ranked[:n]:
+                    keep.add(cid)
+
+            # Fade out every currently-shown label that won't remain.
+            fading = []
+            for cid, item in old_map.items():
+                if cid in keep:
+                    continue
+                try:
+                    c = item.color
+                    base_rgba = (int(c.red()), int(c.green()), int(c.blue()), max(1, int(c.alpha())))
+                    fading.append([item, base_rgba])
+                except Exception:
+                    pass
+            if fading:
+                self._start_label_fade(fading)
+        except Exception as e:
+            print(f"Error capturing dropping labels: {e}")
+
     def _update_cohort_labels(self):
         """Render dominant-tag labels centered on each cohort in the 3D view."""
         try:
@@ -405,13 +493,17 @@ class CohortLabelsMixin:
             if not hasattr(self, 'gl_view') or self.gl_view is None:
                 return
 
-            # Remove existing labels
-            self._remove_cohort_labels()
-            self.cohort_label_map = {}
+            # NOTE: dropping-label capture for selection switches happens in
+            # show_cluster_info() (before clear_selection removes the old labels),
+            # NOT here — calling it here would double-capture and restart fades at
+            # a reduced alpha. This method only rebuilds the kept labels; items
+            # already mid-fade are preserved by _remove_cohort_labels(keep_ids).
 
             if not self.show_cohort_labels_checkbox.isChecked():
+                self._remove_cohort_labels()
                 return
             if not hasattr(self, 'node_list') or not self.node_list:
+                self._remove_cohort_labels()
                 return
 
             # Group member indices by cluster (vectorized; skip noise)
@@ -424,6 +516,7 @@ class CohortLabelsMixin:
                 cluster_nodes[int(cid)] = np.where(cids_arr == cid)[0]
 
             if not cluster_nodes:
+                self._remove_cohort_labels()
                 return
 
             # Determine label color
@@ -485,6 +578,13 @@ class CohortLabelsMixin:
                 sel_idx = np.where(scene.cluster_ids == selected_cid)[0]
                 if len(sel_idx) > 0:
                     cluster_nodes[selected_cid] = sel_idx
+
+            # Remove existing (non-fading) labels; kept ones are rebuilt fresh below.
+            # Labels that are dropping due to a selection switch were already captured
+            # and started fading by _capture_dropping_labels() before the clear, so
+            # they're excluded here via keep_ids and removed by their fade timer.
+            fade_ids = {id(e[0]) for e in getattr(self, '_label_fade_items', [])}
+            self._remove_cohort_labels(keep_ids=fade_ids)
 
             # Smart labels: resolve duplicate labels across cohorts
             smart_label_mode = self.smart_label_mode_combo.currentText()
@@ -573,12 +673,24 @@ class CohortLabelsMixin:
             print(f"Error updating cohort labels: {e}")
             traceback.print_exc()
 
-    def _remove_cohort_labels(self):
-        """Remove all cohort label items from the 3D view."""
+    def _remove_cohort_labels(self, keep_ids=None):
+        """Remove cohort label items from the 3D view.
+
+        Items that are mid-fade-out (tracked in ``_label_fade_items``) are always
+        left in place so their fade timer can finish and remove them — this is what
+        makes selection-switch fades actually visible instead of vanishing instantly.
+
+        Args:
+            keep_ids: optional extra set of item ids to leave in place.
+        """
         if not hasattr(self, 'cohort_label_items'):
             self.cohort_label_items = []
             return
+        fading_ids = {id(e[0]) for e in getattr(self, '_label_fade_items', [])}
+        keep_ids = (keep_ids or set()) | fading_ids
         for item in self.cohort_label_items:
+            if id(item) in keep_ids:
+                continue
             try:
                 self.gl_view.removeItem(item)
             except Exception:

@@ -33,6 +33,12 @@ class DataPipelineMixin:
         # Fresh full load produces new positions -> re-fit camera on next render
         self._camera_initialized = False
 
+        # Smart Scale: apply the size-appropriate profile to the setting widgets
+        # BEFORE spawning the worker, so UMAP/DBSCAN/visual params read below
+        # reflect it. Uses max_files as the size estimate (exact count is applied
+        # again in on_loading_finished once known). No-op when disabled.
+        self._smart_scale_apply_for_load(self.max_files_spin.value())
+
         # Create worker
         def worker_func():
             return self._load_and_compute()
