@@ -1426,12 +1426,12 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
 
             # Create clickable tag widgets (tags live in self.tag_data)
             node_tags = (self.tag_data or {}).get(fid, [])
-            tags_to_show = list(node_tags[:50])  # Limit to 50 tags for performance
+            tags_to_show = list(node_tags[:42])  # Limit to 42 tags for performance
             if self.tag_interner:
                 tags_to_show = self.tag_interner.strings_to_list(tags_to_show)
-            if len(node_tags) > 50:
+            if len(node_tags) > 42:
                 # Add a label to indicate more tags exist
-                more_label = QLabel(f"... and {len(node_tags) - 50} more tags")
+                more_label = QLabel(f"... and {len(node_tags) - 42} more tags")
                 more_label.setStyleSheet(f"color: {GRAY_33}; font-size: 10px; font-style: italic;")
                 self.tag_grid.addWidget(more_label, 0, 0)
                 self._tag_widgets.append(more_label)
@@ -1525,9 +1525,9 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             self.info_text.setText("\n".join(info_lines))
             
             # Create clickable tag widgets for top tags
-            tags_to_show = sorted_tags[:50]  # Limit to 50 tags
-            if len(sorted_tags) > 50:
-                more_label = QLabel(f"... and {len(sorted_tags) - 50} more tags")
+            tags_to_show = sorted_tags[:42]  # Limit to 42 tags
+            if len(sorted_tags) > 42:
+                more_label = QLabel(f"... and {len(sorted_tags) - 42} more tags")
                 more_label.setStyleSheet(f"color: {GRAY_33}; font-size: 10px; font-style: italic;")
                 self.tag_grid.addWidget(more_label, 0, 0)
                 self._tag_widgets.append(more_label)

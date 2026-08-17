@@ -1394,7 +1394,7 @@ class UIConstructionMixin:
                 background-color: rgb(50, 70, 170);
             }}
         """)
-        self.right_tabs.addTab(actions_tab, "Actions")
+        self.right_tabs.addTab(actions_tab, "Stats")
         self.right_tabs.addTab(visuals_tab, "Visuals")
 
         # Insert the tab widget at the top of the right sidebar (before the stretch).
