@@ -53,7 +53,7 @@ def get_multiline_text_item_class():
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.outline_color = None
-            self.outline_width = 2.0
+            self.outline_width = 3.0
             self._ss_factor = 1.0
 
         def _build_cache(self):
@@ -137,7 +137,7 @@ def get_multiline_text_item_class():
             outline_color = getattr(self, 'outline_color', None)
             if outline_color is not None:
                 from PySide6.QtGui import QPen
-                ow = getattr(self, 'outline_width', 2.0) * ss
+                ow = getattr(self, 'outline_width', 3.0) * ss
                 pen = QPen(outline_color, ow)
                 pen.setJoinStyle(_Qt.PenJoinStyle.RoundJoin)
                 painter.setPen(pen)
