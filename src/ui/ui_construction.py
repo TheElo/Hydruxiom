@@ -431,7 +431,7 @@ class UIConstructionMixin:
         self.wobble_user_interacting = False  # True while user drags (pauses wobble)
 
         # Load Button and Progress
-        self.load_button = QPushButton("Load & Compute")
+        self.load_button = QPushButton("Load and Compute")
         self.load_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: {BLUE_60};

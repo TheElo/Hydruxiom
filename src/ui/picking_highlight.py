@@ -3,8 +3,8 @@
 Mixin: methods operate on the ``TagMap3DTab`` instance (``self``). Covers 3D
 point picking, node/cluster highlighting, and scatter plot updates. Moved here
 from ``tag_map_3d_tab.py`` to reduce its size without changing behavior.
-All numpy/pyqtgraph imports are local to each method (as in the original).
 """
+import numpy as np
 
 
 class PickingHighlightMixin:

@@ -319,7 +319,7 @@ class TagMap3DSettingsDialog(QDialog):
         _shortcut_rows = [
             ("F3", "Open settings window"),
             ("F4", "Toggle media viewer"),
-            ("F5", "Load & Compute"),
+            ("F5", "Load and Compute"),
             ("F6", "Recompute (UMAP only)"),
             ("F7", "Regroup (DBSCAN only)"),
             ("F12", "4x snapshot screenshot (saved to screenshots/)"),

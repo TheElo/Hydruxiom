@@ -4,9 +4,12 @@ Mixin: methods operate on the ``TagMap3DTab`` instance (``self``). Covers data
 loading, UMAP/DBSCAN computation, and recomputation workers. Moved here from
 ``tag_map_3d_tab.py`` to reduce its size without changing behavior.
 """
+import time
+
 import numpy as np
 
 from src.ui.workers import WorkerThread
+from src.ui.tag_map_utils import compile_tag_patterns
 
 
 class DataPipelineMixin:

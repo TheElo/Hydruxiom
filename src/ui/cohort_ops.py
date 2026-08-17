@@ -2,9 +2,12 @@
 
 Mixin: methods operate on the ``TagMap3DTab`` instance (``self``). Covers cut,
 pop, recluster, and DBSCAN-optimize worker operations. Moved here from
-``tag_map_3d_tab.py`` to reduce its size without changing behavior. numpy is
-imported locally within each method (as in the original).
+``tag_map_3d_tab.py`` to reduce its size without changing behavior.
 """
+import time
+
+import numpy as np
+
 from src.ui.workers import WorkerThread
 
 
