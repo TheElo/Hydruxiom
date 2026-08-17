@@ -32,6 +32,9 @@ ENV/
 *.swp
 *.swo
 
+# Agent tooling (local, not tracked)
+agent/
+
 # OS
 .DS_Store
 Thumbs.db
