@@ -101,6 +101,8 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
 
         # Default before load_settings (which may set it from the saved state)
         self._restore_media_viewer_open = False
+        self.auto_deorphan = "Never"  # "Never", "After Load and Compute", "After Regroup"
+        self._pending_deorphan = False  # True while a deorphan worker is in flight
         self.load_settings()
         self._load_client_db_path()
         self._connect_settings_signals()
@@ -698,6 +700,22 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             print(f"[Session] Loaded {n_loaded} nodes from {filename}")
             self.render_scene(scene)
 
+            # A session load is a valid "data ready" state — enable the same set
+            # of action buttons that on_loading_finished() enables. Without this,
+            # auto-loading a session on startup left every button greyed out.
+            self.load_button.setEnabled(True)
+            self.recompute_button.setEnabled(True)
+            self.recluster_button.setEnabled(True)
+            self.optimize_button.setEnabled(True)
+            self.deorphan_button.setEnabled(True)
+            self.save_session_button.setEnabled(True)
+            self.load_session_button.setEnabled(True)
+            if hasattr(self, 'send_to_tab_btn'):
+                self.send_to_tab_btn.setEnabled(True)
+            if hasattr(self, 'time_travel_button'):
+                self.time_travel_button.setEnabled(True)
+            self._set_cohort_action_buttons(True)
+
         except Exception as e:
             import traceback
             self.status_label.setText(f"Error loading session: {e}")
@@ -777,6 +795,7 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             self.recompute_button.setEnabled(True)
             self.recluster_button.setEnabled(True)
             self.optimize_button.setEnabled(True)
+            self.deorphan_button.setEnabled(True)
             self.save_session_button.setEnabled(True)
             self.load_session_button.setEnabled(True)
             self._set_cohort_action_buttons(True)
@@ -789,6 +808,7 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         self.recompute_button.setEnabled(True)
         self.recluster_button.setEnabled(True)
         self.optimize_button.setEnabled(True)
+        self.deorphan_button.setEnabled(True)
         self.save_session_button.setEnabled(True)
         self.load_session_button.setEnabled(True)
         self.send_to_tab_btn.setEnabled(True)
@@ -798,7 +818,8 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
 
         # Re-cluster results keep positions unchanged -> update colors in-place
         # (much lighter than full render_scene, avoids UI lock on 55k nodes).
-        if getattr(self, '_pending_recluster', False):
+        was_recluster = getattr(self, '_pending_recluster', False)
+        if was_recluster:
             self._pending_recluster = False
             self.node_list = scene.get_file_ids()
             self._build_base_scatter()
@@ -810,12 +831,28 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         # Auto-save session so "Auto load session" can restore it on next launch.
         self._auto_save_session()
 
+        # Auto-Deorphan: optionally assign noise (-1) nodes to their nearest
+        # cohort after the chosen operation. Skip when this completion IS a
+        # deorphan (its flags are set by start_deorphan) to avoid an infinite loop.
+        was_deorphan = getattr(self, '_pending_deorphan', False)
+        if was_deorphan:
+            self._pending_deorphan = False
+        else:
+            mode = getattr(self, 'auto_deorphan', "Never")
+            should_deorphan = (
+                (mode == "After Load and Compute" and not was_recluster) or
+                (mode == "After Regroup" and was_recluster)
+            )
+            if should_deorphan:
+                self.start_deorphan()
+
     def on_loading_error(self, error_msg):
         """Handle loading error."""
         self.load_button.setEnabled(True)
         self.recompute_button.setEnabled(True)
         self.recluster_button.setEnabled(True)
         self.optimize_button.setEnabled(True)
+        self.deorphan_button.setEnabled(True)
         self.save_session_button.setEnabled(True)
         self.load_session_button.setEnabled(True)
         self._set_cohort_action_buttons(True)

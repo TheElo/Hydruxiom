@@ -74,6 +74,10 @@ class SettingsPersistenceMixin:
             self.normalize_positions = settings.get("normalize_positions", True)
             # Sync the inline checkbox so the UI reflects the saved value
             self.normalize_checkbox.setChecked(self.normalize_positions)
+            # Auto-Deorphan behavior (validated against known values below)
+            _ad = settings.get("auto_deorphan", "Never")
+            if _ad in ("Never", "After Load and Compute", "After Regroup"):
+                self.auto_deorphan = _ad
             # Optional tag-score DB path
             self.score_db_path = settings.get("score_db_path", "")
             # UI scale (percent); applied at startup, restart required to change
@@ -316,6 +320,7 @@ class SettingsPersistenceMixin:
                 "opt_min_samples_min": getattr(self, 'opt_min_samples_min', 2),
                 "opt_min_samples_max": getattr(self, 'opt_min_samples_max', 30),
                 "normalize_positions": getattr(self, 'normalize_positions', True),
+                "auto_deorphan": getattr(self, 'auto_deorphan', "Never"),
                 "score_db_path": getattr(self, 'score_db_path', ''),
                 # UI scale (percent); applied at startup via QT_SCALE_FACTOR
                 "ui_scale": getattr(self, 'ui_scale', 100),

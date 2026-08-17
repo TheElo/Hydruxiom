@@ -525,6 +525,32 @@ class UIConstructionMixin:
 
         layout.addLayout(regroup_row)
 
+        # Deorphan: assign each noise (-1) node to its nearest non-noise cohort.
+        self.deorphan_button = QPushButton("Deorphan")
+        self.deorphan_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: rgb(60, 80, 160);
+                color: {RED_A};
+                padding: 8px;
+                font-size: 12px;
+                border-radius: 5px;
+            }}
+            QPushButton:hover {{
+                background-color: rgb(80, 100, 200);
+            }}
+            QPushButton:disabled {{
+                background-color: {GRAY_40};
+            }}
+        """)
+        self.deorphan_button.setEnabled(False)
+        self.deorphan_button.clicked.connect(self.start_deorphan)
+        self.deorphan_button.setToolTip(
+            "Assign every orphan (noise, cluster -1) node to the cohort of its\n"
+            "nearest non-orphan node. No re-clustering — just re-labels orphans.\n"
+            "Use after Regroup when you want fewer unassigned nodes."
+        )
+        layout.addWidget(self.deorphan_button)
+
         # Clear button - drop the current session data and free resources
         self.clear_button = QPushButton("Clear")
         self.clear_button.setStyleSheet(f"""
@@ -641,7 +667,23 @@ class UIConstructionMixin:
                     
                     # Call parent implementation for normal 3D navigation
                     super().mousePressEvent(event)
-                
+
+                def mouseDoubleClickEvent(self, event: QMouseEvent):
+                    """Double-click on empty space clears the current selection.
+
+                    Double-clicking a node/cluster keeps its selection (only an
+                    empty-space double-click unselects), so this is a safe way to
+                    dismiss a cohort without touching Clear.
+                    """
+                    if event.button() == Qt.MouseButton.LeftButton:
+                        try:
+                            closest_idx = self.parent_tab.pick_nearest_point(self, event.pos())
+                            if closest_idx is None:
+                                self.parent_tab.clear_selection()
+                        except Exception as e:
+                            print(f"Error in double-click handling: {e}")
+                    super().mouseDoubleClickEvent(event)
+
                 def handle_right_click(self, event: QMouseEvent):
                     """Handle right-click by picking the node under cursor (vectorized)."""
                     try:

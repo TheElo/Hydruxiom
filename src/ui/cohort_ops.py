@@ -422,6 +422,91 @@ class CohortOpsMixin:
         std[std == 0] = 1.0
         return centered / std
 
+    def start_deorphan(self):
+        """Assign each noise (-1) node to the cohort of its nearest non-noise node."""
+        if self.tag_data is None or not hasattr(self, 'node_list') or not self.node_list:
+            self.status_label.setText("Error: No data loaded. Load data first.")
+            return
+
+        self.load_button.setEnabled(False)
+        self.recompute_button.setEnabled(False)
+        self.recluster_button.setEnabled(False)
+        self.optimize_button.setEnabled(False)
+        self.deorphan_button.setEnabled(False)
+        self.save_session_button.setEnabled(False)
+        self.load_session_button.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Deorphaning: assigning orphans to nearest cohort...")
+        # Deorphan only re-labels orphans (positions unchanged), so the lighter
+        # in-place color refresh path is used on completion (like _recluster).
+        self._pending_recluster = True
+        self._pending_deorphan = True
+
+        def worker_func():
+            return self._deorphan()
+
+        self.worker = WorkerThread(worker_func)
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.on_loading_finished)
+        self.worker.error.connect(self.on_loading_error)
+        self.worker.start()
+
+    def _deorphan(self):
+        """Re-label noise nodes to the cluster of their nearest non-noise neighbor.
+
+        Uses scipy.spatial.cKDTree for O(n log n) nearest-neighbor queries.
+        Positions are unchanged; only cluster labels are updated.
+        Returns (scene, tag_data) in the same format as _recluster_all.
+        """
+        import numpy as np
+        from scipy.spatial import cKDTree
+        from src.core.models import SceneGraph
+
+        scene = self.scene_graph
+        positions = np.asarray(scene.positions, dtype=float)
+        cluster_ids = np.asarray(scene.cluster_ids, dtype=int)
+        file_ids = list(scene.file_ids)
+        node_size = float(self.min_size_spin.value()) / 10.0
+
+        noise_mask = cluster_ids == -1
+        n_orphans = int(noise_mask.sum())
+        if n_orphans == 0:
+            self.worker.progress.emit(100, "No orphans to assign.")
+            return scene, {fid: list((self.tag_data or {}).get(fid, [])) for fid in file_ids}
+
+        # Build KD-tree on non-noise positions only.
+        anchored_positions = positions[~noise_mask]
+        anchored_labels = cluster_ids[~noise_mask]
+        tree = cKDTree(anchored_positions)
+
+        # Query nearest anchor for each orphan.
+        orphan_positions = positions[noise_mask]
+        _, nearest_idx = tree.query(orphan_positions, k=1)
+        new_labels_for_orphans = anchored_labels[nearest_idx]
+
+        # Apply: replace -1 with the assigned cluster id.
+        updated_labels = cluster_ids.copy()
+        updated_labels[noise_mask] = new_labels_for_orphans
+
+        self.worker.progress.emit(70, f"Assigned {n_orphans} orphans to nearest cohorts.")
+
+        # Rebuild scene graph with updated labels (positions unchanged).
+        all_tag_data = {fid: list((self.tag_data or {}).get(fid, [])) for fid in file_ids}
+        reverse_vocab = self.tag_interner.index_to_tag if self.tag_interner else None
+        new_scene = SceneGraph()
+        new_scene.build_from_data(
+            file_ids,
+            positions,
+            all_tag_data,
+            updated_labels,
+            node_size=node_size,
+            tokenized=bool(self.tag_interner),
+            reverse_vocab=reverse_vocab,
+        )
+
+        self.worker.progress.emit(100, f"Deorphaned {n_orphans} nodes.")
+        return new_scene, all_tag_data
+
     def start_optimize(self):
         """Start the DBSCAN optimizer to find ideal eps/min_samples."""
         if self.tag_data is None or not hasattr(self, 'node_list') or not self.node_list:

@@ -278,6 +278,27 @@ class TagMap3DSettingsDialog(QDialog):
         self.opt_min_samples_max_spin.setToolTip("Upper bound of the Min Samples search range.")
         opt_layout.addRow("Min Samples Max:", self.opt_min_samples_max_spin)
 
+        # Auto-Deorphan: when to automatically assign noise (-1) nodes to their
+        # nearest cohort after a clustering operation.
+        self.auto_deorphan_combo = QComboBox()
+        for label in ("Never", "After Load and Compute", "After Regroup"):
+            self.auto_deorphan_combo.addItem(label)
+        _ad_idx = self.auto_deorphan_combo.findText(
+            getattr(self.tab, 'auto_deorphan', "Never")
+        )
+        if _ad_idx >= 0:
+            self.auto_deorphan_combo.setCurrentIndex(_ad_idx)
+        else:
+            self.auto_deorphan_combo.setCurrentIndex(0)
+        self.auto_deorphan_combo.setToolTip(
+            "Automatically run Deorphan (assign every noise/-1 node to the cohort\n"
+            "of its nearest non-noise node) after the chosen operation.\n"
+            "- Never: only when you click the Deorphan button manually.\n"
+            "- After Load and Compute: deorphan once a fresh load finishes.\n"
+            "- After Regroup: deorphan every time DBSCAN re-clustering runs."
+        )
+        opt_layout.addRow("Auto-Deorphan:", self.auto_deorphan_combo)
+
         opt_group.setLayout(opt_layout)
         main_layout.addWidget(opt_group)
 
@@ -388,6 +409,9 @@ class TagMap3DSettingsDialog(QDialog):
         tab.opt_eps_max = self.opt_eps_max_spin.value()
         tab.opt_min_samples_min = self.opt_min_samples_min_spin.value()
         tab.opt_min_samples_max = self.opt_min_samples_max_spin.value()
+
+        # Auto-Deorphan behavior
+        tab.auto_deorphan = self.auto_deorphan_combo.currentText()
 
         # Persist the full clients working copy (Clients section is authoritative).
         self._sync_selected_client_to_dict()
