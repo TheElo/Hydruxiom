@@ -140,6 +140,11 @@ class SettingsPersistenceMixin:
             color2 = settings.get("cohort_label_color2", [255, 200, 0])
             self._cohort_label_color2 = tuple(color2)
             self._update_label_color_button2()
+            # Outline color + width
+            outline_color = settings.get("cohort_label_outline_color", [0, 0, 0])
+            self._cohort_label_outline_color = tuple(outline_color)
+            self._update_outline_color_button()
+            self.cohort_label_outline_width_spin.setValue(settings.get("cohort_label_outline_width", 2))
             # Label mode + N
             mode_idx = self.cohort_label_mode_combo.findText(settings.get("cohort_label_mode", "Selected & N neighbors"))
             if mode_idx >= 0:
@@ -228,6 +233,7 @@ class SettingsPersistenceMixin:
             'dim_alpha_spin': 'valueChanged',
             'cohort_threshold_spin': 'valueChanged',
             'cohort_label_size_spin': 'valueChanged',
+            'cohort_label_outline_width_spin': 'valueChanged',
             'cohort_label_n_spin': 'valueChanged',
             'cohort_label_max_tags_spin': 'valueChanged',
             'wobble_speed_spin': 'valueChanged',
@@ -348,6 +354,8 @@ class SettingsPersistenceMixin:
                 "dynamic_label_size": self.dynamic_label_size_checkbox.isChecked(),
                 "cohort_label_color": list(self._cohort_label_color),
                 "cohort_label_color2": list(self._cohort_label_color2),
+                "cohort_label_outline_color": list(getattr(self, '_cohort_label_outline_color', (0, 0, 0))),
+                "cohort_label_outline_width": getattr(self, 'cohort_label_outline_width_spin', None).value() if hasattr(self, 'cohort_label_outline_width_spin') else 2,
                 "cohort_label_mode": self.cohort_label_mode_combo.currentText(),
                 "cohort_label_n": self.cohort_label_n_spin.value(),
                 "cohort_label_max_tags": self.cohort_label_max_tags_spin.value(),

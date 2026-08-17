@@ -1855,6 +1855,17 @@ class TagMap3DTab(CohortLabelsMixin, VisualEffectsMixin, UIConstructionMixin, Se
                 except Exception:
                     pass
 
+            # Scale text items (cohort labels) for supersample rendering.
+            # Their paint() method reads _ss_factor to scale font + culling bounds.
+            saved_text_factors = []
+            for item in getattr(self, 'cohort_label_items', []) or []:
+                try:
+                    orig_factor = getattr(item, '_ss_factor', 1.0)
+                    item._ss_factor = float(ss)
+                    saved_text_factors.append((item, orig_factor))
+                except Exception:
+                    pass
+
             try:
                 # Render at 4x via renderToArray (returns BGRA uint8)
                 arr = view.renderToArray(size=(w * ss, h * ss))
@@ -1862,6 +1873,11 @@ class TagMap3DTab(CohortLabelsMixin, VisualEffectsMixin, UIConstructionMixin, Se
                 for s, orig in saved_sizes:
                     try:
                         s.setData(size=orig)
+                    except Exception:
+                        pass
+                for item, orig_factor in saved_text_factors:
+                    try:
+                        item._ss_factor = orig_factor
                     except Exception:
                         pass
             arr = np.ascontiguousarray(arr)

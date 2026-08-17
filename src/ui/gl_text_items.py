@@ -40,7 +40,21 @@ def get_multiline_text_item_class():
         and issue drawText calls at the cached offsets. This matters a lot
         when the view repaints continuously (e.g. camera wobble), because it
         removes QFontMetrics + horizontalAdvance from the hot path.
+
+        Attributes:
+            outline_color: QColor or None. If set, text is drawn with an
+                outline in this color before the fill pass.
+            outline_width: float. Pen width for the outline (in pixels).
+            _ss_factor: float. Supersample scale factor. When > 1, font size
+                and culling bounds are scaled up so labels render correctly
+                in an offscreen buffer larger than the widget.
         """
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.outline_color = None
+            self.outline_width = 2.0
+            self._ss_factor = 1.0
 
         def _build_cache(self):
             """Precompute line layout metrics (called only when text/font change)."""
@@ -76,6 +90,8 @@ def get_multiline_text_item_class():
             if len(self.text) < 1:
                 return
 
+            ss = getattr(self, '_ss_factor', 1.0)
+
             # Rebuild the metrics cache only when text/font/alignment changed
             cache = getattr(self, "_label_cache", None)
             key = (self.text, self.font.pointSizeF(), int(self.alignment))
@@ -93,22 +109,50 @@ def get_multiline_text_item_class():
             # Off-screen culling: skip labels whose anchor is outside the
             # viewport (with a margin for text extent). Saves drawText calls
             # for cohorts that are behind/beside the camera.
+            # Scale bounds by ss_factor when rendering into a larger FBO.
             view = self.view()
-            vw = view.width()
-            vh = view.height()
-            margin = 200.0
+            vw = view.width() * ss
+            vh = view.height() * ss
+            margin = 200.0 * ss
             if (anchor.x() < -margin or anchor.x() > vw + margin or
                     anchor.y() < -margin or anchor.y() > vh + margin):
                 return
 
+            from PySide6.QtGui import QFont as _QFont
             painter = QPainter(view)
-            painter.setPen(self.color)
-            painter.setFont(self.font)
+            # Scale font for supersample rendering so text appears at normal
+            # size after downsampling.
+            if ss != 1.0:
+                scaled_font = _QFont(self.font)
+                scaled_font.setPointSizeF(self.font.pointSizeF() * ss)
+                painter.setFont(scaled_font)
+            else:
+                painter.setFont(self.font)
             painter.setRenderHints(
                 QPainter.RenderHint.Antialiasing
                 | QPainter.RenderHint.TextAntialiasing
             )
 
+            # Outline pass (drawn first, underneath the fill)
+            outline_color = getattr(self, 'outline_color', None)
+            if outline_color is not None:
+                from PySide6.QtGui import QPen
+                ow = getattr(self, 'outline_width', 2.0) * ss
+                pen = QPen(outline_color, ow)
+                pen.setJoinStyle(_Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(pen)
+                for line, dx, dy in layout:
+                    pos = QPointF(anchor.x() - dx, anchor.y() + dy)
+                    # Draw outline by rendering text 4 times offset slightly
+                    # (cheap stroke approximation without QPainterPath)
+                    off = ow * 0.5
+                    painter.drawText(pos + QPointF(-off, 0), line)
+                    painter.drawText(pos + QPointF(off, 0), line)
+                    painter.drawText(pos + QPointF(0, -off), line)
+                    painter.drawText(pos + QPointF(0, off), line)
+
+            # Fill pass
+            painter.setPen(self.color)
             for line, dx, dy in layout:
                 painter.drawText(QPointF(anchor.x() - dx, anchor.y() + dy), line)
             painter.end()

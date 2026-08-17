@@ -1287,6 +1287,28 @@ class UIConstructionMixin:
         self._cohort_label_color2 = (255, 200, 0)  # default amber
         self._update_label_color_button2()
         label_color_row.addWidget(self.cohort_label_color2_btn)
+
+        # Outline color + width row
+        outline_row = QHBoxLayout()
+        outline_label = QLabel("Outline:")
+        outline_label.setStyleSheet(f"color: {RED_A};")
+        outline_row.addWidget(outline_label)
+        self.cohort_label_outline_color_btn = QPushButton("")
+        self.cohort_label_outline_color_btn.setFixedSize(40, 24)
+        self.cohort_label_outline_color_btn.setToolTip("Outline color for cohort labels. Click to change.")
+        self.cohort_label_outline_color_btn.clicked.connect(self._pick_cohort_label_outline_color)
+        self._cohort_label_outline_color = (0, 0, 0)  # default black
+        self._update_outline_color_button()
+        outline_row.addWidget(self.cohort_label_outline_color_btn)
+        self.cohort_label_outline_width_spin = QSpinBox()
+        self.cohort_label_outline_width_spin.setRange(1, 8)
+        self.cohort_label_outline_width_spin.setValue(2)
+        self.cohort_label_outline_width_spin.setToolTip("Outline thickness in pixels.")
+        self.cohort_label_outline_width_spin.valueChanged.connect(self._on_cohort_label_outline_width_changed)
+        outline_row.addWidget(self.cohort_label_outline_width_spin)
+        outline_row.addStretch()
+        cohort_layout.addLayout(outline_row)
+
         label_color_row.addStretch()
         cohort_layout.addLayout(label_color_row)
 

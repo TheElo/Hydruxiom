@@ -126,6 +126,35 @@ class CohortLabelsMixin:
             }}
         """)
 
+    def _pick_cohort_label_outline_color(self):
+        """Open color picker for the cohort label outline."""
+        from PySide6.QtWidgets import QColorDialog
+        from PySide6.QtGui import QColor
+        color = QColorDialog.getColor(
+            QColor(*self._cohort_label_outline_color),
+            self,
+            "Select Label Outline Color",
+        )
+        if color.isValid():
+            self._cohort_label_outline_color = (color.red(), color.green(), color.blue())
+            self._update_outline_color_button()
+            self._update_cohort_labels()
+
+    def _update_outline_color_button(self):
+        """Update the outline color button background."""
+        r, g, b = self._cohort_label_outline_color
+        self.cohort_label_outline_color_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: rgb({r}, {g}, {b});
+                border: 1px solid {BLUE_60};
+                border-radius: 3px;
+            }}
+        """)
+
+    def _on_cohort_label_outline_width_changed(self, value):
+        """Update label outline width and re-render labels."""
+        self._update_cohort_labels()
+
     def _get_selected_label_rgba(self):
         """Return the RGBA tuple for the selected cohort's label based on blink state.
 
@@ -528,6 +557,10 @@ class CohortLabelsMixin:
                         font=font,
                         alignment=Qt.AlignHCenter,
                     )
+                    # Apply outline settings
+                    from PySide6.QtGui import QColor as _QColor
+                    label_item.outline_color = _QColor(*self._cohort_label_outline_color)
+                    label_item.outline_width = float(self.cohort_label_outline_width_spin.value())
                     self.gl_view.addItem(label_item)
                     label_item.setVisible(True)
                     self.cohort_label_items.append(label_item)
