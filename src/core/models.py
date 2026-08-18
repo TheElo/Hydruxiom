@@ -49,7 +49,9 @@ class Cluster:
 class SceneGraph:
     """Manages all nodes and clusters in the 3D scene as flat arrays."""
 
-    # Distinct pastel colors for clusters (soft but visible)
+    # Distinct pastel colors for clusters (soft but visible). This is the BASE
+    # palette and defines the target color count (19) that every discrete scheme
+    # matches so up to 19 cohorts stay distinguishable without repeating.
     CLUSTER_COLORS = [
         (255, 107, 107),  # Soft Red
         (78, 205, 196),   # Soft Teal
@@ -66,6 +68,56 @@ class SceneGraph:
         (255, 178, 107),  # Soft Peach
         (107, 255, 205),  # Soft Aqua
         (255, 129, 178),  # Soft Rose
+        (130, 195, 255),  # Soft Sky Blue
+        (165, 175, 240),  # Soft Periwinkle
+        (185, 220, 175),  # Soft Sage
+        (235, 210, 175),  # Soft Sand
+    ]
+
+    # Nature / camouflage tones: greens, olives, browns and tans.
+    NATURE_COLORS = [
+        (107, 142, 35),   # Olive Drab
+        (34, 139, 34),    # Forest Green
+        (195, 176, 145),  # Khaki
+        (88, 104, 60),    # Moss Green
+        (210, 180, 140),  # Tan
+        (85, 107, 47),    # Dark Olive
+        (139, 168, 120),  # Sage
+        (139, 90, 43),    # Brown
+        (144, 238, 144),  # Light Green
+        (70, 90, 50),     # Army Green
+        (245, 245, 220),  # Beige
+        (60, 90, 60),     # Pine
+        (245, 222, 179),  # Wheat
+        (0, 100, 0),      # Dark Green
+        (180, 160, 120),  # Camo Tan
+        (150, 160, 60),   # Lime Olive
+        (101, 67, 33),    # Forest Brown
+        (190, 220, 180),  # Pale Green
+        (50, 60, 45),     # Charcoal Green
+    ]
+
+    # Sci-Fi / cool clean tones: blues, cyans, teals, purples and silvers.
+    SCIFI_COLORS = [
+        (30, 144, 255),   # Electric Blue
+        (0, 255, 255),    # Cyan
+        (0, 128, 128),    # Teal
+        (176, 224, 230),  # Ice Blue
+        (70, 130, 180),   # Steel Blue
+        (190, 100, 255),  # Neon Purple
+        (192, 192, 200),  # Silver
+        (0, 60, 140),     # Deep Blue
+        (128, 255, 255),  # Aqua
+        (130, 147, 220),  # Periwinkle
+        (0, 70, 190),     # Cobalt
+        (160, 255, 240),  # Mint Cyan
+        (180, 190, 255),  # Lavender Blue
+        (64, 224, 208),   # Turquoise
+        (40, 80, 160),    # Navy Glow
+        (200, 240, 255),  # Pale Cyan
+        (65, 105, 225),   # Royal Blue
+        (220, 235, 255),  # Frost
+        (0, 200, 190),    # Electric Teal
     ]
 
     NOISE_COLOR = (169, 169, 169)  # Dark Gray for noise points

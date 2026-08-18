@@ -22,7 +22,9 @@ from src.ui.styles import (
     GRAY_40, GRAY_33, RED_A, BLUE_60,
     TAB_BACKGROUND, TAB_TEXT, TAB_SELECTED, TAB_BORDER,
 )
-from src.ui.media_viewer import TagMap3DSplitWindow, SplitWindowLoader, SingleFileLoader
+from src.ui.media_viewer import (
+    TagMap3DSplitWindow, SplitWindowLoader, SingleFileLoader, decode_image_bytes,
+)
 from src.ui.workers import WorkerThread
 from src.ui.panels.tag_query import (
     ClickableTag, split_query_preserving_brackets,
@@ -138,9 +140,54 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         # change has occurred for session_save_delay seconds. closeEvent forces
         # an immediate save so nothing is lost on exit. 0 = save immediately.
         self.session_save_delay = 60  # seconds (managed in settings dialog)
+
+        # Chunk Size default before load_settings. Plain int attribute — its
+        # spinbox lives in the Settings window -> Clients tab, not on this tree.
+        self.chunk_size = 8192
+
+        # Node sizing mode default before load_settings. "Distance" is the legacy
+        # behavior (pxMode=False, perspective scaling with camera distance). The
+        # other modes are experimental (see _node_px_mode / _base_node_size_scene).
+        self.node_sizing_mode = "Distance"
+        self._auto_ref_dist = 200.0  # reference camera distance for Auto-scale mode
+        # Lightweight timer that refreshes node sizes while in Auto-scale mode so
+        # they track the current camera distance (far -> larger, near -> smaller).
+        self._auto_node_timer = QTimer(self)
+        self._auto_node_timer.setInterval(50)  # ~20 fps is plenty for size tracking
+        self._auto_node_timer.timeout.connect(self._update_auto_node_sizes)
         self._session_save_timer = QTimer(self)
         self._session_save_timer.setSingleShot(True)
         self._session_save_timer.timeout.connect(self._auto_save_session)
+
+        # WASD cohort navigation state + preview appearance defaults. MUST be set
+        # BEFORE load_settings() so saved values are not clobbered by these defaults,
+        # and the widget-sync block in load_settings can read them safely.
+        self.wasd_paths_enabled = True   # master toggle (managed in settings dialog)
+        # WASD preview appearance (defaults match the legacy hardcoded green/size).
+        self.wasd_line_color = (80, 255, 140)    # RGB of the W/S/A/D path lines
+        self.wasd_letter_color = (80, 255, 140)  # RGB of the W/S/A/D letter labels
+        self.wasd_label_size = 36                # font point size for the letters
+        self.wasd_persistent_labels = False      # keep arrows visible after nav ends
+        self._wasd_mode = False          # navigation active (paths visible); refresh on camera move
+        self._wasd_selecting = False     # transient: True only during WASD-initiated selection
+        self._wasd_targets = {}   # 'W'/'S'/'A'/'D' -> cluster_id
+        self._wasd_items = []     # GL items currently drawn for the preview
+        # Fade-out of WASD paths when navigation ends (labels fade over ~2 s; lines
+        # are dropped immediately since GLLinePlotItem has no color-update API).
+        self._wasd_fade_labels = []  # list of [GLTextItem, base_rgba] fading out
+        self._wasd_fade_timer = QTimer(self)
+        self._wasd_fade_timer.setInterval(16)  # ~60 fps
+        self._wasd_fade_timer.timeout.connect(self._update_wasd_path_fade)
+
+        # WASD travel history: an ordered list of (cluster_id, centroid) visited via
+        # W/S/A/D navigation. _wasd_history_index points at the current position in
+        # that list. Q steps back through it, E steps forward again (only available
+        # after going back). The persistent translucent-turquoise trail is drawn from
+        # history[0..index]. Kept until reset (Visualization Settings -> "Reset Travel
+        # Trail") or a scene rebuild. Independent of the live W/S/A/D preview arrows.
+        self._wasd_history = []        # list of (cluster_id, np.array(3) centroid)
+        self._wasd_history_index = -1  # current position in _wasd_history (-1 = none)
+        self._wasd_trail_items = []    # GL items currently drawn for the trail
 
         # Explore "helicopter orbit" mode defaults. MUST be set BEFORE load_settings()
         # so that saved values from the JSON file are not clobbered by these defaults.
@@ -188,32 +235,6 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         self._label_fade_timer = QTimer(self)
         self._label_fade_timer.setInterval(16)  # ~60 fps
         self._label_fade_timer.timeout.connect(self._update_label_fade)
-
-        # WASD cohort navigation: first WASD press shows preview paths (W/S/A/D)
-        # to the nearest cohort in each screen direction; subsequent presses move
-        # the selection + camera there. Paths are 2D overlays that refresh as the
-        # camera moves (arrow keys) or the selection changes.
-        self.wasd_paths_enabled = True   # master toggle (managed in settings dialog)
-        self._wasd_mode = False          # navigation active (paths visible); refresh on camera move
-        self._wasd_selecting = False     # transient: True only during WASD-initiated selection
-        self._wasd_targets = {}   # 'W'/'S'/'A'/'D' -> cluster_id
-        self._wasd_items = []     # GL items currently drawn for the preview
-        # Fade-out of WASD paths when navigation ends (labels fade over ~2 s; lines
-        # are dropped immediately since GLLinePlotItem has no color-update API).
-        self._wasd_fade_labels = []  # list of [GLTextItem, base_rgba] fading out
-        self._wasd_fade_timer = QTimer(self)
-        self._wasd_fade_timer.setInterval(16)  # ~60 fps
-        self._wasd_fade_timer.timeout.connect(self._update_wasd_path_fade)
-
-        # WASD travel history: an ordered list of (cluster_id, centroid) visited via
-        # W/S/A/D navigation. _wasd_history_index points at the current position in
-        # that list. Q steps back through it, E steps forward again (only available
-        # after going back). The persistent translucent-turquoise trail is drawn from
-        # history[0..index]. Kept until reset (Visualization Settings -> "Reset Travel
-        # Trail") or a scene rebuild. Independent of the live W/S/A/D preview arrows.
-        self._wasd_history = []        # list of (cluster_id, np.array(3) centroid)
-        self._wasd_history_index = -1  # current position in _wasd_history (-1 = none)
-        self._wasd_trail_items = []    # GL items currently drawn for the trail
 
         # Explore path preview: runtime state for the planned route overlay.
         self._explore_path_items = []  # GL items currently drawn for the path preview
@@ -1275,7 +1296,12 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             colors_list = [self._get_color_for_cluster(int(cid), total_clusters) for cid in cluster_ids_arr]
             colors = np.array(colors_list)
 
-            sizes = scene.get_node_sizes()
+            # Mode-aware node sizing (Distance uses the pipeline's per-node sizes;
+            # other modes override with a uniform value — see _current_node_sizes).
+            if getattr(self, 'node_sizing_mode', "Distance") == "Distance":
+                sizes = scene.get_node_sizes()
+            else:
+                sizes = self._current_node_sizes(len(positions))
 
             if len(positions) == 0:
                 return
@@ -1290,7 +1316,8 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                 pos=positions,
                 size=sizes,
                 color=colors_rgba,
-                pxMode=False
+                pxMode=self._node_px_mode(),
+                glOptions=self._node_gl_options()
             )
             try:
                 self.gl_scatter.sigClicked.connect(self.on_node_clicked)
@@ -1589,6 +1616,17 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         if not hasattr(self, 'node_list') or not self.node_list:
             return
 
+        # Cancel any in-flight loads from the PREVIOUS selection before starting
+        # new ones. Without this, rapid cohort switching leaves old loaders
+        # fetching every remaining thumbnail from Hydrus (results are discarded
+        # by the identity guards, but the network + CPU work is wasted).
+        prev_grid = getattr(self, 'split_loader', None)
+        if prev_grid is not None:
+            prev_grid.cancel()
+        prev_single = getattr(self, 'single_loader', None)
+        if prev_single is not None and prev_single.isRunning():
+            prev_single.cancel()
+
         self.split_window.clear_grid()
 
         # Determine selection state
@@ -1607,6 +1645,9 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             self.split_window.set_title("All Cohorts")
             self._load_cohort_representatives()
 
+    # Cap for full-res single-file pixmaps (longest side), bounds memory.
+    SINGLE_FILE_MAX_PIXELS = 4096
+
     def _load_single_file(self, file_id):
         """Load a single full-res file into the split window asynchronously."""
         self._pending_single_file_id = file_id
@@ -1617,8 +1658,25 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             file_id,
             parent=self
         )
-        self.single_loader.pixmap_ready.connect(self._on_single_pixmap_ready)
+        self.single_loader.bytes_ready.connect(
+            lambda b, t, _l=self.single_loader: self._on_single_bytes_ready(b, t, _l)
+        )
         self.single_loader.start()
+
+    def _on_single_bytes_ready(self, image_bytes, tooltip, _l=None):
+        """Decode the fetched bytes on the main thread, then display.
+
+        QPixmap must not be created from a worker thread (undefined behavior;
+        on Windows it can spawn transient offscreen windows). Decoding here is
+        fast because PIL already downscaled to SINGLE_FILE_MAX_PIXELS.
+        """
+        # Identity guard: ignore results from a superseded loader so a stale
+        # full-res image can never be shown for the current selection.
+        if _l is not None and getattr(self, 'single_loader', None) is not _l:
+            return
+        pixmap = decode_image_bytes(image_bytes, max_size=self.SINGLE_FILE_MAX_PIXELS)
+        if pixmap is not None:
+            self._on_single_pixmap_ready(pixmap, tooltip)
 
     def _on_single_pixmap_ready(self, pixmap, tooltip):
         """Display a loaded full-res single file (main thread).
@@ -1657,17 +1715,23 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             file_id,
             parent=self
         )
-        self.single_loader.pixmap_ready.connect(self._on_single_pixmap_ready)
+        self.single_loader.bytes_ready.connect(
+            lambda b, t, _l=self.single_loader: self._on_single_bytes_ready(b, t, _l)
+        )
         self.single_loader.start()
 
     def _return_to_grid(self, file_id):
         """Go back from a zoomed full-res image to the thumbnail grid."""
         if self.split_window is None or not self.split_window.isVisible():
             return
-        # Rebuild whatever grid was showing before the zoom (cohort files or
-        # cohort representatives) based on the current selection state.
+        # The grid widgets are still in place (zooming only hid the scroll area),
+        # so just re-show them — instant, no image re-fetch. Fall back to a full
+        # rebuild only if the grid was somehow emptied while zoomed.
         self._zoom_pending_file_id = None
-        self._sync_split_window()
+        if self.split_window.grid_layout.count() > 0:
+            self.split_window.restore_grid()
+        else:
+            self._sync_split_window()
 
     def _load_file_grid(self, file_ids):
         """Load a grid of thumbnails for the given file IDs asynchronously."""
@@ -1676,16 +1740,17 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         loader = SplitWindowLoader(
             self.client_combo.currentText(),
             file_ids[:max_files],
-            image_size,
             parent=self
         )
         # Identity guard: drop emissions from a superseded loader so leftover
         # thumbnails from a previous selection don't pile onto the current grid.
-        def _ready(pixmap, tooltip, _l=loader):
+        def _ready(image_bytes, tooltip, _l=loader):
             if self.split_loader is not _l:
                 return
-            self._on_split_pixmap_ready(pixmap, tooltip)
-        loader.pixmap_ready.connect(_ready)
+            pixmap = decode_image_bytes(image_bytes, max_size=image_size)
+            if pixmap is not None:
+                self._on_split_pixmap_ready(pixmap, tooltip)
+        loader.bytes_ready.connect(_ready)
         self.split_loader = loader
         loader.start()
 
@@ -1733,16 +1798,17 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         loader = SplitWindowLoader(
             self.client_combo.currentText(),
             rep_file_ids,
-            image_size,
             parent=self
         )
         # Identity guard (same as _load_file_grid): drop emissions from a
         # superseded loader so stale tiles don't accumulate.
-        def _ready(pixmap, tooltip, _l=loader):
+        def _ready(image_bytes, tooltip, _l=loader):
             if self.split_loader is not _l:
                 return
-            self._on_cohort_pixmap_ready(pixmap, tooltip)
-        loader.pixmap_ready.connect(_ready)
+            pixmap = decode_image_bytes(image_bytes, max_size=image_size)
+            if pixmap is not None:
+                self._on_cohort_pixmap_ready(pixmap, tooltip)
+        loader.bytes_ready.connect(_ready)
         self.split_loader = loader
         loader.start()
         self._cohort_cluster_map = cluster_map
@@ -1847,18 +1913,17 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                 ("Position", f"({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"),
             ]))
 
-            # Create clickable tag widgets (tags live in self.tag_data)
+            # Create clickable tag widgets (tags live in self.tag_data).
+            # Grid capacity is user-configurable (Settings -> General -> Tag Query):
+            # max tags shown = columns * rows.
+            tq_cols, tq_max = self._tag_query_grid_size()
             node_tags = (self.tag_data or {}).get(fid, [])
-            tags_to_show = list(node_tags[:42])  # Limit to 42 tags for performance
+            tags_to_show = list(node_tags[:tq_max])  # Limit for performance
             if self.tag_interner:
                 tags_to_show = self.tag_interner.strings_to_list(tags_to_show)
-            if len(node_tags) > 42:
-                # Add a label to indicate more tags exist
-                more_label = QLabel(f"... and {len(node_tags) - 42} more tags")
-                more_label.setStyleSheet("color: rgb(140, 146, 156); font-size: 10px; font-style: italic;")
-                self.tag_grid.addWidget(more_label, 0, 0)
-                self._tag_widgets.append(more_label)
-            
+            # (The "... and N more tags" label is added AFTER the tag widgets so
+            # it sits below them instead of overlapping the first tag at 0,0.)
+
             included_query, excluded_query, or_query = self._get_query_tag_states()
             for idx, tag in enumerate(tags_to_show):
                 tag_widget = ClickableTag(tag)
@@ -1875,8 +1940,14 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                 tag_widget._update_appearance()
                 self.tag_query_states[tag] = tag_widget.state
                 self._tag_widgets.append(tag_widget)
-                self.tag_grid.addWidget(tag_widget, idx // 3, idx % 3)  # 3 columns
-            
+                self.tag_grid.addWidget(tag_widget, idx // tq_cols, idx % tq_cols)
+
+            if len(node_tags) > tq_max:
+                more_label = QLabel(f"... and {len(node_tags) - tq_max} more tags")
+                more_label.setStyleSheet("color: rgb(140, 146, 156); font-size: 10px; font-style: italic;")
+                self.tag_grid.addWidget(more_label, len(tags_to_show) // tq_cols, (len(tags_to_show)) % tq_cols)
+                self._tag_widgets.append(more_label)
+
             # Force layout refresh so the tags render immediately
             self.tag_container.update()
             self.tag_grid.update()
@@ -1894,6 +1965,12 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
 
             # Ensure the selected node's cohort gets a label
             self._update_cohort_labels()
+
+            # "Keep WASD labels visible": after a non-WASD selection change the arrows
+            # were NOT faded (see _wasd_end_fade), so redraw them from the new centroid.
+            if getattr(self, 'wasd_persistent_labels', False) and \
+                    not getattr(self, '_wasd_selecting', False):
+                self._wasd_redraw_if_active()
 
             # Sync split window if open
             self._sync_split_window()
@@ -1961,14 +2038,12 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                 ("Unique tags", f"{len(tag_counts):,}"),
             ]))
 
-            # Create clickable tag widgets for top tags
-            tags_to_show = sorted_tags[:42]  # Limit to 42 tags
-            if len(sorted_tags) > 42:
-                more_label = QLabel(f"... and {len(sorted_tags) - 42} more tags")
-                more_label.setStyleSheet("color: rgb(140, 146, 156); font-size: 10px; font-style: italic;")
-                self.tag_grid.addWidget(more_label, 0, 0)
-                self._tag_widgets.append(more_label)
-            
+            # Create clickable tag widgets for top tags (capacity from settings).
+            tq_cols, tq_max = self._tag_query_grid_size()
+            tags_to_show = sorted_tags[:tq_max]
+            # (The "... and N more tags" label is added AFTER the tag widgets so
+            # it sits below them instead of overlapping the first tag at 0,0.)
+
             included_query, excluded_query, or_query = self._get_query_tag_states()
             for idx, (tag, count) in enumerate(tags_to_show):
                 tag_widget = ClickableTag(tag)
@@ -1986,8 +2061,14 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                 tag_widget._update_appearance()
                 self.tag_query_states[tag] = tag_widget.state
                 self._tag_widgets.append(tag_widget)
-                self.tag_grid.addWidget(tag_widget, idx // 3, idx % 3)  # 3 columns
-            
+                self.tag_grid.addWidget(tag_widget, idx // tq_cols, idx % tq_cols)
+
+            if len(sorted_tags) > tq_max:
+                more_label = QLabel(f"... and {len(sorted_tags) - tq_max} more tags")
+                more_label.setStyleSheet("color: rgb(140, 146, 156); font-size: 10px; font-style: italic;")
+                self.tag_grid.addWidget(more_label, len(tags_to_show) // tq_cols, (len(tags_to_show)) % tq_cols)
+                self._tag_widgets.append(more_label)
+
             # Force layout refresh so the tags render immediately
             self.tag_container.update()
             self.tag_grid.update()
@@ -2014,6 +2095,30 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
 
             # Sync split window if open
             self._sync_split_window()
+
+    def _tag_query_grid_size(self):
+        """Return (columns, max_tags) for the tag query grid from settings.
+
+        Max tags shown = columns * rows; both are clamped to sane minimums so a
+        bad saved value can never produce an empty or broken grid.
+        """
+        cols = max(1, int(getattr(self, 'tag_query_columns', 3)))
+        rows = max(1, int(getattr(self, 'tag_query_rows', 14)))
+        return cols, cols * rows
+
+    def _rebuild_tag_query_grid(self):
+        """Re-render the tag query grid for the current selection.
+
+        Called after the Tag Query settings change so a live selection updates
+        immediately without re-selecting manually. No-op when nothing is selected.
+        """
+        if getattr(self, 'selected_node_index', None) is not None:
+            self.show_node_info(self.selected_node_index)
+        elif getattr(self, 'selected_cluster_id', None) is not None and hasattr(self, 'scene_graph'):
+            import numpy as np
+            idxs = np.where(self.scene_graph.cluster_ids == self.selected_cluster_id)[0]
+            if len(idxs) > 0:
+                self.show_cluster_info(int(idxs[0]))
 
     def _clear_tag_widgets(self):
         """Clear all tag widgets from the grid layout synchronously."""
@@ -2140,6 +2245,96 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         """Parse the current query_edit into included/excluded/OR tag sets."""
         return parse_query_tag_states(self.query_edit.text())
 
+    # ── Node sizing modes ────────────────────────────────────────────────
+    # Pixel factors for the screen-space (pxMode=True) modes. Tunable here; they
+    # map the 0.01–0.5 "Node Size" spinbox onto a sensible point-sprite pixel size.
+    _SCREEN_PX_FACTOR = 25.0     # Screen-constant: px = NodeSize * this
+    _UNIFORM_PX_MIN = 2          # Uniform single-size floor (px) for the perf probe
+
+    def _node_px_mode(self):
+        """Whether nodes render in screen pixels (True) or scene units (False).
+
+        Distance mode uses scene units so perspective scaling applies naturally.
+        All other modes use pixel sizes (constant on screen regardless of distance).
+        """
+        return getattr(self, 'node_sizing_mode', "Distance") != "Distance"
+
+    def _auto_scale_factor(self):
+        """Size multiplier for Auto-scale mode based on current camera distance.
+
+        Far from the data -> larger nodes (so they stay visible); close in ->
+        smaller (less overdraw). 1.0 at the reference distance, clamped to a sane
+        range so it never vanishes or blows up.
+        """
+        try:
+            dist = float(self.gl_view.opts.get("distance", self._auto_ref_dist))
+        except Exception:
+            dist = self._auto_ref_dist
+        if dist <= 0:
+            return 1.0
+        f = dist / max(1e-6, self._auto_ref_dist)
+        return float(min(max(f, 0.25), 4.0))
+
+    def _current_node_sizes(self, n):
+        """Return a length-n size array for the main scatter in the active mode."""
+        import numpy as np
+        base = float(self.min_size_spin.value()) / 10.0  # actual scene-unit size
+        mode = getattr(self, 'node_sizing_mode', "Distance")
+        if mode == "Distance":
+            return np.full(n, base)                       # scene units (perspective)
+        if mode == "Screen-constant":
+            px = max(1.0, float(base * 10.0) * self._SCREEN_PX_FACTOR)
+            return np.full(n, px)                          # pixels, constant on screen
+        if mode == "Uniform single size":
+            px = max(self._UNIFORM_PX_MIN, round(float(base * 10.0) * 8.0))
+            return np.full(n, float(px))                   # one minimal pixel size (perf probe)
+        if mode == "Auto-scale to view distance":
+            px = max(1.0, float(base * 10.0) * self._SCREEN_PX_FACTOR) * self._auto_scale_factor()
+            return np.full(n, px)                          # pixels scaled by camera distance
+        return np.full(n, base)
+
+    def _update_auto_node_sizes(self):
+        """Refresh node sizes for Auto-scale mode (called from a timer)."""
+        if getattr(self, 'node_sizing_mode', "Distance") != "Auto-scale to view distance":
+            return
+        sc = self.gl_scatter
+        scene = getattr(self, 'scene_graph', None)
+        if sc is None or scene is None:
+            return
+        try:
+            sc.setData(size=self._current_node_sizes(len(scene.file_ids)))
+        except Exception as e:
+            print(f"Error updating auto node sizes: {e}")
+
+    def _on_node_sizing_changed(self, mode):
+        """Apply a new Node Sizing mode (from the Visualization Settings combo).
+
+        - Distance: legacy perspective scaling (pxMode=False), no timer.
+        - Screen-constant / Uniform single size: fixed pixel sizes (pxMode=True).
+        - Auto-scale to view distance: pixel sizes that track camera distance via a
+          lightweight timer (far -> larger, near -> smaller).
+
+        Rebuilds the live scatter so pxMode + sizes take effect immediately.
+        """
+        self.node_sizing_mode = mode
+        # Manage the auto-scale refresh timer.
+        if getattr(self, '_auto_node_timer', None) is not None:
+            if mode == "Auto-scale to view distance":
+                try:
+                    d = float(self.gl_view.opts.get("distance", 0)) or 0
+                    self._auto_ref_dist = d if d > 0 else self._auto_ref_dist
+                except Exception:
+                    pass
+                self._update_auto_node_sizes()  # apply immediately at current distance
+                self._auto_node_timer.start()
+            else:
+                self._auto_node_timer.stop()
+        # Rebuild the scatter with the new pxMode + sizes (no-op if nothing loaded).
+        try:
+            self._on_size_changed()
+        except Exception as e:
+            print(f"Error applying node sizing mode: {e}")
+
     def _on_size_changed(self):
         """Handle size parameter changes to update scatter dynamically."""
         if self.gl_scatter and hasattr(self, 'node_list') and self.node_list:
@@ -2147,15 +2342,16 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             import pyqtgraph.opengl as gl
             node_size = self.min_size_spin.value() / 10.0
             alpha = self.transparency_spin.value()
-            
+
             # Uniform node size
             scene = self.scene_graph
-            sizes = np.full(len(scene.file_ids), node_size)
+            sizes = self._current_node_sizes(len(scene.file_ids))
 
             # Remove old scatter and create new one with updated sizes
             self.gl_view.removeItem(self.gl_scatter)
 
-            positions = scene.positions
+            # Apply spread (display-only transform, same as the other rebuild paths).
+            positions = scene.positions * float(self.spread_spin.value())
             colors = scene.colors.astype(np.float64) / 255.0
             colors_rgba = np.column_stack([colors, alpha * np.ones(len(colors))])
             
@@ -2163,7 +2359,8 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                 pos=positions,
                 size=sizes,
                 color=colors_rgba,
-                pxMode=False
+                pxMode=self._node_px_mode(),
+                glOptions=self._node_gl_options()
             )
             try:
                 self.gl_scatter.sigClicked.connect(self.on_node_clicked)
@@ -2187,7 +2384,7 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             # Recalculate positions with spread (direct SoA array access)
             scene = self.scene_graph
             positions = scene.positions * spread
-            sizes = np.full(len(scene.file_ids), node_size)
+            sizes = self._current_node_sizes(len(scene.file_ids))
             colors = scene.colors.astype(np.float64) / 255.0
             colors_rgba = np.column_stack([colors, alpha * np.ones(len(colors))])
             
@@ -2197,7 +2394,8 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                 pos=positions,
                 size=sizes,
                 color=colors_rgba,
-                pxMode=False
+                pxMode=self._node_px_mode(),
+                glOptions=self._node_gl_options()
             )
             try:
                 self.gl_scatter.sigClicked.connect(self.on_node_clicked)
@@ -2208,6 +2406,10 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
 
         # Re-apply selection style if a selection is active
         self._reapply_selection_style()
+
+        # Spread changed the on-screen positions -> refresh any Explore tour so its
+        # stored centroids (computed with the old spread) track the new layout.
+        self._invalidate_explore_path()
 
     def _on_transparency_changed(self):
         """Handle transparency parameter changes to update scatter dynamically."""
@@ -2221,7 +2423,7 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             # Recalculate positions with spread (direct SoA array access)
             scene = self.scene_graph
             positions = scene.positions * spread
-            sizes = np.full(len(scene.file_ids), node_size)
+            sizes = self._current_node_sizes(len(scene.file_ids))
             colors = scene.colors.astype(np.float64) / 255.0
             colors_rgba = np.column_stack([colors, alpha * np.ones(len(colors))])
             
@@ -2231,7 +2433,8 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                 pos=positions,
                 size=sizes,
                 color=colors_rgba,
-                pxMode=False
+                pxMode=self._node_px_mode(),
+                glOptions=self._node_gl_options()
             )
             try:
                 self.gl_scatter.sigClicked.connect(self.on_node_clicked)
@@ -2243,6 +2446,87 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         # Re-apply selection style if a selection is active
         self._reapply_selection_style()
 
+    def _dim_colors_rgba(self, colors_rgba, mask, dim_alpha):
+        """Return a copy of colors_rgba with rows matching ``mask`` dimmed.
+
+        In Simple (opaque) blending the GPU ignores alpha entirely, so dimming
+        via the alpha channel would have no visible effect there — instead the
+        RGB is desaturated AND darkened by the same factor (both at once), which
+        works in every blending mode. Other modes keep the classic alpha dim.
+        """
+        import numpy as np
+        out = colors_rgba.copy()
+        if getattr(self, 'node_blending', "Normal Alpha") == "Simple":
+            f = float(dim_alpha)
+            rgb = out[mask, :3]
+            gray = rgb.mean(axis=1, keepdims=True)
+            sat = 1.0 - (1.0 - f) * 0.75   # reduce saturation by the dim factor
+            out[mask, :3] = np.clip((gray + sat * (rgb - gray)) * f, 0.0, 1.0)
+        else:
+            out[mask, 3] = float(dim_alpha)
+        return out
+
+    def _node_gl_options(self):
+        """GL blending options for the main node scatter, from settings.
+
+        - Normal Alpha (default): standard alpha blending; overlapping same-hue
+          nodes converge to that hue instead of blowing out (density visible).
+        - Additive (legacy): colors accumulate where nodes overlap and saturate
+          to white at high density — shows density but loses hue.
+        - Normal Alpha: standard alpha blending; overlapping same-hue nodes
+          converge to that hue instead of blowing out (density still visible).
+        - Simple: no blending + depth test; the nearest node wins per pixel, so
+          overlaps keep their exact shape and color (no density cue at all).
+
+        All three are a single draw call with identical vertex counts — the only
+        difference is the GL blend state, so switching costs ~0% performance.
+        """
+        mode = getattr(self, 'node_blending', "Normal Alpha")
+        if mode == "Normal Alpha":
+            return "translucent"
+        if mode == "Simple":
+            return "opaque"
+        return "additive"
+
+    def _on_node_blending_changed(self, mode):
+        """Apply a new blending mode to the live scatter (no data rebuild).
+
+        Called from the Node Blending combo (currentTextChanged). Updates the
+        attribute so save_settings() persists it, then re-applies the GL state.
+        """
+        self.node_blending = mode
+        self._sync_blending_controls()
+        if self.gl_scatter is not None:
+            try:
+                self.gl_scatter.setGLOptions(self._node_gl_options())
+            except Exception as e:
+                print(f"Error applying node blending: {e}")
+
+    def _sync_blending_controls(self):
+        """Enable/disable controls that don't apply to the current blend mode.
+
+        In Simple (opaque) mode the GPU ignores alpha entirely, so the global
+        Transparency control has no effect — it is greyed out. Dim Alpha still
+        works in every mode: for Simple it desaturates + darkens instead of
+        lowering alpha (see _dim_colors_rgba).
+        """
+        simple = getattr(self, 'node_blending', "Normal Alpha") == "Simple"
+        if hasattr(self, 'transparency_spin'):
+            self.transparency_spin.setEnabled(not simple)
+            self.transparency_spin.setToolTip(
+                ("Alpha (transparency) of nodes in the 3D view.\n"
+                 "0.0 = fully transparent, 1.0 = fully opaque.\n"
+                 "Default: 0.8\n\n"
+                 "Disabled: Simple blending ignores alpha entirely.") if simple else
+                "Alpha (transparency) of nodes in the 3D view.\n0.0 = fully transparent, 1.0 = fully opaque.\nDefault: 0.8"
+            )
+        if hasattr(self, 'dim_alpha_spin'):
+            self.dim_alpha_spin.setToolTip(
+                ("Dim strength for non-selected nodes (Simple mode):\n"
+                 "reduces brightness AND saturation of dimmed nodes by this factor.\n"
+                 "1.0 = no dim, 0.0 = fully greyed out.") if simple else
+                "Alpha (transparency) applied to non-selected nodes\nwhen a selection is active.\n0.0 = fully transparent, 1.0 = fully opaque.\nDefault: 0.15"
+            )
 
     def keyPressEvent(self, event):
         """Handle key press events for fullscreen toggle and shortcuts."""
@@ -2323,7 +2607,17 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             colors = SceneGraph.CLUSTER_COLORS
             return colors[cluster_id % len(colors)]
 
-        # Matplotlib-based colormaps
+        if scheme == "Nature":
+            from src.core.models import SceneGraph
+            colors = SceneGraph.NATURE_COLORS
+            return colors[cluster_id % len(colors)]
+
+        if scheme == "Sci-Fi":
+            from src.core.models import SceneGraph
+            colors = SceneGraph.SCIFI_COLORS
+            return colors[cluster_id % len(colors)]
+
+        # Matplotlib-based colormaps (Viridis, Plasma, Inferno, Coolwarm)
         try:
             import matplotlib.cm as cm
             import numpy as np
@@ -2369,7 +2663,7 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
 
         # Recalculate positions (direct SoA array access)
         positions = scene.positions * spread
-        sizes = np.full(len(scene.file_ids), node_size)
+        sizes = self._current_node_sizes(len(scene.file_ids))
 
         # Generate new colors based on scheme (one per node, by its cluster)
         colors = np.array([self._get_color_for_cluster(int(cid), total_clusters) for cid in scene.cluster_ids]) / 255.0
@@ -2385,7 +2679,8 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             pos=positions,
             size=sizes,
             color=colors_rgba,
-            pxMode=False
+            pxMode=self._node_px_mode(),
+            glOptions=self._node_gl_options()
         )
         try:
             self.gl_scatter.sigClicked.connect(self.on_node_clicked)
@@ -2393,6 +2688,30 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             pass
         self.gl_view.addItem(self.gl_scatter)
         self._build_base_scatter()
+
+    def _on_bg_color_changed(self):
+        """Apply the chosen 3D view background color (live)."""
+        if hasattr(self, 'gl_view') and self.gl_view is not None:
+            try:
+                r = int(self.bg_color[0] * 255)
+                g = int(self.bg_color[1] * 255)
+                b = int(self.bg_color[2] * 255)
+                self.gl_view.setBackgroundColor((r, g, b, 255))
+            except Exception as e:
+                print(f"Error setting background color: {e}")
+
+    def _pick_bg_color(self):
+        """Open a color picker for the 3D view background."""
+        from PySide6.QtWidgets import QColorDialog
+        from PySide6.QtGui import QColor
+        _bg = getattr(self, 'bg_color', (0.0, 0.0, 0.0))
+        current = QColor(int(_bg[0]*255), int(_bg[1]*255), int(_bg[2]*255))
+        color = QColorDialog.getColor(current, self, "3D View Background")
+        if color.isValid():
+            self.bg_color = (color.red()/255.0, color.green()/255.0, color.blue()/255.0)
+            r, g, b = int(color.red()), int(color.green()), int(color.blue())
+            self.bg_color_btn.setStyleSheet(f"background-color: rgb({r},{g},{b});")
+            self._on_bg_color_changed()
 
     # Remember Last Session
     def _load_last_data(self):
@@ -2517,6 +2836,8 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                        extreme while passing through every cohort.
         - Contrast:    greedy farthest-point sampling — each next cohort is the one
                        most distant from ALL previously visited, maximizing variety.
+        - Size:        biggest cohort first down to smallest; the tour loops (the
+                       path index wraps), so after the last it repeats from largest.
 
         Returns a list of (cluster_id, size, centroid) tuples.
         """
@@ -2566,6 +2887,10 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                 order.append(best_i)
                 visited.add(best_i)
             return [cohorts[i] for i in order]
+
+        if mode == "Size":
+            # Biggest to smallest; ties broken by cluster id for a stable order.
+            return sorted(cohorts, key=lambda c: (-c[1], c[0]))
 
         # Default: Random (shuffled).
         shuffled = list(cohorts)
@@ -2630,6 +2955,35 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         if hasattr(self, 'selection_timer') and self.selected_cluster_id not in (None, -1):
             self.selection_timer.start(500)
         self.status_label.setText("Explore stopped")
+
+    def _invalidate_explore_path(self):
+        """Refresh the Explore tour after positions change (e.g. Spread changed).
+
+        The stored path holds centroids computed with the spread value at build time;
+        a spread change makes them stale. If Explore is running, update each stop's
+        centroid in place (preserving visit order + current index) and re-target the
+        camera to the fresh position. Otherwise drop the cached path so the next start
+        builds targets from the new centroids.
+        """
+        try:
+            if getattr(self, '_explore_active', False):
+                # Map cluster_id -> (size, centroid*spread) with current spread.
+                fresh = {c[0]: c for c in self._build_explore_cohorts()}
+                path = getattr(self, '_explore_path', []) or []
+                if not path:
+                    return
+                new_path = [fresh.get(p[0], p) for p in path]  # keep order + any missing stops
+                self._explore_path = new_path
+                idx = max(0, min(getattr(self, '_explore_path_index', 0), len(new_path) - 1))
+                self._explore_path_index = idx
+                # Re-target the current stop with its fresh centroid + redraw preview.
+                self._explore_begin_target(new_path[idx])
+                self._explore_draw_path_preview()
+            else:
+                # Not exploring: drop cached path so a later start uses fresh centroids.
+                self._explore_path = []
+        except Exception as e:
+            print(f"Error refreshing explore path: {e}")
 
     def _explore_jump(self, direction):
         """Jump the Explore tour to the next (+1) or previous (-1) cohort.
@@ -3341,18 +3695,19 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             out.append((int(cid), float(sx), float(sy)))
         return out
 
-    def _wasd_pick_targets(self):
-        """Pick the nearest cohort in each screen direction (W/S/A/D) from the
-        currently selected centroid. Returns dict {'W': cid, 'S': cid, ...}.
+    def _wasd_pick_targets(self, anchor_cid=None):
+        """Pick the nearest cohort in each screen direction (W/S/A/D) from a centroid.
 
-        Navigation is restricted to the cohorts that are CURRENTLY LABELED on
-        screen (self.cohort_label_map), so WASD hops between the labels you can
-        actually see rather than distant unlabeled clusters. If no labels are
-        shown it falls back to all projected centroids.
+        Returns dict {'W': cid, 'S': cid, ...}. ``anchor_cid`` overrides the selected
+        cohort as the origin (used by "Keep WASD labels visible" when nothing is
+        selected). Navigation is restricted to the cohorts that are CURRENTLY LABELED
+        on screen (self.cohort_label_map), so WASD hops between the labels you can
+        actually see rather than distant unlabeled clusters. If no labels are shown it
+        falls back to all projected centroids.
         """
         import numpy as np
         scene = self.scene_graph
-        selected_cid = self.selected_cluster_id
+        selected_cid = anchor_cid if anchor_cid is not None else self.selected_cluster_id
         if selected_cid is None or selected_cid == -1:
             return {}
 
@@ -3463,7 +3818,11 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             self._wasd_fade_timer.stop()
 
     def _wasd_draw_paths(self):
-        """Draw (or redraw) the W/S/A/D preview paths from the selected centroid."""
+        """Draw (or redraw) the W/S/A/D preview paths from the selected centroid.
+
+        In "Keep WASD labels visible" mode with no selection, anchors on the largest
+        cohort so the four direction arrows are always shown.
+        """
         # Hidden via settings -> nothing to draw.
         if not getattr(self, 'wasd_paths_enabled', True):
             return
@@ -3472,20 +3831,34 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         spread = float(self.spread_spin.value())
         positions = scene.positions * spread
 
+        persistent = getattr(self, 'wasd_persistent_labels', False)
+        anchor_cid = None
+        if persistent and (self.selected_cluster_id is None or self.selected_cluster_id == -1):
+            # No selection: use the largest cohort as the arrow origin.
+            sizes = np.bincount(scene.cluster_ids[scene.cluster_ids != -1])
+            non_noise = scene.cluster_ids[scene.cluster_ids != -1]
+            if len(non_noise) > 0 and len(sizes) > 0:
+                anchor_cid = int(np.argmax(sizes))
+
         import pyqtgraph.opengl as gl
         # Redraw: drop the current paths immediately (no fade) so they track the
         # camera/selection crisply; fading only happens when navigation ends.
         self._wasd_clear_paths(fade=False)
-        targets = self._wasd_pick_targets()
+        targets = self._wasd_pick_targets(anchor_cid=anchor_cid)
         if not targets:
             return
 
-        sel_idx = np.where(scene.cluster_ids == self.selected_cluster_id)[0]
+        origin_cid = anchor_cid if (persistent and anchor_cid is not None) else self.selected_cluster_id
+        sel_idx = np.where(scene.cluster_ids == origin_cid)[0]
         if len(sel_idx) == 0:
             return
         start = positions[sel_idx].mean(axis=0)
 
         from PySide6.QtGui import QColor, QFont
+        # Appearance is user-configurable (Filter Settings -> WASD preview).
+        lr, lg, lb = self.wasd_line_color
+        cr, cg, cb = self.wasd_letter_color
+        font_size = int(self.wasd_label_size)
         for key, cid in targets.items():
             idx = np.where(scene.cluster_ids == cid)[0]
             if len(idx) == 0:
@@ -3498,7 +3871,7 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                 line = gl.GLLinePlotItem(
                     pos=np.array([[start[0], start[1], start[2]],
                                   [end[0], end[1], end[2]]]),
-                    color=(80, 255, 140, 255), width=6, antialias=True)
+                    color=(lr, lg, lb, 255), width=6, antialias=True)
                 self.gl_view.addItem(line)
                 self._wasd_items.append(line)
 
@@ -3507,20 +3880,85 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                 # in this pyqtgraph version).
                 label = gl.GLTextItem(
                     pos=np.array([mid[0], mid[1], mid[2]]),
-                    text=key, color=QColor(80, 255, 140, 255),
-                    font=QFont("Helvetica", 36))
+                    text=key, color=QColor(cr, cg, cb, 255),
+                    font=QFont("Helvetica", font_size))
                 self.gl_view.addItem(label)
                 self._wasd_items.append(label)
             except Exception as e:
                 print(f"Error drawing WASD path {key}: {e}")
 
+    def _wasd_redraw_if_active(self):
+        """Redraw the WASD arrows when they should be visible.
+
+        Visible during active navigation (a cohort selected), or always in "Keep WASD
+        labels visible" mode (anchored on the largest cohort if nothing is selected).
+        """
+        try:
+            persistent = getattr(self, 'wasd_persistent_labels', False)
+            has_selection = self.selected_cluster_id not in (None, -1)
+            if persistent or (getattr(self, '_wasd_mode', False) and has_selection):
+                self._wasd_draw_paths()
+        except Exception as e:
+            print(f"Error redrawing WASD paths: {e}")
+
+    def _pick_wasd_line_color(self):
+        """Open a color picker for the WASD path line color."""
+        from PySide6.QtWidgets import QColorDialog
+        from PySide6.QtGui import QColor
+        cur = QColor(int(self.wasd_line_color[0]), int(self.wasd_line_color[1]), int(self.wasd_line_color[2]))
+        color = QColorDialog.getColor(cur, self, "WASD Path Line Color")
+        if color.isValid():
+            self.wasd_line_color = (color.red(), color.green(), color.blue())
+            r, g, b = color.red(), color.green(), color.blue()
+            self.wasd_line_btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 1px solid #4050a0;")
+            self._wasd_redraw_if_active()
+
+    def _pick_wasd_letter_color(self):
+        """Open a color picker for the WASD letter label color."""
+        from PySide6.QtWidgets import QColorDialog
+        from PySide6.QtGui import QColor
+        cur = QColor(int(self.wasd_letter_color[0]), int(self.wasd_letter_color[1]), int(self.wasd_letter_color[2]))
+        color = QColorDialog.getColor(cur, self, "WASD Letter Color")
+        if color.isValid():
+            self.wasd_letter_color = (color.red(), color.green(), color.blue())
+            r, g, b = color.red(), color.green(), color.blue()
+            self.wasd_letter_btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 1px solid #4050a0;")
+            self._wasd_redraw_if_active()
+
+    def _on_wasd_label_size_changed(self):
+        """WASD label size changed -> store + live redraw."""
+        try:
+            self.wasd_label_size = int(getattr(self, 'wasd_label_spin', None) and self.wasd_label_spin.value())
+        except (TypeError, ValueError):
+            pass
+        self._wasd_redraw_if_active()
+
+    def _on_wasd_persistent_toggled(self, state):
+        """Keep-WASD-labels toggle changed -> store + apply immediately."""
+        self.wasd_persistent_labels = bool(state)
+        if not self.wasd_persistent_labels and getattr(self, '_wasd_items', []):
+            # Turning it off: fade out any currently-shown arrows.
+            self._wasd_end_fade()
+        else:
+            # Turning it on (or already on): show the arrows now — anchored on the
+            # selected cohort, or the largest one if nothing is selected.
+            self._wasd_redraw_if_active()
+
     def _wasd_end_fade(self):
         """Fade out the current WASD paths (navigation is ending).
+
+        With "Keep WASD labels visible" enabled, non-WASD selection changes do NOT
+        fade the arrows — they are redrawn from the new centroid instead.
 
         Called when the selection changes by non-WASD means (left-click, session
         load) or the scene is rebuilt — i.e. whenever the preview should no longer
         be shown. No-op if there are no active paths.
         """
+        # "Keep WASD labels visible": don't fade on a non-WASD selection change — the
+        # arrows are redrawn from the new centroid instead (see show_cluster_info).
+        if getattr(self, 'wasd_persistent_labels', False) and \
+                self.selected_cluster_id not in (None, -1):
+            return
         if getattr(self, '_wasd_items', []):
             self._wasd_mode = False
             self._wasd_clear_paths(fade=True)
@@ -3733,7 +4171,7 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         import numpy as np
         import pyqtgraph.opengl as gl
         self._explore_clear_path_preview()
-        if not getattr(self, 'explore_show_path', True):
+        if not getattr(self, 'explore_show_path', False):
             return
         path = getattr(self, '_explore_path', []) or []
         n = len(path)

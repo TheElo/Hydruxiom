@@ -17,9 +17,10 @@ from PySide6.QtWidgets import (
     QCheckBox, QSpinBox, QDoubleSpinBox, QLineEdit, QGroupBox, QFormLayout,
     QListWidget, QListWidgetItem, QFileDialog, QMessageBox, QInputDialog,
     QComboBox, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QTabWidget,
+    QScrollArea,
 )
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QIntValidator
 
 from src.ui.smart_scale import (
     SMART_SCALE_SETTINGS, SMART_SCALE_KEYS, default_profiles, read_current_values,
@@ -68,14 +69,33 @@ class TagMap3DSettingsDialog(QDialog):
         outer_layout.setContentsMargins(10, 10, 10, 10)
         outer_layout.setSpacing(12)
 
-        # The dialog is tabbed: "General" holds all the classic groups below;
-        # "Smart Scale" manages node-count-based automatic settings. main_layout
-        # is the General tab's container (all existing addWidget calls target it).
+        # The dialog is tabbed: General | UI | Clients | Shortcuts | Smart Scale.
+        # Each tab's content is wrapped in a scroll area (see _scroll_tab) so
+        # settings never get squished on small screens — the vertical scrollbar
+        # only appears when the content doesn't fit.
         self.settings_tabs = QTabWidget()
+
         general_tab = QWidget()
         main_layout = QVBoxLayout(general_tab)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(12)
+
+        # Containers for the other tabs; their groups are built further down in
+        # this method and added to these layouts.
+        ui_tab = QWidget()
+        ui_tab_layout = QVBoxLayout(ui_tab)
+        ui_tab_layout.setContentsMargins(8, 8, 8, 8)
+        ui_tab_layout.setSpacing(12)
+
+        clients_tab = QWidget()
+        clients_tab_layout = QVBoxLayout(clients_tab)
+        clients_tab_layout.setContentsMargins(8, 8, 8, 8)
+        clients_tab_layout.setSpacing(12)
+
+        shortcuts_tab = QWidget()
+        shortcuts_tab_layout = QVBoxLayout(shortcuts_tab)
+        shortcuts_tab_layout.setContentsMargins(8, 8, 8, 8)
+        shortcuts_tab_layout.setSpacing(12)
 
         # --- Clients group (full CRUD over clients.json) ---
         clients_group = QGroupBox("Clients")
@@ -104,6 +124,17 @@ class TagMap3DSettingsDialog(QDialog):
         cform.addRow("Thumbs Dir:", self._browse_row(self.c_thumbs_dir_edit))
         cg_layout.addLayout(cform)
 
+        # Chunk Size (moved here from the left panel). Stored on the tab as a
+        # plain int attribute; written back in apply_settings().
+        self.chunk_size_spin = QSpinBox()
+        self.chunk_size_spin.setRange(50, 100000000)
+        try:
+            self.chunk_size_spin.setValue(int(getattr(self.tab, 'chunk_size', 8192)))
+        except (TypeError, ValueError):
+            self.chunk_size_spin.setValue(8192)
+        self.chunk_size_spin.setToolTip("Number of files to fetch per API request.\nLarger = faster but may timeout.\nSmaller = more requests but more reliable.\nDefault: 8192")
+        cform.addRow("Chunk Size:", self.chunk_size_spin)
+
         # Action buttons
         btns = QHBoxLayout()
         self.client_add_btn = QPushButton("+ Add")
@@ -123,7 +154,7 @@ class TagMap3DSettingsDialog(QDialog):
         cg_layout.addWidget(self.client_status)
 
         clients_group.setLayout(cg_layout)
-        main_layout.addWidget(clients_group)
+        clients_tab_layout.addWidget(clients_group)
 
         # Populate the client list from the working copy.
         for cid in self._clients.keys():
@@ -198,6 +229,40 @@ class TagMap3DSettingsDialog(QDialog):
         perf_group.setLayout(perf_layout)
         main_layout.addWidget(perf_group)
 
+        # --- Tag Query group (clickable tag grid layout in the left panel) ---
+        tq_group = QGroupBox("Tag Query")
+        tq_layout = QFormLayout()
+
+        self.tag_query_columns_spin = QSpinBox()
+        self.tag_query_columns_spin.setRange(1, 20)
+        self.tag_query_columns_spin.setValue(getattr(self.tab, 'tag_query_columns', 3))
+        self.tag_query_columns_spin.setToolTip(
+            "Number of columns in the clickable tag grid (Filter Settings).\n"
+            "More columns = wider rows, fewer lines. Combined with Rows it\n"
+            "determines how many tags are shown at once."
+        )
+        tq_layout.addRow("Columns:", self.tag_query_columns_spin)
+
+        self.tag_query_rows_spin = QSpinBox()
+        self.tag_query_rows_spin.setRange(1, 200)
+        self.tag_query_rows_spin.setValue(getattr(self.tab, 'tag_query_rows', 14))
+        self.tag_query_rows_spin.setToolTip(
+            "Number of rows in the clickable tag grid.\n"
+            "Max tags shown = Columns x Rows (the rest are collapsed into a\n"
+            "'... and N more tags' label). Increase for files with many tags."
+        )
+        tq_layout.addRow("Rows:", self.tag_query_rows_spin)
+
+        self.tag_query_max_label = QLabel("")
+        self.tag_query_max_label.setStyleSheet("color: #888; font-size: 10px;")
+        self._update_tag_query_max_label()
+        self.tag_query_columns_spin.valueChanged.connect(self._update_tag_query_max_label)
+        self.tag_query_rows_spin.valueChanged.connect(self._update_tag_query_max_label)
+        tq_layout.addRow("Max tags shown:", self.tag_query_max_label)
+
+        tq_group.setLayout(tq_layout)
+        main_layout.addWidget(tq_group)
+
         # --- UI group (scale + camera glide behavior) ---
         scale_group = QGroupBox("UI")
         scale_layout = QFormLayout()
@@ -247,27 +312,34 @@ class TagMap3DSettingsDialog(QDialog):
         scale_layout.addRow(self.wasd_paths_checkbox)
 
         self.ui_scale_combo = QComboBox()
-        for pct in (100, 125, 150, 200):
+        self.ui_scale_combo.setEditable(True)
+        for pct in (50, 75, 100, 125, 150, 200):
             self.ui_scale_combo.addItem(f"{pct}%", userData=pct)
+        # Allow typing any integer percentage between 25 and 250.
+        self.ui_scale_combo.setValidator(QIntValidator(25, 250))
         try:
             current_scale = int(getattr(self.tab, 'ui_scale', 100))
         except (TypeError, ValueError):
             current_scale = 100
+        current_scale = max(25, min(250, current_scale))
         idx = self.ui_scale_combo.findData(current_scale)
         if idx < 0:
             # Non-standard saved value: show it as a custom entry so the UI
             # reflects reality instead of silently resetting to 100%.
-            self.ui_scale_combo.addItem(f"{current_scale}% (custom)", userData=current_scale)
+            self.ui_scale_combo.addItem(f"{current_scale}%", userData=current_scale)
             idx = self.ui_scale_combo.count() - 1
         self.ui_scale_combo.setCurrentIndex(idx)
         self.ui_scale_combo.setToolTip(
-            "Uniformly scales the whole UI (fonts + widgets) for high-DPI displays.\n"
+            "Uniformly scales the whole UI (fonts + widgets).\n"
+            "Use values below 100% on low-resolution screens where the UI\n"
+            "doesn't fit; above 100% for high-DPI displays.\n"
+            "Any integer from 25 to 250 can be typed in.\n"
             "Applied at app startup — restart Hydruxiom after changing it.\n"
             "Note: this multiplies on top of Windows display scaling."
         )
         scale_layout.addRow("Scale:", self.ui_scale_combo)
         scale_group.setLayout(scale_layout)
-        main_layout.addWidget(scale_group)
+        ui_tab_layout.addWidget(scale_group)
 
         # --- DBSCAN Optimizer group ---
         opt_group = QGroupBox("DBSCAN Optimizer")
@@ -400,7 +472,7 @@ class TagMap3DSettingsDialog(QDialog):
         explore_layout = QFormLayout()
 
         self.explore_mode_combo = QComboBox()
-        self.explore_mode_combo.addItems(["Random", "Linear Path", "Contrast"])
+        self.explore_mode_combo.addItems(["Random", "Linear Path", "Contrast", "Size"])
         _em_idx = self.explore_mode_combo.findText(getattr(self.tab, 'explore_mode', "Random"))
         if _em_idx >= 0:
             self.explore_mode_combo.setCurrentIndex(_em_idx)
@@ -412,12 +484,13 @@ class TagMap3DSettingsDialog(QDialog):
             "- Linear Path: starts at one spatial extreme and hops to the nearest\n"
             "  unvisited cohort — a short-step sweep that ends near the other extreme.\n"
             "- Contrast: greedy farthest-point sampling; each next cohort is the most\n"
-            "  distant from all previously visited, for the most varied tour."
+            "  distant from all previously visited, for the most varied tour.\n"
+            "- Size: visits cohorts biggest to smallest, then loops back to repeat."
         )
         explore_layout.addRow("Mode:", self.explore_mode_combo)
 
         self.explore_show_path_checkbox = QCheckBox("Show path preview")
-        self.explore_show_path_checkbox.setChecked(getattr(self.tab, 'explore_show_path', True))
+        self.explore_show_path_checkbox.setChecked(getattr(self.tab, 'explore_show_path', False))
         self.explore_show_path_checkbox.setToolTip(
             "When enabled, Explore draws the planned route before flying it:\n"
             "- orange lines = approach / travel between targets\n"
@@ -496,7 +569,7 @@ class TagMap3DSettingsDialog(QDialog):
         explore_layout.addRow("Orbit Elevation:", self.explore_elevation_spin)
 
         explore_group.setLayout(explore_layout)
-        main_layout.addWidget(explore_group)
+        ui_tab_layout.addWidget(explore_group)
 
         # --- Direct DB group (per-client DB paths are now in the Clients section) ---
         db_group = QGroupBox("Direct DB")
@@ -579,15 +652,18 @@ class TagMap3DSettingsDialog(QDialog):
         self.shortcuts_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         sc_layout.addWidget(self.shortcuts_table)
         shortcuts_group.setLayout(sc_layout)
-        main_layout.addWidget(shortcuts_group)
+        shortcuts_tab_layout.addWidget(shortcuts_group)
 
         # --- Smart Scale tab (node-count-based automatic settings) ---
         smart_tab = QWidget()
         self._build_smart_scale_tab(smart_tab)
 
-        # Assemble the tabs and move them into the outer layout.
-        self.settings_tabs.addTab(general_tab, "General")
-        self.settings_tabs.addTab(smart_tab, "Smart Scale")
+        # Assemble the tabs (each scrollable) in the requested order.
+        self.settings_tabs.addTab(self._scroll_tab(general_tab), "General")
+        self.settings_tabs.addTab(self._scroll_tab(ui_tab), "UI")
+        self.settings_tabs.addTab(self._scroll_tab(clients_tab), "Clients")
+        self.settings_tabs.addTab(self._scroll_tab(shortcuts_tab), "Shortcuts")
+        self.settings_tabs.addTab(self._scroll_tab(smart_tab), "Smart Scale")
         outer_layout.addWidget(self.settings_tabs)
 
         # --- Buttons (shared by all tabs; sit below the tab widget) ---
@@ -608,6 +684,22 @@ class TagMap3DSettingsDialog(QDialog):
 
         self.setLayout(outer_layout)
         self.apply_dark_theme()
+
+    @staticmethod
+    def _scroll_tab(content):
+        """Wrap a tab page in a QScrollArea that scrolls only when needed.
+
+        Vertical scrollbar policy is AsNeeded, so the bar (and its space)
+        appears only when the content doesn't fit; horizontal scrolling is
+        disabled and widgets stretch to the tab width instead.
+        """
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(content)
+        return scroll
 
     # ------------------------------------------------------------------
     # Smart Scale tab
@@ -919,9 +1011,39 @@ class TagMap3DSettingsDialog(QDialog):
         self._smart_refresh_profile_list()
         self.smart_profile_list.setCurrentRow(target)
 
+    def _update_tag_query_max_label(self, *_args):
+        """Keep the 'Max tags shown' hint in sync with columns x rows."""
+        cols = self.tag_query_columns_spin.value()
+        rows = self.tag_query_rows_spin.value()
+        self.tag_query_max_label.setText(f"{cols} × {rows} = {cols * rows} tags")
+
+    def _read_ui_scale(self):
+        """Read the UI scale (percent) from the editable combo, clamped to 25–250.
+
+        A typed value has no matching item userData, so fall back to parsing
+        the line-edit text; unparseable input falls back to 100%.
+        """
+        data = self.ui_scale_combo.currentData()
+        if isinstance(data, int):
+            return max(25, min(250, data))
+        text = self.ui_scale_combo.currentText().strip()
+        if text.endswith("%"):
+            text = text[:-1].strip()
+        try:
+            val = int(float(text))
+        except ValueError:
+            return 100
+        return max(25, min(250, val))
+
     def apply_settings(self):
         """Apply dialog values back to the tab and save settings."""
         tab = self.tab
+
+        # Chunk Size (edited in the Clients group; plain int on the tab)
+        try:
+            tab.chunk_size = int(self.chunk_size_spin.value())
+        except Exception:
+            pass
 
         tab.low_memory = self.low_memory_checkbox.isChecked()
         tab.n_jobs = self.n_jobs_spin.value()
@@ -946,6 +1068,18 @@ class TagMap3DSettingsDialog(QDialog):
 
         # Session auto-save delay (seconds; 0 = save immediately)
         tab.session_save_delay = self.session_save_delay_spin.value()
+
+        # Tag query grid layout (columns x rows; max tags shown = cols * rows).
+        # Re-render the live selection so the change is visible immediately.
+        old_cols = int(getattr(tab, 'tag_query_columns', 3))
+        old_rows = int(getattr(tab, 'tag_query_rows', 14))
+        tab.tag_query_columns = self.tag_query_columns_spin.value()
+        tab.tag_query_rows = self.tag_query_rows_spin.value()
+        if (old_cols, old_rows) != (tab.tag_query_columns, tab.tag_query_rows):
+            try:
+                tab._rebuild_tag_query_grid()
+            except Exception as e:
+                print(f"Error rebuilding tag query grid: {e}")
 
         # Smart Scale profiles (node-count-based automatic settings). The master
         # enable toggle lives in the main window, not this dialog.
@@ -1009,8 +1143,9 @@ class TagMap3DSettingsDialog(QDialog):
         except Exception as e:
             print(f"Error reloading tag scores: {e}")
 
-        # UI scale (applied at startup; restart required to take effect)
-        new_scale = self.ui_scale_combo.currentData() or 100
+        # UI scale (applied at startup; restart required to take effect).
+        # The combo is editable, so a typed value has no userData — parse text.
+        new_scale = self._read_ui_scale()
         scale_changed = int(getattr(tab, 'ui_scale', 100)) != int(new_scale)
         tab.ui_scale = int(new_scale)
 

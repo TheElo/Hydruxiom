@@ -15,10 +15,13 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSpinBox, QComboBox, QProgressBar, QGroupBox, QFormLayout,
     QTextEdit, QSplitter, QScrollArea, QLineEdit, QDoubleSpinBox, QCheckBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QGridLayout, QFileDialog, QTabWidget
+    QTableWidget, QTableWidgetItem, QHeaderView, QGridLayout, QFileDialog, QTabWidget,
+    QStyledItemDelegate, QStyleOptionViewItem, QApplication
 )
 from PySide6.QtCore import Qt, QTimer, QEvent
-from PySide6.QtGui import QCloseEvent, QMouseEvent, QVector3D, QFont
+from PySide6.QtGui import (
+    QCloseEvent, QMouseEvent, QVector3D, QFont, QPainter, QColor, QFontMetrics,
+)
 import pyqtgraph.opengl as gl
 
 from src.ui.styles import (
@@ -35,7 +38,110 @@ from src.ui.tag_map_utils import compile_tag_patterns, ease_in_out, SETTINGS_FIL
 from src.ui.gl_text_items import get_multiline_text_item_class as _get_multiline_text_item_class
 
 
+def _scheme_preview_colors(name):
+    """Return an ordered list of distinct (r,g,b) colors for a color scheme.
+
+    Used to render each letter of the Color Scheme dropdown in one of that
+    scheme's own colors, so users can see what's inside before selecting it.
+    Discrete schemes use their full palette; matplotlib colormaps are sampled at
+    evenly spaced points (no duplicates).
+    """
+    from src.core.models import SceneGraph
+    if name == "Pastel":
+        return list(SceneGraph.CLUSTER_COLORS)
+    if name == "Nature":
+        return list(SceneGraph.NATURE_COLORS)
+    if name == "Sci-Fi":
+        return list(SceneGraph.SCIFI_COLORS)
+    try:
+        import matplotlib.cm as cm
+        cmap = cm.get_cmap(name.lower())
+        n = 12
+        out, seen = [], set()
+        for i in range(n):
+            t = (i + 0.5) / n
+            c = tuple(int(round(v * 255)) for v in cmap(t)[:3])
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out or [(170, 170, 170)]
+    except Exception:
+        return list(SceneGraph.CLUSTER_COLORS[:8])
+
+
+class _ColorSchemeDelegate(QStyledItemDelegate):
+    """Renders each character of a Color Scheme item in one of that scheme's colors.
+
+    Letters cycle through the palette (no repeats until exhausted) so every color is
+    visible without duplication. Applied to both the popup list and the closed combo
+    display, so the currently selected scheme also shows its own colors. Falls back
+    to plain text if no preview data exists for a name.
+    """
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
+        from PySide6.QtWidgets import QStyle
+        from PySide6.QtGui import QPalette
+
+        name = str(index.data(Qt.ItemDataRole.DisplayRole))
+        colors = _scheme_preview_colors(name) if name else []
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+
+        # Draw the background/selection highlight OURSELVES (no super().paint() and no
+        # drawControl(CE_ItemViewItem), both of which would also render Qt's default white
+        # item text — that ghosted/misaligned layer is what we must avoid). Filling from
+        # the palette keeps it theme-correct.
+        pal = option.palette
+        bg_color = (pal.color(QPalette.ColorRole.Highlight) if selected
+                    else pal.color(QPalette.ColorRole.Base))
+        painter.fillRect(option.rect, bg_color)
+
+        if not colors or not name:
+            return
+
+        # Draw each character in its own scheme color. Letters cycle through the palette
+        # (no repeats until exhausted). Vertically centered using font metrics.
+        fm = QFontMetrics(option.font)
+        y_center = (option.rect.top() + option.rect.bottom()) // 2
+        baseline = y_center + (fm.ascent() - fm.descent()) // 2
+        x = option.rect.left() + 6
+
+        painter.save()
+        for i, ch in enumerate(name):
+            r, g, b = colors[i % len(colors)]
+            if selected:
+                # Keep light letters readable on the blue selection row.
+                lum = 0.299 * r + 0.587 * g + 0.114 * b
+                col = QColor(255, 255, 255) if lum > 160 else QColor(r, g, b)
+            else:
+                col = QColor(r, g, b)
+            painter.setPen(col)
+            painter.drawText(x, baseline, ch)
+            x += fm.horizontalAdvance(ch)
+        painter.restore()
+
+
 class UIConstructionMixin:
+    @staticmethod
+    def _make_scrollable(content, min_width=None, max_width=None):
+        """Wrap a content widget in a QScrollArea that scrolls only when needed.
+
+        The vertical scrollbar policy is AsNeeded, so the bar (and its space)
+        appears only when the content doesn't fit — keeping sidebars compact on
+        large screens while staying usable on low-resolution ones. Horizontal
+        scrolling is disabled; widgets stretch to the sidebar width instead.
+        """
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        if min_width is not None:
+            scroll.setMinimumWidth(min_width)
+        if max_width is not None:
+            scroll.setMaximumWidth(max_width)
+        scroll.setWidget(content)
+        return scroll
+
     def setup_ui(self):
         """Create the user interface."""
         main_layout = QVBoxLayout()
@@ -143,10 +249,19 @@ class UIConstructionMixin:
 
     def create_control_panel(self):
         """Create the control panel widget."""
+        # The left sidebar content is scrollable so it scrolls instead of being
+        # squished on low-resolution screens (scrollbar only when needed). The
+        # progress bar / phase / status labels stay pinned below, OUTSIDE the
+        # scroll area. NOTE: the content widget must not be added to any other
+        # layout directly — that would reparent it out of the QScrollArea and
+        # silently disable scrolling.
         panel = QWidget()
         panel.setMinimumWidth(250)
         panel.setMaximumWidth(350)
-        layout = QVBoxLayout()
+        content = QWidget()
+        self._left_content = content  # used by _reorganize_sidebars (cohort row)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(15)
 
         # Title
@@ -154,8 +269,11 @@ class UIConstructionMixin:
         title.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {RED_A};")
         layout.addWidget(title)
 
-        # Settings button (opens the advanced settings window)
-        self.settings_button = QPushButton("Settings")
+        # Settings + Help buttons side by side
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+
+        self.settings_button = QPushButton("\u2699")  # cog (settings)
         self.settings_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: {BLUE_60};
@@ -168,9 +286,29 @@ class UIConstructionMixin:
                 background-color: rgb(80, 100, 200);
             }}
         """)
-        self.settings_button.setToolTip("Open the 3D tag map settings window (low RAM, CPU cores, direct DB).")
+        self.settings_button.setToolTip("Open the 3D tag map settings window.\nShortcut: F3")
         self.settings_button.clicked.connect(self.open_settings_dialog)
-        layout.addWidget(self.settings_button)
+        btn_row.addWidget(self.settings_button)
+
+        # Help button (opens the manual window)
+        self.help_button = QPushButton("\U0001F4D6")  # book (manual)
+        self.help_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {BLUE_60};
+                color: {RED_A};
+                padding: 8px;
+                font-size: 12px;
+                border-radius: 5px;
+            }}
+            QPushButton:hover {{
+                background-color: rgb(80, 100, 200);
+            }}
+        """)
+        self.help_button.setToolTip("Open the Hydruxiom manual (controls and interactions).")
+        self.help_button.clicked.connect(self.open_manual_dialog)
+        btn_row.addWidget(self.help_button)
+
+        layout.addLayout(btn_row)
 
         # Smart Scale master toggle: when on, after data loads the app picks a
         # profile by file count and overwrites UMAP/DBSCAN/visualization settings.
@@ -199,11 +337,9 @@ class UIConstructionMixin:
         self.client_combo.currentTextChanged.connect(self._populate_tag_services)
         client_layout.addRow("Client:", self.client_combo)
 
-        self.chunk_size_spin = QSpinBox()
-        self.chunk_size_spin.setRange(50, 100000000)
-        self.chunk_size_spin.setValue(8192)
-        self.chunk_size_spin.setToolTip("Number of files to fetch per API request.\nLarger = faster but may timeout.\nSmaller = more requests but more reliable.\nDefault: 8192")
-        client_layout.addRow("Chunk Size:", self.chunk_size_spin)
+        # (Chunk Size moved to the Settings window -> Clients tab. The spinbox is
+        # created there and stored on this tab as self.chunk_size_spin, so all
+        # existing references keep working.)
 
         self.max_files_spin = QSpinBox()
         self.max_files_spin.setRange(1, 100000000)
@@ -377,15 +513,73 @@ class UIConstructionMixin:
         self._filter_layout = filter_layout
 
         filter_group.setLayout(filter_layout)
-        # Order: Client -> Filter -> Algorithm -> Cluster (Filter sits below Client).
+        # Left panel order: Client -> Filter. The Algorithm + Cluster groups are
+        # moved to the right sidebar "Algorithm" tab by _reorganize_sidebars().
         layout.addWidget(filter_group)
-        layout.addWidget(algo_group)
-        layout.addWidget(cluster_group)
 
-        # Camera Wobble Group (for depth perception) — moved to right sidebar "Visuals" tab
-        wobble_group = QGroupBox("Camera Wobble (Depth Effect)")
-        wobble_group.setToolTip("Continuous camera movement to create depth perception through parallax.")
+        # WASD Navigation group: appearance of the W/S/A/D preview arrows + a toggle
+        # to keep them visible (anchored on the largest cohort when nothing selected).
+        wasd_group = QGroupBox("WASD Navigation")
+        wasd_group.setToolTip("Appearance and behavior of the W/S/A/D navigation preview arrows.")
+        wl_layout = QFormLayout()
+
+        self.wasd_persistent_checkbox = QCheckBox("Keep WASD labels visible")
+        self.wasd_persistent_checkbox.setChecked(getattr(self, 'wasd_persistent_labels', False))
+        self.wasd_persistent_checkbox.stateChanged.connect(self._on_wasd_persistent_toggled)
+        self.wasd_persistent_checkbox.setToolTip(
+            "When enabled the W/S/A/D direction arrows stay on screen instead of\n"
+            "fading out after you stop navigating. With no cohort selected they anchor\n"
+            "on the largest cohort, so you can always see where each direction leads."
+        )
+        wl_layout.addRow(self.wasd_persistent_checkbox)
+
+        self.wasd_line_btn = QPushButton("")
+        self.wasd_line_btn.setFixedWidth(80)
+        _wlc = getattr(self, 'wasd_line_color', (80, 255, 140))
+        self.wasd_line_btn.setStyleSheet(f"background-color: rgb({int(_wlc[0])},{int(_wlc[1])},{int(_wlc[2])}); border: 1px solid #4050a0;")
+        self.wasd_line_btn.clicked.connect(self._pick_wasd_line_color)
+        self.wasd_line_btn.setToolTip("Color of the W/S/A/D path lines. Click to change.")
+        wl_layout.addRow("Line Color:", self.wasd_line_btn)
+
+        self.wasd_letter_btn = QPushButton("")
+        self.wasd_letter_btn.setFixedWidth(80)
+        _wcc = getattr(self, 'wasd_letter_color', (80, 255, 140))
+        self.wasd_letter_btn.setStyleSheet(f"background-color: rgb({int(_wcc[0])},{int(_wcc[1])},{int(_wcc[2])}); border: 1px solid #4050a0;")
+        self.wasd_letter_btn.clicked.connect(self._pick_wasd_letter_color)
+        self.wasd_letter_btn.setToolTip("Color of the W/S/A/D letter labels. Click to change.")
+        wl_layout.addRow("Letter Color:", self.wasd_letter_btn)
+
+        self.wasd_label_spin = QSpinBox()
+        self.wasd_label_spin.setRange(8, 120)
+        try:
+            self.wasd_label_spin.setValue(int(getattr(self, 'wasd_label_size', 36)))
+        except (TypeError, ValueError):
+            self.wasd_label_spin.setValue(36)
+        self.wasd_label_spin.valueChanged.connect(self._on_wasd_label_size_changed)
+        self.wasd_label_spin.setToolTip("Font size of the W/S/A/D letter labels.")
+        wl_layout.addRow("Label Size:", self.wasd_label_spin)
+
+        wasd_group.setLayout(wl_layout)
+        layout.addWidget(wasd_group)
+
+        self._algo_group = algo_group
+        self._cluster_group = cluster_group
+
+        # Camera Settings Group: orbit speed + wobble (depth effect). Placed in
+        # the right sidebar "Visuals" tab by _reorganize_sidebars(). Orbit Speed
+        # lives here (not in Visualization Settings) because it controls the
+        # camera, not node appearance.
+        wobble_group = QGroupBox("Camera Settings")
+        wobble_group.setToolTip("Camera behavior: arrow-key orbit speed and continuous wobble for depth perception.")
         wobble_layout = QFormLayout()
+
+        self.orbit_speed_spin = QDoubleSpinBox()
+        self.orbit_speed_spin.setRange(0.1, 50.0)
+        self.orbit_speed_spin.setValue(0.2)
+        self.orbit_speed_spin.setDecimals(2)
+        self.orbit_speed_spin.setSingleStep(0.1)
+        self.orbit_speed_spin.setToolTip("Speed of camera orbit when using arrow keys.\nLower = slower, more precise movement.\nHigher = faster camera rotation.\nDefault: 0.2")
+        wobble_layout.addRow("Orbit Speed:", self.orbit_speed_spin)
 
         self.wobble_enabled_checkbox = QCheckBox()
         self.wobble_enabled_checkbox.setChecked(False)
@@ -444,6 +638,15 @@ class UIConstructionMixin:
         self.wobble_spin_azim = 0.0    # continuous-spin azimuth accumulator
         self.wobble_user_interacting = False  # True while user drags (pauses wobble)
 
+        # --- Action buttons: pinned to the BOTTOM of the sidebar (outside the
+        # scroll area) so they stay reachable while the settings groups above
+        # scroll. The Split | Pop | Cut row is inserted into this container by
+        # _reorganize_sidebars().
+        actions = QWidget()
+        self._left_actions_layout = QVBoxLayout(actions)
+        self._left_actions_layout.setContentsMargins(0, 0, 0, 0)
+        self._left_actions_layout.setSpacing(6)
+
         # Load Button and Progress
         self.load_button = QPushButton("Load and Compute")
         self.load_button.setStyleSheet(f"""
@@ -463,7 +666,7 @@ class UIConstructionMixin:
         """)
         self.load_button.setToolTip("Load files from Hydrus and compute the full 3D map\n(query -> tags -> UMAP/PCA -> DBSCAN).\nShortcut: F5")
         self.load_button.clicked.connect(self.start_loading)
-        layout.addWidget(self.load_button)
+        self._left_actions_layout.addWidget(self.load_button)
 
         self.recompute_button = QPushButton("Recompute")
         self.recompute_button.setStyleSheet(f"""
@@ -484,7 +687,7 @@ class UIConstructionMixin:
         self.recompute_button.setEnabled(False)
         self.recompute_button.clicked.connect(self.start_recompute)
         self.recompute_button.setToolTip("Re-run UMAP/PCA only with new settings using currently loaded data.\nClustering is separate (use Regroup).\nShortcut: F6")
-        layout.addWidget(self.recompute_button)
+        self._left_actions_layout.addWidget(self.recompute_button)
 
         # Regroup + Optimize row: Regroup takes ~3/4 width, Optimize is a small icon (~1/4)
         regroup_row = QHBoxLayout()
@@ -511,8 +714,8 @@ class UIConstructionMixin:
         self.recluster_button.setToolTip("Re-run DBSCAN only on current positions (no UMAP/PCA re-run). Use after changing eps/min_samples.\nShortcut: F7")
         regroup_row.addWidget(self.recluster_button, 3)
 
-        # Optimize: small icon button next to Regroup
-        self.optimize_button = QPushButton("⚙")
+        # Optimize: small icon button next to Regroup (rocket = automation/speed)
+        self.optimize_button = QPushButton("\U0001F680")  # rocket
         self.optimize_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: rgb(60, 80, 160);
@@ -537,7 +740,7 @@ class UIConstructionMixin:
         )
         regroup_row.addWidget(self.optimize_button, 1)
 
-        layout.addLayout(regroup_row)
+        self._left_actions_layout.addLayout(regroup_row)
 
         # Deorphan: assign each noise (-1) node to its nearest non-noise cohort.
         self.deorphan_button = QPushButton("Deorphan")
@@ -563,7 +766,11 @@ class UIConstructionMixin:
             "nearest non-orphan node. No re-clustering — just re-labels orphans.\n"
             "Use after Regroup when you want fewer unassigned nodes."
         )
-        layout.addWidget(self.deorphan_button)
+        self._left_actions_layout.addWidget(self.deorphan_button)
+
+        # (Split | Pop | Cut row is inserted into this actions container by
+        # _reorganize_sidebars(), because those buttons are created later in
+        # create_right_sidebar.)
 
         # Clear button - drop the current session data and free resources
         self.clear_button = QPushButton("Clear")
@@ -584,27 +791,37 @@ class UIConstructionMixin:
         """)
         self.clear_button.setToolTip("Drop the current session data (scene graph, node list,\nGPU buffers) and clear the view.\nFrees memory before starting a new load.\nShortcut: Ctrl+X")
         self.clear_button.clicked.connect(self.clear_session)
-        layout.addWidget(self.clear_button)
+        self._left_actions_layout.addWidget(self.clear_button)
+
+        # Trailing stretch: keeps all content top-aligned when the scroll area's
+        # page is stretched to fill the viewport (setWidgetResizable). Without it,
+        # the group boxes above would expand and look "stretched over the area".
+        layout.addStretch()
 
         # Session buttons are now automatic (hidden). Objects kept for setEnabled compat.
         self.save_session_button = QPushButton()  # hidden, auto-saved after each load
         self.load_session_button = QPushButton()  # hidden, auto-loaded on startup
 
+        # Progress bar + phase/status labels are pinned to the BOTTOM of the
+        # sidebar (outside the scroll area) so they stay visible while scrolling.
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
-        layout.addWidget(self.progress_bar)
 
         # Phase label - shows which pipeline stage is currently running
         self.phase_label = QLabel("Phase: Idle")
         self.phase_label.setStyleSheet(f"color: {BLUE_60}; font-size: 11px; font-weight: bold;")
-        layout.addWidget(self.phase_label)
 
         self.status_label = QLabel("Ready")
         self.status_label.setStyleSheet(f"color: {RED_A}; font-size: 12px;")
-        layout.addWidget(self.status_label)
 
-        layout.addStretch()
-        panel.setLayout(layout)
+        scroll = self._make_scrollable(content)
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        outer.addWidget(scroll, stretch=1)
+        outer.addWidget(actions)  # pinned action buttons (bottom, above status)
+        for w in (self.progress_bar, self.phase_label, self.status_label):
+            outer.addWidget(w)
         return panel
 
     def create_3d_view(self):
@@ -808,7 +1025,9 @@ class UIConstructionMixin:
             
             # Create the custom view widget
             view = RightClickGLView(self)
-            view.setBackgroundColor((0, 0, 0, 255))  # Complete black
+            # Background from settings (default black; applied again after load_settings)
+            _bg = getattr(self, 'bg_color', (0.0, 0.0, 0.0))
+            view.setBackgroundColor((int(_bg[0]*255), int(_bg[1]*255), int(_bg[2]*255), 255))
             view.setCameraPosition(distance=200, elevation=30, azimuth=45)
             
             # Add grid (hidden)
@@ -834,11 +1053,23 @@ class UIConstructionMixin:
             return fallback
 
     def create_right_sidebar(self):
-        """Create the right sidebar with actions panel."""
+        """Create the right sidebar with actions panel.
+
+        The tab pages (Stats | Visuals, built in _reorganize_sidebars) are each
+        wrapped in a scroll area so their content scrolls instead of being
+        squished on low-resolution screens; "Send to Tab" stays pinned at the
+        bottom outside the tabs.
+        """
         sidebar = QWidget()
         sidebar.setMinimumWidth(200)
         sidebar.setMaximumWidth(350)
-        layout = QVBoxLayout(sidebar)
+        self._right_outer_layout = QVBoxLayout(sidebar)
+        self._right_outer_layout.setContentsMargins(0, 0, 0, 0)
+        self._right_outer_layout.setSpacing(15)
+
+        # Placeholder layout; the real tab pages are assembled in
+        # _reorganize_sidebars() from the groups created below.
+        layout = QVBoxLayout()
         layout.setSpacing(15)
 
         # Selected File Info (moved from bottom panel)
@@ -967,8 +1198,8 @@ class UIConstructionMixin:
         self.send_status_label.setWordWrap(True)
         send_layout.addWidget(self.send_status_label)
 
-        # Explore button
-        self.time_travel_button = QPushButton("Explore")
+        # Explore button (play symbol — starts the camera tour)
+        self.time_travel_button = QPushButton("\u25B6")  # play triangle
         self.time_travel_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: {BLUE_60};
@@ -984,13 +1215,15 @@ class UIConstructionMixin:
                 background-color: {GRAY_40};
             }}
         """)
-        self.time_travel_button.setToolTip("Fly the camera through the largest cluster centroids to explore the map.")
+        self.time_travel_button.setToolTip("Explore: fly the camera through the largest cluster centroids.\nShortcut-free tour — click again to stop.")
         self.time_travel_button.clicked.connect(self._toggle_time_travel)
         self.time_travel_button.setEnabled(False)  # Enabled when data is loaded
         send_layout.addWidget(self.time_travel_button)
 
-        # Cut out button - select the cohort nodes and remove everything else
-        self.cut_button = QPushButton("Cut out")
+        # Cohort action buttons (Split / Pop / Cut) are created here but placed
+        # in the LEFT panel between Deorphan and Clear by _reorganize_sidebars().
+        # Cut - select the cohort nodes and remove everything else
+        self.cut_button = QPushButton("Cut")
         self.cut_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: {BLUE_60};
@@ -1009,10 +1242,9 @@ class UIConstructionMixin:
         self.cut_button.setToolTip("Cut out the selected cohort - keep only its nodes\nand remove everything else from the view.\nShortcut: Ctrl+E")
         self.cut_button.clicked.connect(self._cut_selected_cohort)
         self.cut_button.setEnabled(False)  # Enabled when a cohort is selected
-        send_layout.addWidget(self.cut_button)
 
         # Pop button - remove the selected cohort from the view (inverse of Cut out)
-        self.pop_button = QPushButton("Pop cohort")
+        self.pop_button = QPushButton("Pop")
         self.pop_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: {BLUE_60};
@@ -1031,10 +1263,9 @@ class UIConstructionMixin:
         self.pop_button.setToolTip("Remove the selected cohort from the view\n(keep everything else). Positions of remaining nodes stay unchanged.\nShortcut: Ctrl+R")
         self.pop_button.clicked.connect(self._pop_selected_cohort)
         self.pop_button.setEnabled(False)  # Enabled when a cohort is selected
-        send_layout.addWidget(self.pop_button)
 
         # Split group button - apply cluster algo on selection, keep positions
-        self.cluster_button = QPushButton("Split group")
+        self.cluster_button = QPushButton("Split")
         self.cluster_button.setStyleSheet(f"""
             QPushButton {{
                 background-color: {BLUE_60};
@@ -1053,7 +1284,6 @@ class UIConstructionMixin:
         self.cluster_button.setToolTip("Split the selected cohort into sub-groups using the cluster\nalgorithm on its existing positions.\nPositions stay unchanged; only coloring/labels change.\nShortcut: Ctrl+S")
         self.cluster_button.clicked.connect(self._recluster_selection)
         self.cluster_button.setEnabled(False)  # Enabled when a cohort is selected
-        send_layout.addWidget(self.cluster_button)
 
         send_group.setLayout(send_layout)
         self._send_group = send_group  # reorganized into tabs in setup_ui
@@ -1073,6 +1303,33 @@ class UIConstructionMixin:
         self.min_size_spin.setToolTip("Node size in the 3D view.\nDisplay value is x10 of the actual size.\nDefault: 0.2 (actual: 0.02)")
         vis_layout.addRow("Node Size:", self.min_size_spin)
 
+        # Node Sizing mode — how node size relates to camera distance / screen.
+        self.node_sizing_combo = QComboBox()
+        self.node_sizing_combo.addItems([
+            "Distance",                 # legacy: perspective scaling (default)
+            "Screen-constant",          # relative: constant pixel size on screen
+            "Uniform single size",      # perf probe: one minimal fixed size
+            "Auto-scale to view distance",  # far -> larger, near -> smaller
+        ])
+        _ns_idx = self.node_sizing_combo.findText(getattr(self, 'node_sizing_mode', "Distance"))
+        if _ns_idx >= 0:
+            self.node_sizing_combo.setCurrentIndex(_ns_idx)
+        else:
+            self.node_sizing_combo.setCurrentIndex(0)
+        self.node_sizing_combo.currentTextChanged.connect(self._on_node_sizing_changed)
+        self.node_sizing_combo.setToolTip(
+            "How node size behaves relative to the camera:\n"
+            "- Distance (default): nodes scale with distance — bigger when close\n"
+            "  (classic perspective look).\n"
+            "- Screen-constant: nodes keep a fixed pixel size on screen regardless of\n"
+            "  how far the camera is.\n"
+            "- Uniform single size: every node uses one minimal fixed size — no scaling\n"
+            "  at all. A performance probe (disabling per-node size variation).\n"
+            "- Auto-scale to view distance: nodes grow when you zoom out and shrink\n"
+            "  when you zoom in, so they stay visible without overdraw."
+        )
+        vis_layout.addRow("Node Sizing:", self.node_sizing_combo)
+
         self.spread_spin = QDoubleSpinBox()
         self.spread_spin.setRange(0.1, 10.0)
         self.spread_spin.setValue(1.0)
@@ -1082,14 +1339,8 @@ class UIConstructionMixin:
         self.spread_spin.setToolTip("Scale factor for spreading nodes apart in 3D space.\n1.0 = original algorithm output.\nHigher = nodes spread further apart.\nUseful for seeing clusters more clearly.\nDefault: 1.0")
         vis_layout.addRow("Spread:", self.spread_spin)
 
-        self.orbit_speed_spin = QDoubleSpinBox()
-        self.orbit_speed_spin.setRange(0.1, 50.0)
-        self.orbit_speed_spin.setValue(0.2)
-        self.orbit_speed_spin.setDecimals(2)
-        self.orbit_speed_spin.setSingleStep(0.1)
-        self.orbit_speed_spin.setToolTip("Speed of camera orbit when using arrow keys.\nLower = slower, more precise movement.\nHigher = faster camera rotation.\nDefault: 0.2")
-        vis_layout.addRow("Orbit Speed:", self.orbit_speed_spin)
-
+        # (Orbit Speed moved to the Camera Settings group — it controls the
+        # camera, not node appearance.)
         self.transparency_spin = QDoubleSpinBox()
         self.transparency_spin.setRange(0.0, 1.0)
         self.transparency_spin.setValue(0.8)
@@ -1098,6 +1349,27 @@ class UIConstructionMixin:
         self.transparency_spin.valueChanged.connect(self._on_transparency_changed)
         self.transparency_spin.setToolTip("Alpha (transparency) of nodes in the 3D view.\n0.0 = fully transparent, 1.0 = fully opaque.\nDefault: 0.8")
         vis_layout.addRow("Transparency:", self.transparency_spin)
+
+        # Node blending mode — controls how overlapping nodes combine color.
+        self.node_blending_combo = QComboBox()
+        self.node_blending_combo.addItems(["Additive", "Normal Alpha", "Simple"])
+        _nb_idx = self.node_blending_combo.findText(getattr(self, 'node_blending', "Normal Alpha"))
+        if _nb_idx >= 0:
+            self.node_blending_combo.setCurrentIndex(_nb_idx)
+        else:
+            self.node_blending_combo.setCurrentIndex(0)
+        self.node_blending_combo.currentTextChanged.connect(self._on_node_blending_changed)
+        self.node_blending_combo.setToolTip(
+            "How overlapping nodes combine color in the 3D view:\n"
+            "- Normal Alpha (default): standard alpha blending; same-hue overlaps\n"
+            "  converge to that hue instead of blowing out. Density still visible.\n"
+            "- Additive: colors accumulate where nodes overlap and saturate to\n"
+            "  white at high density. Shows density, but loses hue.\n"
+            "- Simple: no blending — the nearest node wins per pixel, so overlaps\n"
+            "  keep their exact shape and color (no density cue).\n"
+            "All three cost ~the same; applies live."
+        )
+        vis_layout.addRow("Node Blending:", self.node_blending_combo)
 
         # Dim non-selected nodes when a selection is active
         self.dim_non_selected_checkbox = QCheckBox("Dim Non-Selected on Selection")
@@ -1123,6 +1395,16 @@ class UIConstructionMixin:
         self.highlight_color_btn.clicked.connect(self._pick_highlight_color)
         self.highlight_color_btn.setToolTip("Color used to highlight the selected cluster or node.\nClick to choose a custom color.")
         vis_layout.addRow("Highlight Color:", self.highlight_color_btn)
+
+        # 3D view background color (default: black, matching legacy behavior)
+        self.bg_color = getattr(self, 'bg_color', (0.0, 0.0, 0.0))
+        self.bg_color_btn = QPushButton("")
+        self.bg_color_btn.setFixedWidth(80)
+        r, g, b = int(self.bg_color[0]*255), int(self.bg_color[1]*255), int(self.bg_color[2]*255)
+        self.bg_color_btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 1px solid #4050a0;")
+        self.bg_color_btn.clicked.connect(self._pick_bg_color)
+        self.bg_color_btn.setToolTip("Background color of the 3D view.\nClick to choose a custom color.")
+        vis_layout.addRow("View Background:", self.bg_color_btn)
 
         # Reset the persistent WASD travel trail (translucent turquoise line of
         # every cohort visited via W/S/A/D navigation).
@@ -1184,10 +1466,24 @@ class UIConstructionMixin:
 
         # V5: Color Scheme dropdown
         self.color_scheme_combo = QComboBox()
-        self.color_scheme_combo.addItems(["Pastel", "Viridis", "Plasma", "Inferno", "Coolwarm"])
-        self.color_scheme_combo.setCurrentText("Pastel")
+        # Render each option's letters in its own scheme colors (popup + closed display).
+        _cs_delegate = _ColorSchemeDelegate(self)
+        self.color_scheme_combo.setItemDelegate(_cs_delegate)
+        self.color_scheme_combo.view().setItemDelegate(_cs_delegate)
+        self.color_scheme_combo.addItems(["Pastel", "Nature", "Sci-Fi", "Viridis", "Plasma", "Inferno", "Coolwarm"])
+        _cs_idx = self.color_scheme_combo.findText(getattr(self, 'color_scheme', "Pastel"))
+        if _cs_idx >= 0:
+            self.color_scheme_combo.setCurrentIndex(_cs_idx)
+        else:
+            self.color_scheme_combo.setCurrentText("Pastel")
         self.color_scheme_combo.currentTextChanged.connect(self._on_color_scheme_changed)
-        self.color_scheme_combo.setToolTip("Color scheme for cluster nodes.\nPastel = Default soft colors.\nViridis/Plasma/Inferno/Coolwarm = Matplotlib colormaps.")
+        self.color_scheme_combo.setToolTip(
+            "Color scheme for cluster nodes:\n"
+            "- Pastel (default): soft, distinct colors.\n"
+            "- Nature: green / camouflage tones.\n"
+            "- Sci-Fi: cool clean blues, cyans and purples.\n"
+            "- Viridis/Plasma/Inferno/Coolwarm: Matplotlib colormaps."
+        )
         vis_layout.addRow("Color Scheme:", self.color_scheme_combo)
 
         # Anti-noise / quality settings
@@ -1446,37 +1742,39 @@ class UIConstructionMixin:
         self._importance_group = importance_group  # reorganized into tabs in setup_ui
         layout.addWidget(importance_group)
 
-        layout.addStretch()
-        sidebar.setLayout(layout)
+        # No stretch / setLayout here: _reorganize_sidebars() wraps the groups
+        # in scrollable tab pages and assembles them into self._right_outer_layout.
         return sidebar
 
     def _reorganize_sidebars(self):
         """Reorganize the right sidebar into tabs and move shared widgets.
 
         Called from setup_ui after both sidebars are built:
-        - Right sidebar gets a tab bar (Actions | Visuals).
-        - Camera Wobble group moves from left panel to the Visuals tab.
+        - Right sidebar gets a tab bar (Stats | Visuals); each tab page is
+          scrollable so content scrolls instead of squishing on small screens.
+        - Camera Settings group (orbit speed + wobble) moves to the Visuals tab.
         - Tag query grid moves from "Selected File Info" into Filter Settings (left).
         - Status label + progress bar are pinned to the left sidebar bottom.
         - "Send to Tab" is pinned to the right sidebar bottom (below the tabs).
         """
-        # --- Right sidebar: wrap existing groups in a QTabWidget ---
-        right_layout = self.right_sidebar.layout()
+        # --- Right sidebar: wrap existing groups in scrollable tab pages ---
+        def _tab_page(*groups):
+            page = QWidget()
+            lay = QVBoxLayout(page)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(15)
+            for g in groups:
+                lay.addWidget(g)
+            # Trailing stretch keeps content top-aligned when the page is
+            # stretched to fill the viewport (setWidgetResizable).
+            lay.addStretch()
+            return self._make_scrollable(page)
 
-        visuals_tab = QWidget()
-        visuals_lay = QVBoxLayout(visuals_tab)
-        visuals_lay.setContentsMargins(0, 0, 0, 0)
-        visuals_lay.addWidget(self._vis_group)
-        visuals_lay.addWidget(self.wobble_group)      # moved from left panel
-        visuals_lay.addWidget(self._cohort_group)
-
-        actions_tab = QWidget()
-        actions_lay = QVBoxLayout(actions_tab)
-        actions_lay.setContentsMargins(0, 0, 0, 0)
-        actions_lay.addWidget(self._info_group)
-        actions_lay.addWidget(self._selection_tags_group)
-        # Tag importance sits directly under Cohort Tag Data.
-        actions_lay.addWidget(self._importance_group)
+        visuals_tab = _tab_page(self._vis_group, self.wobble_group, self._cohort_group)
+        actions_tab = _tab_page(self._info_group, self._selection_tags_group,
+                                self._importance_group)  # importance under cohort tags
+        # Algorithm + Cluster groups moved here from the left sidebar.
+        algo_tab = _tab_page(self._algo_group, self._cluster_group)
 
         self.right_tabs = QTabWidget()
         self.right_tabs.setStyleSheet(f"""
@@ -1500,23 +1798,22 @@ class UIConstructionMixin:
         """)
         self.right_tabs.addTab(actions_tab, "Stats")
         self.right_tabs.addTab(visuals_tab, "Visuals")
+        self.right_tabs.addTab(algo_tab, "Algorithm")
 
-        # Insert the tab widget at the top of the right sidebar (before the stretch).
-        right_layout.insertWidget(0, self.right_tabs)
+        # Tabs fill the right sidebar; "Send to Tab" stays pinned below them.
+        self._right_outer_layout.addWidget(self.right_tabs, stretch=1)
+        self._right_outer_layout.addWidget(self._send_group)
 
-        # --- Pin "Send to Tab" to the bottom of the right sidebar (below tabs) ---
-        # The sidebar layout ends with a stretch; adding after it keeps the group
-        # at the very bottom regardless of tab content height.
-        right_layout.addWidget(self._send_group)
-
-        # --- Move status label + progress bar to the left sidebar bottom ---
-        # The left panel layout ends with a stretch, so widgets added after it
-        # sit at the very bottom of the left sidebar.
-        left_layout = self.left_sidebar.layout()
-        for w in (self.progress_bar, self.phase_label, self.status_label):
-            if w is not None:
-                w.setParent(self.left_sidebar)
-                left_layout.addWidget(w)
+        # --- Move Split | Pop | Cut row to the left panel actions area, between Deorphan and Clear ---
+        # The buttons are created in create_right_sidebar; adding them to a layout
+        # reparents them automatically.
+        cohort_row = QHBoxLayout()
+        cohort_row.setSpacing(6)
+        for b in (self.cluster_button, self.pop_button, self.cut_button):
+            cohort_row.addWidget(b, 1)
+        _clear_idx = self._left_actions_layout.indexOf(self.clear_button)
+        if _clear_idx >= 0:
+            self._left_actions_layout.insertLayout(_clear_idx, cohort_row)
 
         # --- Move tag query grid into Filter Settings (left panel) ---
         if hasattr(self, '_filter_layout') and getattr(self, 'tag_container', None) is not None:

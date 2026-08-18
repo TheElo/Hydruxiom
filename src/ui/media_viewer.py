@@ -14,6 +14,7 @@ the orchestrator while this module owns all viewer UI + loading.
 
 import json
 import os
+from io import BytesIO
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox,
@@ -117,6 +118,13 @@ class TagMap3DSplitWindow(QWidget):
             if item and hasattr(item, 'widget'):
                 widget = item.widget()
                 if widget:
+                    # CRITICAL: hide BEFORE detaching. Detaching a VISIBLE child
+                    # with setParent(None) makes Qt promote it to its own
+                    # top-level OS window (titled with the app name) — this is
+                    # what caused the flashing white windows when switching
+                    # cohorts rapidly (one per visible thumbnail). Hiding first
+                    # keeps the widget child-only until deleteLater() cleans up.
+                    widget.hide()
                     widget.setParent(None)
                     widget.deleteLater()
         self.cohort_tiles = []
@@ -127,11 +135,23 @@ class TagMap3DSplitWindow(QWidget):
         self.single_file_label.hide()
         self.scroll_area.show()
 
+    def restore_grid(self):
+        """Re-show the existing thumbnail grid without rebuilding it.
+
+        Used when returning from a full-res zoom: the grid widgets are still in
+        place (zooming only hid the scroll area), so this is instant — no image
+        re-fetch, unlike clear_grid() + reload.
+        """
+        self._zoomed_file_id = None
+        self.single_file_label.hide()
+        self.scroll_area.show()
+
     def show_single_image(self, pixmap, tooltip="", file_id=None):
         """Show a single full-res image scaled to fill the window.
 
         If ``file_id`` is given (thumbnail zoom), clicking the image again goes
-        back to the grid; otherwise (node selection) it just displays.
+        back to the grid; otherwise (node selection) it just displays. The grid
+        itself is NOT cleared — only hidden — so returning to it is instant.
         """
         self._single_file_pixmap = pixmap
         self.single_file_label.setToolTip(tooltip)
@@ -285,28 +305,45 @@ class TagMap3DSplitWindow(QWidget):
 
 
 class SplitWindowLoader(QThread):
-    """Background worker for loading thumbnails into the split window."""
-    pixmap_ready = Signal(object, str)  # pixmap, tooltip
+    """Background worker for fetching thumbnails into the split window.
+
+    IMPORTANT: only network I/O happens here. The raw image BYTES are emitted;
+    QPixmap creation/scaling is done on the MAIN thread by the receiver.
+    Creating QPixmaps from a non-GUI thread is undefined behavior in Qt and,
+    on Windows/ANGLE, can spawn transient offscreen windows (the "small white
+    window flashes" users saw when loading large cohorts).
+
+    Cancellation: call cancel() to stop fetching further thumbnails as soon as
+    possible (checked between requests). Used when the user selects a different
+    cohort mid-load — finishing the old load would only waste network + CPU.
+    The single in-flight request completes; no new ones start after that.
+    """
+    bytes_ready = Signal(object, str)  # image bytes, tooltip
     finished = Signal()
 
-    def __init__(self, client_name, file_ids, image_size, parent=None):
+    def __init__(self, client_name, file_ids, parent=None):
         super().__init__(parent)
         self.client_name = client_name
         self.file_ids = file_ids
-        self.image_size = image_size
+        self._cancelled = False
+
+    def cancel(self):
+        """Request cooperative cancellation (takes effect between fetches)."""
+        self._cancelled = True
 
     def run(self):
         try:
             from src.utils.utility_functions import ConnectToClient
-            from src.utils.image_loader import load_pixmap_with_lanczos
             client = ConnectToClient(self.client_name)
             for file_id in self.file_ids:
+                if self._cancelled:
+                    break  # selection changed — stop wasting requests
                 try:
                     response = client.get_thumbnail(file_id=file_id)
-                    if response and hasattr(response, 'content'):
-                        pixmap = load_pixmap_with_lanczos(response.content, max_size=self.image_size)
-                        if pixmap:
-                            self.pixmap_ready.emit(pixmap, f"File {file_id}")
+                    if self._cancelled:
+                        break
+                    if response and hasattr(response, 'content') and response.content:
+                        self.bytes_ready.emit(bytes(response.content), f"File {file_id}")
                 except Exception as e:
                     print(f"Error loading file {file_id}: {e}")
         except Exception as e:
@@ -315,39 +352,64 @@ class SplitWindowLoader(QThread):
 
 
 class SingleFileLoader(QThread):
-    """Background worker for loading a single full-res file from Hydrus.
+    """Background worker for fetching a single full-res file from Hydrus.
 
     Uses client.get_file() (full resolution) instead of get_thumbnail().
-    The in-memory pixmap is capped at 4096px on the longest side to keep
-    memory bounded; the split window scales it to fit for display.
-    """
-    pixmap_ready = Signal(object, str)  # pixmap, tooltip
-    finished = Signal()
+    Like SplitWindowLoader, only the network fetch runs here — the bytes are
+    emitted and decoded on the main thread (QPixmap is not thread-safe). The
+    receiver caps the result at 4096px on the longest side to bound memory.
 
-    MAX_PIXELS = 4096
+    Cancellation: cancel() before start() skips the fetch entirely; after
+    start() it only suppresses emitting the result once it arrives.
+    """
+    bytes_ready = Signal(object, str)  # image bytes, tooltip
+    finished = Signal()
 
     def __init__(self, client_name, file_id, parent=None):
         super().__init__(parent)
         self.client_name = client_name
         self.file_id = file_id
+        self._cancelled = False
+
+    def cancel(self):
+        """Request cooperative cancellation (see class docstring)."""
+        self._cancelled = True
 
     def run(self):
+        if self._cancelled:
+            return  # cancelled before start — skip the fetch entirely
         try:
-            from PySide6.QtGui import QPixmap
             from src.utils.utility_functions import ConnectToClient
             client = ConnectToClient(self.client_name)
             response = client.get_file(file_id=self.file_id)
-            if response and hasattr(response, 'content'):
-                pixmap = QPixmap()
-                if pixmap.loadFromData(response.content):
-                    # Cap in-memory size (longest side) to bound memory
-                    if max(pixmap.width(), pixmap.height()) > self.MAX_PIXELS:
-                        pixmap = pixmap.scaled(
-                            self.MAX_PIXELS, self.MAX_PIXELS,
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation
-                        )
-                    self.pixmap_ready.emit(pixmap, f"File {self.file_id}")
+            if not self._cancelled and response and hasattr(response, 'content') and response.content:
+                self.bytes_ready.emit(bytes(response.content), f"File {self.file_id}")
         except Exception as e:
             print(f"Error loading full-res file {self.file_id}: {e}")
         self.finished.emit()
+
+
+def decode_image_bytes(image_bytes, max_size=None):
+    """Decode raw image bytes into a QPixmap ON THE CALLING (main) thread.
+
+    Downscaling is done with PIL's LANCZOS filter before the QPixmap is created,
+    so full-resolution data never has to be scaled by Qt afterwards. Returns
+    None if the data cannot be decoded. ``max_size`` caps the longest side in
+    pixels (None = keep original size).
+    """
+    from PySide6.QtGui import QPixmap
+    try:
+        from PIL import Image
+        img = Image.open(BytesIO(image_bytes))
+        img.load()
+        if max_size is not None and max(img.width, img.height) > max_size:
+            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA")
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        pixmap = QPixmap()
+        return pixmap if pixmap.loadFromData(buf.getvalue()) else None
+    except Exception as e:
+        print(f"Error decoding image bytes: {e}")
+        return None

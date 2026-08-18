@@ -153,6 +153,9 @@ def load_images_for_window(window_instance, client, file_ids, limit=None, use_pa
 
                         if index < len(black_squares):
                             black_square = black_squares[index]
+                            # Hide before detaching: setParent(None) on a visible
+                            # child promotes it to a top-level OS window (flash).
+                            black_square.hide()
                             black_square.setParent(None)
                             black_square.deleteLater()
         finally:

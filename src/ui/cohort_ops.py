@@ -241,9 +241,10 @@ class CohortOpsMixin:
         min_samples = self.min_samples_spin.value()
         node_size = float(self.min_size_spin.value()) / 10.0
 
-        # Use existing positions (no re-reduce); cluster_nodes are array indices
-        spread = float(self.spread_spin.value())
-        positions = self.scene_graph.positions[cluster_nodes] * spread
+        # Use existing RAW positions (no re-reduce). Spread is a DISPLAY-only
+        # transform applied in render_scene; it must NOT be baked into the stored
+        # scene or clustering input, otherwise it gets applied twice after this op.
+        positions = self.scene_graph.positions[cluster_nodes]
 
         # Use SEPARATE sub-clustering settings (independent from global eps/min).
         # The selected cohort is already a dense sub-region; the global eps would
@@ -268,7 +269,8 @@ class CohortOpsMixin:
         # Non-selected nodes keep their original positions and cluster labels.
         n = len(file_ids_arr)
         all_file_ids = list(file_ids_arr)
-        all_positions = self.scene_graph.positions * spread
+        # Store RAW positions (spread applied at display time, not here).
+        all_positions = np.asarray(self.scene_graph.positions, dtype=float)
         all_tag_data = {fid: list((self.tag_data or {}).get(fid, [])) for fid in file_ids_arr}
 
         selected_ids = set(int(file_ids_arr[i]) for i in cluster_nodes)
@@ -373,11 +375,11 @@ class CohortOpsMixin:
         eps = self.eps_spin.value() / 100.0
         min_samples = self.min_samples_spin.value()
         node_size = float(self.min_size_spin.value()) / 10.0
-        spread = float(self.spread_spin.value())
 
-        # Use existing positions for ALL nodes (no re-reduce) — direct array access
+        # Use existing RAW positions for ALL nodes (no re-reduce). Spread is a
+        # display-only transform; baking it in here would double-apply on render.
         all_file_ids = list(self.scene_graph.file_ids)
-        all_positions = self.scene_graph.positions * spread
+        all_positions = np.asarray(self.scene_graph.positions, dtype=float)
         all_tag_data = {fid: list((self.tag_data or {}).get(fid, [])) for fid in all_file_ids}
 
         self.worker.progress.emit(40, "Clustering all positions...")
@@ -554,11 +556,11 @@ class CohortOpsMixin:
         min_samples_max = getattr(self, 'opt_min_samples_max', 30)
 
         node_size = float(self.min_size_spin.value()) / 10.0
-        spread = float(self.spread_spin.value())
 
-        # Use existing positions for ALL nodes (no re-reduce) — direct array access
+        # Use existing RAW positions for ALL nodes (no re-reduce). Spread is a
+        # display-only transform; baking it in here would double-apply on render.
         all_file_ids = list(self.scene_graph.file_ids)
-        all_positions = self.scene_graph.positions * spread
+        all_positions = np.asarray(self.scene_graph.positions, dtype=float)
         all_tag_data = {fid: list((self.tag_data or {}).get(fid, [])) for fid in all_file_ids}
 
         # Normalize ONCE and use the same space for both the parameter search and

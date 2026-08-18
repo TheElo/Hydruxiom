@@ -127,8 +127,9 @@ class PickingHighlightMixin:
         import numpy as np
         scene = self.scene_graph
         positions = scene.positions * float(self.spread_spin.value())
-        node_size = self.min_size_spin.value() / 10.0
-        sizes = np.full(len(scene.file_ids), node_size)
+        # Mode-aware sizing so the cached base matches the live scatter (see
+        # _current_node_sizes / _node_px_mode on the tab).
+        sizes = self._current_node_sizes(len(scene.file_ids))
         colors = scene.colors.astype(np.float64) / 255.0
         alpha = self.transparency_spin.value()
         colors_rgba = np.column_stack([colors, alpha * np.ones(len(colors))])
@@ -137,9 +138,11 @@ class PickingHighlightMixin:
         self._base_positions = positions
         self._base_sizes = sizes
         self._base_colors_rgba = colors_rgba
-        # Re-spawn twinkle nodes if active (positions may have changed)
-        if getattr(self, 'twinkle_active', False):
-            self._spawn_twinkle_nodes()
+        # Sync the star-twinkle effect with the checkbox + new base positions. This
+        # (re)spawns nodes and restarts the timer when twinkle should be on — including
+        # after a session auto-load or any rebuild path — and removes it otherwise.
+        if hasattr(self, '_sync_twinkle'):
+            self._sync_twinkle()
         return positions, sizes, colors_rgba
 
     def _apply_highlight_colors(self, colors_rgba):
@@ -161,21 +164,24 @@ class PickingHighlightMixin:
         if not hasattr(self, '_base_colors_rgba') or self._base_colors_rgba is None:
             self._build_base_scatter()
 
-        # Dim base scatter (persistent, applied once)
+        # Dim base scatter (persistent, applied once). _dim_colors_rgba picks
+        # alpha-dim vs desaturate+darken depending on the active blend mode.
         if self.dim_non_selected_checkbox.isChecked():
-            colors_rgba = self._base_colors_rgba.copy()
-            dim_alpha = self.dim_alpha_spin.value()
-            mask = np.ones(len(colors_rgba), dtype=bool)
+            mask = np.ones(len(self._base_colors_rgba), dtype=bool)
             mask[node_index] = False
-            colors_rgba[mask, 3] = dim_alpha
+            colors_rgba = self._dim_colors_rgba(
+                self._base_colors_rgba, mask, self.dim_alpha_spin.value()
+            )
             self._apply_highlight_colors(colors_rgba)
         else:
             self._apply_highlight_colors(self._base_colors_rgba)
 
-        # Create/update highlight item (single point)
+        # Create/update highlight item (single point). Alpha follows node
+        # transparency so the highlight isn't blindingly bright when nodes are set transparent.
+        hl_alpha = float(self.transparency_spin.value()) if hasattr(self, 'transparency_spin') else 1.0
         self._update_highlight_item(
             positions=self._base_positions[node_index:node_index+1],
-            color=[self.highlight_color[0], self.highlight_color[1], self.highlight_color[2], 1.0]
+            color=[self.highlight_color[0], self.highlight_color[1], self.highlight_color[2], hl_alpha]
         )
 
     def _highlight_cluster(self, cluster_id):
@@ -189,21 +195,26 @@ class PickingHighlightMixin:
         if not hasattr(self, '_base_colors_rgba') or self._base_colors_rgba is None:
             self._build_base_scatter()
 
-        # Dim base scatter (persistent, applied once)
+        # Dim base scatter (persistent, applied once). _dim_colors_rgba picks
+        # alpha-dim vs desaturate+darken depending on the active blend mode.
         if self.dim_non_selected_checkbox.isChecked():
-            colors_rgba = self._base_colors_rgba.copy()
             cluster_ids = self._base_cluster_ids
-            colors_rgba[cluster_ids != cluster_id, 3] = self.dim_alpha_spin.value()
+            colors_rgba = self._dim_colors_rgba(
+                self._base_colors_rgba, cluster_ids != cluster_id,
+                self.dim_alpha_spin.value()
+            )
             self._apply_highlight_colors(colors_rgba)
         else:
             self._apply_highlight_colors(self._base_colors_rgba)
 
-        # Create/update highlight item (cluster points only)
+        # Create/update highlight item (cluster points only). Alpha follows node
+        # transparency so the highlight isn't blindingly bright when nodes are set transparent.
+        hl_alpha = float(self.transparency_spin.value()) if hasattr(self, 'transparency_spin') else 1.0
         cluster_ids = self._base_cluster_ids
         mask = cluster_ids == cluster_id
         self._update_highlight_item(
             positions=self._base_positions[mask],
-            color=[self.highlight_color[0], self.highlight_color[1], self.highlight_color[2], 1.0]
+            color=[self.highlight_color[0], self.highlight_color[1], self.highlight_color[2], hl_alpha]
         )
 
     def _update_highlight_item(self, positions, color):
@@ -224,13 +235,14 @@ class PickingHighlightMixin:
 
         n = len(positions)
         colors = np.tile(np.array(color, dtype=np.float32), (n, 1))
-        sizes = np.full(n, self.min_size_spin.value() / 10.0 * 1.5)  # Slightly larger
+        # Slightly larger than the base nodes; follow the active sizing mode.
+        sizes = self._current_node_sizes(n) * 1.5
 
         self.gl_highlight = gl.GLScatterPlotItem(
             pos=positions,
             size=sizes,
             color=colors,
-            pxMode=False
+            pxMode=self._node_px_mode()
         )
         self.gl_highlight.setVisible(self.selection_visible)
         self.gl_view.addItem(self.gl_highlight)

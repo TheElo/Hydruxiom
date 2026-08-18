@@ -118,6 +118,12 @@ class ClientServicesMixin:
         except Exception:
             pass
 
+    def open_manual_dialog(self):
+        """Open the manual (help) window. Non-modal; safe to reopen."""
+        from src.ui.manual_dialog import ManualDialog
+        dlg = ManualDialog(self)
+        dlg.exec()
+
     def _refresh_client_combo(self):
         """Rebuild the client combo from clients.json, preserving selection.
 

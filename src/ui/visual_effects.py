@@ -38,21 +38,54 @@ class VisualEffectsMixin:
     # ─── Star Twinkle Effect ───────────────────────────────────────────────
 
     def _on_twinkle_toggle(self, state):
-        """Start or stop the star twinkle animation."""
+        """Start or stop the star twinkle animation.
+
+        When no scene is loaded yet (e.g., during load_settings before auto-load),
+        we keep the checkbox checked and set twinkle_active=True so that render_scene
+        will spawn nodes once data arrives — preserving the user's saved intent across
+        restarts without prematurely unchecking the box.
+        """
         # Guard: state attrs may not exist yet during early load_settings()
         if not hasattr(self, 'twinkle_timer'):
             return
         self.twinkle_active = bool(state)
+        has_scene = (hasattr(self, '_base_positions') and self._base_positions is not None
+                     and len(getattr(self, '_base_positions', [])) > 0)
         if self.twinkle_active:
-            if not hasattr(self, '_base_positions') or self._base_positions is None:
-                # No scene loaded yet; disable the checkbox
-                self.twinkle_checkbox.setChecked(False)
+            if not has_scene:
+                # No scene yet — keep checkbox checked; render_scene will spawn.
                 return
             self._spawn_twinkle_nodes()
             self.twinkle_timer.start(33)  # ~30 fps
         else:
             self.twinkle_timer.stop()
             self._remove_twinkle_item()
+
+    def _sync_twinkle(self):
+        """Ensure twinkle state matches the checkbox + scene availability.
+
+        Called after every base-scatter rebuild (render_scene, recluster, color-scheme
+        change, size/spread/transparency changes) so twinkle is correctly spawned or
+        removed regardless of which code path triggered the rebuild.
+        """
+        if not hasattr(self, 'twinkle_checkbox'):
+            return
+        should_be_active = self.twinkle_checkbox.isChecked()
+        has_scene = (hasattr(self, '_base_positions') and self._base_positions is not None
+                     and len(getattr(self, '_base_positions', [])) > 0)
+        if should_be_active and has_scene:
+            # Always (re)spawn + ensure the timer runs. _spawn_twinkle_nodes removes
+            # any existing item first, so this is safe to call repeatedly — it covers
+            # both "was off" and "item got removed by a rebuild / never started".
+            self.twinkle_active = True
+            self._spawn_twinkle_nodes()
+            if not self.twinkle_timer.isActive():
+                self.twinkle_timer.start(33)  # ~30 fps
+        else:
+            if getattr(self, 'twinkle_active', False):
+                self.twinkle_active = False
+                self.twinkle_timer.stop()
+                self._remove_twinkle_item()
 
     def _on_twinkle_param_changed(self):
         """Restart twinkle with new parameters if active."""
@@ -82,14 +115,14 @@ class VisualEffectsMixin:
         self._remove_twinkle_item()
         import pyqtgraph.opengl as gl
         positions = self._base_positions[self.twinkle_indices]
-        node_size = self.min_size_spin.value() / 10.0
-        sizes = np.full(count, node_size * 1.2)
+        # Follow the active sizing mode (slightly larger than base nodes).
+        sizes = self._current_node_sizes(count) * 1.2
         # Initial colors: base colors of those nodes
         base_colors = self._base_colors_rgba[self.twinkle_indices] if hasattr(self, '_base_colors_rgba') else None
         if base_colors is None:
             base_colors = np.tile([0.5, 0.5, 0.5, 1.0], (count, 1))
         self.gl_twinkle = gl.GLScatterPlotItem(
-            pos=positions, size=sizes, color=base_colors, pxMode=False
+            pos=positions, size=sizes, color=base_colors, pxMode=self._node_px_mode()
         )
         self.gl_view.addItem(self.gl_twinkle)
 

@@ -68,7 +68,11 @@ class DataPipelineMixin:
         from src.core.tag_interner import TagInterner
 
         client_name = self.client_combo.currentText()
-        chunk_size = self.chunk_size_spin.value()
+        # Chunk Size is a plain int attribute (edited in Settings -> Clients).
+        try:
+            chunk_size = int(getattr(self, 'chunk_size', 8192))
+        except (TypeError, ValueError):
+            chunk_size = 8192
         max_files = self.max_files_spin.value()
         tag_service = self.tag_service_combo.currentText()
         algorithm = self.algorithm_combo.currentText().lower()

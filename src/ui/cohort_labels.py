@@ -485,7 +485,12 @@ class CohortLabelsMixin:
             print(f"Error capturing dropping labels: {e}")
 
     def _update_cohort_labels(self):
-        """Render dominant-tag labels centered on each cohort in the 3D view."""
+        """Render dominant-tag labels centered on each cohort in the 3D view.
+
+        Always refreshes the WASD preview arrows afterwards (in ``finally`` so it
+        also runs when this method early-returns, e.g. labels disabled) — the
+        arrows are restricted to the labeled cohorts and must track label changes.
+        """
         try:
             import pyqtgraph.opengl as gl
             import numpy as np
@@ -672,6 +677,13 @@ class CohortLabelsMixin:
             import traceback
             print(f"Error updating cohort labels: {e}")
             traceback.print_exc()
+        finally:
+            # No-op unless the arrows should be shown ("Keep WASD labels visible" or
+            # active navigation with a selection).
+            try:
+                self._wasd_redraw_if_active()
+            except Exception as e:
+                print(f"Error redrawing WASD paths after label update: {e}")
 
     def _remove_cohort_labels(self, keep_ids=None):
         """Remove cohort label items from the 3D view.

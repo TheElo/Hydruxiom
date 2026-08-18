@@ -26,7 +26,12 @@ class SettingsPersistenceMixin:
             client_idx = self.client_combo.findText(settings.get("client", ""))
             if client_idx >= 0:
                 self.client_combo.setCurrentIndex(client_idx)
-            self.chunk_size_spin.setValue(settings.get("chunk_size", 8192))
+            # Chunk Size is now a plain int attribute (its spinbox lives in the
+            # Settings window -> Clients tab, not on this widget tree).
+            try:
+                self.chunk_size = int(settings.get("chunk_size", 8192))
+            except (TypeError, ValueError):
+                self.chunk_size = 8192
             self.max_files_spin.setValue(settings.get("max_files", 20000))
             # Populate tag services dynamically for the selected client, then
             # restore the saved tag service selection.
@@ -84,19 +89,25 @@ class SettingsPersistenceMixin:
             self.auto_split_max_cycles = int(settings.get("auto_split_max_cycles", 3))
             # Session auto-save delay (seconds; 0 = save immediately)
             self.session_save_delay = int(settings.get("session_save_delay", 60))
+            # Node blending mode for the 3D scatter (normal alpha = default)
+            _nb = settings.get("node_blending", "Normal Alpha")
+            self.node_blending = _nb if _nb in ("Additive", "Normal Alpha", "Simple") else "Normal Alpha"
+            # Tag query grid layout (columns x rows; max tags shown = cols * rows)
+            self.tag_query_columns = int(settings.get("tag_query_columns", 3))
+            self.tag_query_rows = int(settings.get("tag_query_rows", 14))
             # Explore (helicopter orbit) parameters
             _em = settings.get("explore_mode", "Random")
-            if _em in ("Random", "Linear Path", "Contrast"):
+            if _em in ("Random", "Linear Path", "Contrast", "Size"):
                 self.explore_mode = _em
-            self.explore_show_path = bool(settings.get("explore_show_path", True))
-            self.explore_accel = float(settings.get("explore_accel", 0.6))
-            self.explore_decel = float(settings.get("explore_decel", 0.6))
-            self.explore_orbit_radius_base = float(settings.get("explore_orbit_radius_base", 8.0))
-            self.explore_orbit_size_factor = float(settings.get("explore_orbit_size_factor", 2.0))
+            self.explore_show_path = bool(settings.get("explore_show_path", False))
+            self.explore_accel = float(settings.get("explore_accel", 0.05))
+            self.explore_decel = float(settings.get("explore_decel", 0.05))
+            self.explore_orbit_radius_base = float(settings.get("explore_orbit_radius_base", 0.0))
+            self.explore_orbit_size_factor = float(settings.get("explore_orbit_size_factor", 0.2))
             self.explore_orbit_speed = float(settings.get("explore_orbit_speed", 12.0))
-            self.explore_cycles = int(settings.get("explore_cycles", 3))
-            self.explore_max_orbit_time = float(settings.get("explore_max_orbit_time", 30.0))
-            self.explore_elevation = float(settings.get("explore_elevation", 40.0))
+            self.explore_cycles = int(settings.get("explore_cycles", 1))
+            self.explore_max_orbit_time = float(settings.get("explore_max_orbit_time", 15.0))
+            self.explore_elevation = float(settings.get("explore_elevation", 35.0))
             # Smart Scale: master toggle + node-count-based profiles.
             self.smart_scale_enabled = bool(settings.get("smart_scale_enabled", False))
             _ssp = settings.get("smart_scale_profiles")
@@ -122,6 +133,32 @@ class SettingsPersistenceMixin:
             self.right_click_select_cohort = bool(settings.get("right_click_select_cohort", False))
             self.auto_center_on_selection = bool(settings.get("auto_center_on_selection", True))
             self.wasd_paths_enabled = bool(settings.get("wasd_paths_enabled", True))
+
+            # WASD navigation preview appearance + persistent-labels toggle.
+            _wlc = settings.get("wasd_line_color")
+            if isinstance(_wlc, (list, tuple)) and len(_wlc) == 3:
+                self.wasd_line_color = tuple(int(c) for c in _wlc)
+            _wcc = settings.get("wasd_letter_color")
+            if isinstance(_wcc, (list, tuple)) and len(_wcc) == 3:
+                self.wasd_letter_color = tuple(int(c) for c in _wcc)
+            try:
+                self.wasd_label_size = int(settings.get("wasd_label_size", 36))
+            except (TypeError, ValueError):
+                self.wasd_label_size = 36
+            self.wasd_persistent_labels = bool(settings.get("wasd_persistent_labels", False))
+            # Sync the widgets built in setup_ui (before this load).
+            if hasattr(self, 'wasd_line_btn'):
+                r, g, b = self.wasd_line_color
+                self.wasd_line_btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 1px solid #4050a0;")
+            if hasattr(self, 'wasd_letter_btn'):
+                r, g, b = self.wasd_letter_color
+                self.wasd_letter_btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 1px solid #4050a0;")
+            if hasattr(self, 'wasd_label_spin'):
+                self.wasd_label_spin.blockSignals(True)
+                self.wasd_label_spin.setValue(max(8, min(120, self.wasd_label_size)))
+                self.wasd_label_spin.blockSignals(False)
+            if hasattr(self, 'wasd_persistent_checkbox'):
+                self.wasd_persistent_checkbox.setChecked(self.wasd_persistent_labels)
             self.smooth_center_transition = bool(settings.get("smooth_center_transition", False))
             self.smooth_center_speed = float(settings.get("smooth_center_speed", 1.0))
             self.min_doc_freq_spin.setValue(settings.get("min_doc_freq", 5))
@@ -133,7 +170,18 @@ class SettingsPersistenceMixin:
             self.min_size_spin.setValue(node_size_actual * 10.0)
             self.spread_spin.setValue(settings.get("spread", 1.0))
             self.orbit_speed_spin.setValue(settings.get("orbit_speed", 0.2))
-            self.transparency_spin.setValue(settings.get("transparency", 0.8))
+            self.transparency_spin.setValue(settings.get("transparency", 0.9))
+
+            # Node blending mode (combo built in setup_ui, before this load).
+            # Also sync the transparency/dim-alpha enable state for Simple mode.
+            if hasattr(self, 'node_blending_combo'):
+                _nb_idx = self.node_blending_combo.findText(self.node_blending)
+                if _nb_idx >= 0:
+                    self.node_blending_combo.blockSignals(True)
+                    self.node_blending_combo.setCurrentIndex(_nb_idx)
+                    self.node_blending_combo.blockSignals(False)
+                if hasattr(self, '_sync_blending_controls'):
+                    self._sync_blending_controls()
 
             # Anti-noise / quality settings
             self.supersample_checkbox.setChecked(settings.get("supersample", False))
@@ -147,8 +195,22 @@ class SettingsPersistenceMixin:
                 r, g, b = int(self.highlight_color[0]*255), int(self.highlight_color[1]*255), int(self.highlight_color[2]*255)
                 self.highlight_color_btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); color: black; font-weight: bold;")
 
+            # 3D view background color (default black). Applied live if the GL
+            # view already exists, otherwise create_3d_view reads it on startup.
+            _bg = settings.get("bg_color", None)
+            if isinstance(_bg, (list, tuple)) and len(_bg) == 3:
+                self.bg_color = tuple(float(c) for c in _bg)
+                r, g, b = int(self.bg_color[0]*255), int(self.bg_color[1]*255), int(self.bg_color[2]*255)
+                if hasattr(self, 'bg_color_btn'):
+                    self.bg_color_btn.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 1px solid #4050a0;")
+                if getattr(self, 'gl_view', None) is not None:
+                    try:
+                        self.gl_view.setBackgroundColor((r, g, b, 255))
+                    except Exception:
+                        pass
+
             # Star twinkle settings (set values first, then toggle to avoid premature spawn)
-            self.twinkle_count_spin.setValue(settings.get("twinkle_count", 2000))
+            self.twinkle_count_spin.setValue(settings.get("twinkle_count", 4000))
             self.twinkle_lifespan_min_spin.setValue(settings.get("twinkle_lifespan_min", 1.0))
             self.twinkle_lifespan_max_spin.setValue(settings.get("twinkle_lifespan_max", 6.0))
             self.twinkle_freq_spin.setValue(settings.get("twinkle_freq", 0.5))
@@ -160,7 +222,21 @@ class SettingsPersistenceMixin:
             color_scheme_idx = self.color_scheme_combo.findText(settings.get("color_scheme", "Pastel"))
             if color_scheme_idx >= 0:
                 self.color_scheme_combo.setCurrentIndex(color_scheme_idx)
-            
+
+            # Node sizing mode (Distance is the legacy default). Set directly so we
+            # don't trigger a scatter rebuild during load (no scene exists yet).
+            _ns = settings.get("node_sizing_mode", "Distance")
+            if hasattr(self, 'node_sizing_combo'):
+                self.node_sizing_mode = _ns if _ns in (
+                    "Distance", "Screen-constant", "Uniform single size",
+                    "Auto-scale to view distance"
+                ) else "Distance"
+                _ns_idx = self.node_sizing_combo.findText(self.node_sizing_mode)
+                if _ns_idx >= 0:
+                    self.node_sizing_combo.blockSignals(True)
+                    self.node_sizing_combo.setCurrentIndex(_ns_idx)
+                    self.node_sizing_combo.blockSignals(False)
+
             # Cohort label settings
             self.cohort_threshold_spin.setValue(settings.get("cohort_threshold", 0.9))
             self.show_cohort_labels_checkbox.setChecked(settings.get("show_cohort_labels", True))
@@ -252,7 +328,6 @@ class SettingsPersistenceMixin:
         # Map of attribute name -> signal name
         signal_map = {
             # QSpinBox / QDoubleSpinBox -> valueChanged
-            'chunk_size_spin': 'valueChanged',
             'max_files_spin': 'valueChanged',
             'n_neighbors_spin': 'valueChanged',
             'min_dist_spin': 'valueChanged',
@@ -293,6 +368,7 @@ class SettingsPersistenceMixin:
             'algorithm_combo': 'currentTextChanged',
             'metric_combo': 'currentTextChanged',
             'color_scheme_combo': 'currentTextChanged',
+            'node_sizing_combo': 'currentTextChanged',
             'cohort_label_mode_combo': 'currentTextChanged',
             'smart_label_mode_combo': 'currentTextChanged',
             # QLineEdit -> textChanged
@@ -329,7 +405,7 @@ class SettingsPersistenceMixin:
             settings = dict(existing)
             settings.update({
                 "client": self.client_combo.currentText(),
-                "chunk_size": self.chunk_size_spin.value(),
+                "chunk_size": int(getattr(self, 'chunk_size', 8192)),
                 "max_files": self.max_files_spin.value(),
                 "tag_service": self.tag_service_combo.currentText(),
                 "use_direct_db": self.use_direct_db,
@@ -363,7 +439,7 @@ class SettingsPersistenceMixin:
                 "session_save_delay": int(getattr(self, 'session_save_delay', 60)),
                 # Explore (helicopter orbit) parameters
                 "explore_mode": getattr(self, 'explore_mode', "Random"),
-                "explore_show_path": bool(getattr(self, 'explore_show_path', True)),
+                "explore_show_path": bool(getattr(self, 'explore_show_path', False)),
                 "explore_accel": float(getattr(self, 'explore_accel', 0.6)),
                 "explore_decel": float(getattr(self, 'explore_decel', 0.6)),
                 "explore_orbit_radius_base": float(getattr(self, 'explore_orbit_radius_base', 8.0)),
@@ -386,14 +462,26 @@ class SettingsPersistenceMixin:
                 "right_click_select_cohort": bool(getattr(self, 'right_click_select_cohort', False)),
                 "auto_center_on_selection": bool(getattr(self, 'auto_center_on_selection', True)),
                 "wasd_paths_enabled": bool(getattr(self, 'wasd_paths_enabled', True)),
+                # WASD navigation preview appearance + persistent-labels toggle.
+                "wasd_line_color": list(getattr(self, 'wasd_line_color', (80, 255, 140))),
+                "wasd_letter_color": list(getattr(self, 'wasd_letter_color', (80, 255, 140))),
+                "wasd_label_size": int(getattr(self, 'wasd_label_size', 36)),
+                "wasd_persistent_labels": bool(getattr(self, 'wasd_persistent_labels', False)),
                 "smooth_center_transition": bool(getattr(self, 'smooth_center_transition', False)),
                 "smooth_center_speed": float(getattr(self, 'smooth_center_speed', 1.0)),
                 "min_doc_freq": self.min_doc_freq_spin.value(),
+                # Tag query grid layout (columns x rows; max tags = cols * rows)
+                "tag_query_columns": int(getattr(self, 'tag_query_columns', 3)),
+                "tag_query_rows": int(getattr(self, 'tag_query_rows', 14)),
                 "drop_universal_tags": self.drop_universal,
                 "node_size": self.min_size_spin.value() / 10.0,
                 "spread": self.spread_spin.value(),
                 "orbit_speed": self.orbit_speed_spin.value(),
                 "transparency": self.transparency_spin.value(),
+                # Node blending mode (normal alpha is the default)
+                "node_blending": getattr(self, 'node_blending', "Normal Alpha"),
+                # Node sizing mode (distance = legacy perspective scaling)
+                "node_sizing_mode": getattr(self, 'node_sizing_mode', "Distance"),
                 # Anti-noise / quality settings
                 "supersample": self.supersample_checkbox.isChecked(),
                 "supersample_fps": self.supersample_fps_spin.value(),
@@ -401,6 +489,8 @@ class SettingsPersistenceMixin:
                 "dim_non_selected": self.dim_non_selected_checkbox.isChecked(),
                 "dim_alpha": self.dim_alpha_spin.value(),
                 "highlight_color": list(self.highlight_color),
+                # 3D view background color (0-1 floats)
+                "bg_color": list(getattr(self, 'bg_color', (0.0, 0.0, 0.0))),
                 # Star twinkle settings
                 "twinkle_enabled": self.twinkle_checkbox.isChecked(),
                 "twinkle_count": self.twinkle_count_spin.value(),
