@@ -581,29 +581,55 @@ class SettingsPersistenceMixin:
             pass
 
     @staticmethod
+    def _clamp_widget_to_screens(widget):
+        """Keep a window's size + position within the available screen area.
+
+        A geometry saved under one UI Scale / resolution can come back LARGER
+        than the current screen (UI scale multiplies logical sizes at startup),
+        leaving e.g. the bottom status bar off-screen and the window feeling
+        "unresizable". The size is capped to the available area of the screen it
+        sits on; if it intersects no screen at all (e.g. a monitor was unplugged)
+        it is moved onto the primary one so the title bar is always reachable.
+        """
+        from PySide6.QtGui import QGuiApplication
+        # NOTE: screens() is a static of QGuiApplication (QCoreApplication has no such method).
+        screens = [s for s in (QGuiApplication.screens() or []) if s.availableGeometry().isValid()]
+        if not screens:
+            return
+        geo = widget.geometry()
+        host = next((s for s in screens if s.availableGeometry().intersects(geo)), None)
+        # QScreen has no isPrimary(); use the app's primary screen instead.
+        primary = QGuiApplication.primaryScreen() or screens[0]
+        avail = (host or primary).availableGeometry()
+
+        w, h = geo.width(), geo.height()
+        if w > avail.width():
+            w = max(1, avail.width())
+        if h > avail.height():
+            h = max(1, avail.height())
+        x = min(max(geo.x(), avail.left()), avail.right() - w)
+        y = min(max(geo.y(), avail.top()), avail.bottom() - h)
+        widget.setGeometry(x, y, w, h)
+
+    @staticmethod
     def _restore_window_geometry(settings, key, widget):
         """Restore a window's geometry from the settings dict (best effort).
 
-        If the saved position lies on a monitor that no longer exists (e.g. a
-        second screen was unplugged), re-center the window on the primary
-        screen instead of leaving it stranded off-screen.
+        The restored size/position is clamped to the available screen area so a
+        saved state that no longer fits (UI scale change, resolution change) can't
+        push parts of the window off-screen. If it still doesn't intersect any
+        monitor (e.g. a second screen was unplugged), re-center on primary.
         """
         try:
-            from PySide6.QtCore import QByteArray, QCoreApplication
+            from PySide6.QtCore import QByteArray
             raw = settings.get(key)
             if not raw:
                 return False
             ba = QByteArray(bytes.fromhex(raw))
             ok = widget.restoreGeometry(ba)
-            # Guard against a saved position on a monitor that no longer exists.
-            geo = widget.geometry()
-            screens = QCoreApplication.screens()
-            if ok and screens and not any(s.availableGeometry().intersects(geo) for s in screens):
-                primary = QCoreApplication.primaryScreen()
-                if primary is not None:
-                    c = primary.availableGeometry().center()
-                    widget.move(c.x() - widget.width() // 2, c.y() - widget.height() // 2)
-                return False
+            # Clamp to the available screen area (size + position). This also pulls a
+            # window saved on an unplugged monitor back onto the primary screen.
+            SettingsPersistenceMixin._clamp_widget_to_screens(widget)
             return bool(ok)
         except Exception:
             return False

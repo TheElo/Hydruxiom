@@ -17,6 +17,40 @@ SETTINGS_FILE = os.path.join(
 )
 
 
+def clamp_scroll_page_width(scroll_area):
+    """Keep a QScrollArea's page from growing wider than its viewport.
+
+    With ``setWidgetResizable(True)`` Qt sizes the page to
+    ``max(viewport, content.minimumSizeHint())`` — so if any child has a large
+    minimum width hint (long tag labels / form fields, worse at high UI scale),
+    the whole page is laid out wider than visible and widgets overflow past the
+    panel's right edge. This installs an event filter on the viewport that caps
+    the page's maximum width to the current viewport width; children then wrap or
+    elide instead of spilling over.
+
+    Args:
+        scroll_area: A QScrollArea whose widget has already been set via setWidget().
+    """
+    from PySide6.QtCore import QObject, QEvent
+
+    class _WidthClamp(QObject):
+        def eventFilter(self, obj, ev):
+            if ev.type() == QEvent.Resize and obj is scroll_area.viewport():
+                page = scroll_area.widget()
+                if page is not None:
+                    w = max(1, scroll_area.viewport().width())
+                    if page.maximumWidth() != w:
+                        page.setMaximumWidth(w)
+            return False
+
+    filter_ = _WidthClamp(scroll_area)
+    scroll_area.viewport().installEventFilter(filter_)
+    # Apply once immediately (viewport may already be sized).
+    page = scroll_area.widget()
+    if page is not None and scroll_area.viewport().width() > 0:
+        page.setMaximumWidth(max(1, scroll_area.viewport().width()))
+
+
 def compile_tag_patterns(tag_list):
     """Split a tag list into exact-match set and compiled wildcard patterns.
 

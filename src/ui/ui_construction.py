@@ -34,7 +34,9 @@ from src.ui.panels.tag_query import (
     ClickableTag, split_query_preserving_brackets,
     query_to_api_tags, parse_query_tag_states,
 )
-from src.ui.tag_map_utils import compile_tag_patterns, ease_in_out, SETTINGS_FILE
+from src.ui.tag_map_utils import (
+    compile_tag_patterns, ease_in_out, SETTINGS_FILE, clamp_scroll_page_width,
+)
 from src.ui.gl_text_items import get_multiline_text_item_class as _get_multiline_text_item_class
 
 
@@ -140,6 +142,9 @@ class UIConstructionMixin:
         if max_width is not None:
             scroll.setMaximumWidth(max_width)
         scroll.setWidget(content)
+        # Keep the page from growing wider than the viewport (children with big
+        # minimum-width hints would otherwise overflow past the panel edge).
+        clamp_scroll_page_width(scroll)
         return scroll
 
     def setup_ui(self):
@@ -156,8 +161,10 @@ class UIConstructionMixin:
         self.left_sidebar = self.create_control_panel()
         main_splitter.addWidget(self.left_sidebar)
 
-        # Center panel - 3D View with toggle button overlay
+        # Center panel - 3D View with toggle button overlay. Minimum width keeps a
+        # usable viewport even when both sidebars are dragged to their max (700).
         center_panel = QWidget()
+        center_panel.setMinimumWidth(320)
         center_layout = QVBoxLayout(center_panel)
         center_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -256,8 +263,10 @@ class UIConstructionMixin:
         # layout directly — that would reparent it out of the QScrollArea and
         # silently disable scrolling.
         panel = QWidget()
-        panel.setMinimumWidth(250)
-        panel.setMaximumWidth(350)
+        # Wide drag range: the user can collapse it near-minimal or stretch it to a
+        # comfortable reading width (content scrolls vertically either way).
+        panel.setMinimumWidth(180)
+        panel.setMaximumWidth(700)
         content = QWidget()
         self._left_content = content  # used by _reorganize_sidebars (cohort row)
         layout = QVBoxLayout(content)
@@ -1061,8 +1070,9 @@ class UIConstructionMixin:
         bottom outside the tabs.
         """
         sidebar = QWidget()
-        sidebar.setMinimumWidth(200)
-        sidebar.setMaximumWidth(350)
+        # Wide drag range, same as the left panel (content scrolls vertically).
+        sidebar.setMinimumWidth(180)
+        sidebar.setMaximumWidth(700)
         self._right_outer_layout = QVBoxLayout(sidebar)
         self._right_outer_layout.setContentsMargins(0, 0, 0, 0)
         self._right_outer_layout.setSpacing(15)

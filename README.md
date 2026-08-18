@@ -39,10 +39,22 @@ The app needs at least one Hydrus client with the **API enabled** (Hydrus → Op
    - **Label / ID** — your name for the client
    - **API URL** — e.g. `http://127.0.0.1:4566/`
    - **API Key** — from Hydrus's API settings page (no masking; stored locally)
-   - **DB / Files / Thumbs dirs** — only needed for *Direct DB mode* and the media viewer thumbnails-from-disk path
+    - **DB Dir** *(optional)* — Hydrus client DB folder; only used by *Direct DB mode*. Leave empty if you use the API (the default)
 3. Use **Test Connection** to verify, then **OK**
 
 Client config is stored in `clients.json` at the project root (gitignored; a `.bak` copy is kept before every save).
+
+### Required API permissions
+
+
+| Permission | Needed for |
+|---|---|
+| ✅ **Search for and fetch files** | Everything core: loading the tag map (`search_files`, `get_file_metadata`), media viewer thumbnails/full-res images, Test Connection |
+| ⬜ Manage pages *(optional)* | Only the **"Send to Tab"** button (Ctrl+T) — it lists Hydrus tabs and adds selected files to one of them |
+
+Tick **Search for and fetch files** at minimum; add **Manage pages** only if you want Send-to-Tab. No other permissions are used — Hydruxiom never edits tags, ratings, notes or relationships in your collection.
+
+If loading fails with a 403 / *"You need at least one these permissions…"* error, edit the key (Hydrus → Options → Network → API) and tick the missing box above.
 
 ---
 

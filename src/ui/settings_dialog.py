@@ -25,6 +25,7 @@ from PySide6.QtGui import QFont, QIntValidator
 from src.ui.smart_scale import (
     SMART_SCALE_SETTINGS, SMART_SCALE_KEYS, default_profiles, read_current_values,
 )
+from src.ui.tag_map_utils import clamp_scroll_page_width
 
 
 class _ClientTestWorker(QThread):
@@ -119,9 +120,37 @@ class TagMap3DSettingsDialog(QDialog):
         cform.addRow("Label:", self.c_label_edit)
         cform.addRow("API URL:", self.c_api_url_edit)
         cform.addRow("API Key:", self.c_api_key_edit)
-        cform.addRow("DB Dir:", self._browse_row(self.c_db_dir_edit))
-        cform.addRow("Files Dir:", self._browse_row(self.c_files_dir_edit))
-        cform.addRow("Thumbs Dir:", self._browse_row(self.c_thumbs_dir_edit))
+
+        # DB Dir: only used by Direct DB mode (reads tags straight from Hydrus's
+        # SQLite files). Hidden until then it would just confuse users.
+        db_row = QWidget()
+        _db_lay = QHBoxLayout(db_row)
+        _db_lay.setContentsMargins(0, 0, 0, 0)
+        _db_lay.addWidget(QLabel("DB Dir:"))
+        _db_lay.addLayout(self._browse_row(self.c_db_dir_edit))
+        self.c_db_dir_edit.setToolTip(
+            "Path to the Hydrus client DB folder (contains client.db).\n"
+            "Only needed for Direct DB mode — leave empty if you use the API."
+        )
+
+        # Files / Thumbs dirs: reserved for a future thumbnails-from-disk path.
+        # Kept in clients.json but hidden from the UI until that feature exists.
+        self._client_dirs_hidden = QWidget()
+        _hd_lay = QVBoxLayout(self._client_dirs_hidden)
+        _hd_lay.setContentsMargins(0, 0, 0, 0)
+        _hd_lay.setSpacing(4)
+        for label_text, edit in (("Files Dir:", self.c_files_dir_edit),
+                                 ("Thumbs Dir:", self.c_thumbs_dir_edit)):
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.addWidget(QLabel(label_text))
+            rl.addLayout(self._browse_row(edit))
+            _hd_lay.addWidget(row)
+        self._client_dirs_hidden.hide()
+
+        cform.addRow(db_row)
+        cg_layout.addWidget(self._client_dirs_hidden)
         cg_layout.addLayout(cform)
 
         # Chunk Size (moved here from the left panel). Stored on the tab as a
@@ -699,6 +728,9 @@ class TagMap3DSettingsDialog(QDialog):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setWidget(content)
+        # Keep the page from growing wider than the viewport (children with big
+        # minimum-width hints would otherwise overflow past the tab edge).
+        clamp_scroll_page_width(scroll)
         return scroll
 
     # ------------------------------------------------------------------
