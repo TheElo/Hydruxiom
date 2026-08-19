@@ -55,6 +55,10 @@ def get_multiline_text_item_class():
             self.outline_color = None
             self.outline_width = 3.0
             self._ss_factor = 1.0
+            # Screen-space (px) offset from the projected world anchor. Used by the
+            # label collision "Move" mode to nudge overlapping labels apart without
+            # moving their world position (so they stay locked to the camera).
+            self.screen_offset = QPointF(0, 0)
 
         def _build_cache(self):
             """Precompute line layout metrics (called only when text/font change)."""
@@ -104,7 +108,7 @@ def get_multiline_text_item_class():
 
             self.setupGLState()
             project = self.compute_projection()
-            anchor = project.map(QVector3D(*self.pos)).toPointF()
+            anchor = project.map(QVector3D(*self.pos)).toPointF() + self.screen_offset
 
             # Off-screen culling: skip labels whose anchor is outside the
             # viewport (with a margin for text extent). Saves drawText calls
@@ -133,13 +137,23 @@ def get_multiline_text_item_class():
                 | QPainter.RenderHint.TextAntialiasing
             )
 
+            # If the whole label is faded out (fill alpha == 0), skip drawing entirely —
+            # otherwise the outline pass would still render at full opacity and leave a
+            # visible ghost stroke behind.
+            if self.color.alpha() <= 0:
+                return
+
             # Outline pass (drawn first, underneath the fill). Skipped when no
-            # outline color is set OR the width is 0 (acts as an "off" switch).
+            # outline color is set OR the width is 0 (acts as an "off" switch). The
+            # outline's alpha follows the FILL's alpha so a faded label vanishes
+            # completely (fill + stroke), not just its interior.
             outline_color = getattr(self, 'outline_color', None)
             ow = getattr(self, 'outline_width', 3.0) * ss
             if outline_color is not None and ow > 0:
-                from PySide6.QtGui import QPen
-                pen = QPen(outline_color, ow)
+                from PySide6.QtGui import QPen, QColor as _QColor
+                oc = _QColor(outline_color)
+                oc.setAlpha(oc.alpha() * self.color.alpha() // 255)
+                pen = QPen(oc, ow)
                 pen.setJoinStyle(_Qt.PenJoinStyle.RoundJoin)
                 painter.setPen(pen)
                 for line, dx, dy in layout:

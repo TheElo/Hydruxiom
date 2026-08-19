@@ -6,7 +6,7 @@ here from ``tag_map_3d_tab.py`` to reduce its size without changing behavior.
 """
 import numpy as np
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QPointF
 
 from src.ui.styles import BLUE_60
 from src.ui.gl_text_items import get_multiline_text_item_class as _get_multiline_text_item_class
@@ -604,6 +604,7 @@ class CohortLabelsMixin:
                     smart_label_map = None
 
             self.cohort_label_items = []
+            self._label_base_rgba = {}  # cid -> (r,g,b,a); used by Label Space fade/move
             for cid, idx in cluster_nodes.items():
                 # Compute centroid (center of cohort) from member indices
                 centroid = scene.positions[idx].mean(axis=0)
@@ -670,8 +671,19 @@ class CohortLabelsMixin:
                     label_item.setVisible(True)
                     self.cohort_label_items.append(label_item)
                     self.cohort_label_map[cid] = label_item
+                    # Remember the un-faded color so Label Space can restore it.
+                    self._label_base_rgba[cid] = tuple(int(c) for c in label_rgba)
                 except Exception as e:
                     print(f"Error creating cohort label: {e}")
+
+            # Handle overlapping labels (None / Fade / Move). Runs after every
+            # label is created so it sees the full set. No-op when mode is None.
+            # immediate=True snaps new labels straight to their targets (no flash of
+            # fully-visible overlaps); the camera-tracking tick eases from there on.
+            try:
+                self._apply_label_space(selected_cid, immediate=True)
+            except Exception as e:
+                print(f"Error applying label space: {e}")
 
         except Exception as e:
             import traceback
@@ -684,6 +696,283 @@ class CohortLabelsMixin:
                 self._wasd_redraw_if_active()
             except Exception as e:
                 print(f"Error redrawing WASD paths after label update: {e}")
+            # (Re)start/stop the camera-tracking tick to match the new label set.
+            try:
+                self._sync_label_space_timer()
+            except Exception:
+                pass
+
+    # ── Label Space (overlap handling: None / Fade / Move) ───────────────
+
+    def _resolve_selected_cluster_id(self):
+        """Return the currently selected cohort id (a single-node selection counts
+        as its cohort), or None."""
+        cid = getattr(self, 'selected_cluster_id', None)
+        if cid is None and getattr(self, 'selected_node_index', None) is not None:
+            scene = getattr(self, 'scene_graph', None)
+            if scene is not None and 0 <= self.selected_node_index < len(scene.file_ids):
+                cid = int(scene.cluster_ids[self.selected_node_index])
+        return cid
+
+    def _on_label_space_changed(self, *_args):
+        """Label Space mode or gap changed -> re-apply + (re)start the camera-tracking tick."""
+        try:
+            self.label_space_mode = str(getattr(self, 'label_space_combo', None).currentText() if hasattr(self, 'label_space_combo') else "None")
+            self.label_space_gap = int(getattr(self, 'label_gap_spin', None).value() if hasattr(self, 'label_gap_spin') else 8)
+        except Exception:
+            pass
+        try:
+            self._apply_label_space(self._resolve_selected_cluster_id())
+        except Exception as e:
+            print(f"Error applying label space on change: {e}")
+        self._sync_label_space_timer()
+
+    def _tick_label_space(self):
+        """Re-solve overlaps + ease toward them while Fade/Move is active.
+
+        Runs on a light timer so the effect tracks the camera continuously: labels
+        fade in/out as occlusion appears/clears and drift apart with weight instead of
+        teleporting. Without this, Label Space only applied at label-rebuild time.
+        """
+        if getattr(self, 'label_space_mode', "None") == "None":
+            return
+        try:
+            self._apply_label_space(self._resolve_selected_cluster_id())  # recompute targets
+            self._ease_label_space()                                      # smooth toward them
+        except Exception:
+            pass
+
+    def _sync_label_space_timer(self):
+        """Start the re-apply tick when Fade/Move is active, stop it otherwise."""
+        timer = getattr(self, '_label_space_timer', None)
+        if timer is None:
+            return
+        has_labels = bool(getattr(self, 'cohort_label_map', None))
+        should_run = (getattr(self, 'label_space_mode', "None") != "None") and has_labels
+        if should_run and not timer.isActive():
+            timer.start()
+        elif not should_run and timer.isActive():
+            timer.stop()
+
+    def _label_screen_boxes(self):
+        """Return {cid: (x0,y0,x1,y1)} screen-space rects for the current labels, at
+        their BASE positions (screen offset ignored).
+
+        Each label's world anchor is projected to screen with the same MVP matrix the
+        WASD projector uses (viewMatrix * currentProjection). The rect matches how
+        paint() actually draws: horizontally centered on the anchor, extending DOWNWARD
+        by lineSpacing * n_lines from it. Off-screen / behind-camera labels are omitted.
+
+        Base positions are used for collision solving so targets stay stable while the
+        eased (rendered) offsets drift toward them — otherwise the solver would chase
+        its own moving output and jitter.
+        """
+        import numpy as np
+        boxes = {}
+        gl_view = getattr(self, 'gl_view', None)
+        if gl_view is None:
+            return boxes
+        try:
+            view_matrix = gl_view.viewMatrix()
+            proj_matrix = gl_view.currentProjection()
+            mvp = proj_matrix * view_matrix
+            m = np.array([
+                [mvp(0, 0), mvp(0, 1), mvp(0, 2), mvp(0, 3)],
+                [mvp(1, 0), mvp(1, 1), mvp(1, 2), mvp(1, 3)],
+                [mvp(2, 0), mvp(2, 1), mvp(2, 2), mvp(2, 3)],
+                [mvp(3, 0), mvp(3, 1), mvp(3, 2), mvp(3, 3)],
+            ])
+        except Exception:
+            return boxes
+
+        from PySide6.QtGui import QFontMetrics
+        width = gl_view.width()
+        height = gl_view.height()
+        for cid, item in getattr(self, 'cohort_label_map', {}).items():
+            try:
+                pos = np.asarray(item.pos, dtype=float)
+                p = np.array([pos[0], pos[1], pos[2], 1.0]) @ m.T
+                w_clip = p[3]
+                if abs(w_clip) < 1e-10 or w_clip <= 0:
+                    continue
+                ndc = p[:3] / w_clip
+                if not (0.0 <= ndc[2] <= 1.0):
+                    continue
+                sx = (ndc[0] * 0.5 + 0.5) * width
+                sy = (1.0 - (ndc[1] * 0.5 + 0.5)) * height
+                # Apply the screen-space offset used by Move mode.
+                ox = float(getattr(item, 'screen_offset', None).x()) if hasattr(item, 'screen_offset') else 0.0
+                oy = float(getattr(item, 'screen_offset', None).y()) if hasattr(item, 'screen_offset') else 0.0
+                sx += ox
+                sy += oy
+
+                fm = QFontMetrics(item.font)
+                lines = [ln for ln in str(getattr(item, "text", "")).split("\n") if ln]
+                tw = max((fm.horizontalAdvance(ln) for ln in lines), default=0.0)
+                th = fm.lineSpacing() * len(lines)
+                # paint() centers horizontally on the anchor and draws downward from it.
+                boxes[cid] = (sx - tw / 2.0, sy, sx + tw / 2.0, sy + th)
+            except Exception:
+                continue
+        return boxes
+
+    @staticmethod
+    def _boxes_overlap(a, b, gap):
+        """True if two (x0,y0,x1,y1) rects overlap with at least ``gap`` px clearance."""
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        return not (ax1 + gap <= bx0 or bx1 + gap <= ax0 or ay1 + gap <= by0 or by1 + gap <= ay0)
+
+    # Easing rates per tick (~16 fps). Fade is quicker than Move so labels drift apart
+    # with visible "weight" instead of teleporting.
+    _LS_FADE_EASE = 0.35   # fraction of remaining alpha gap closed each tick
+    _LS_MOVE_EASE = 0.22   # fraction of remaining offset gap closed each tick
+
+    def _apply_label_space(self, selected_cid, immediate=False):
+        """Compute Label Space TARGETS for the current labels.
+
+        - None: clear all targets and snap offsets/alphas back to their base state.
+        - Fade: a non-selected label overlapping another gets target alpha 0 (fully
+          transparent so it can't block what's around it); otherwise full alpha. The
+          selected cohort always keeps priority (never faded).
+        - Move: each non-selected label is nudged apart in screen space until clear;
+          the selected one stays put.
+
+        ``immediate`` (used on a fresh rebuild) snaps items straight to their targets —
+        otherwise newly-created labels would flash fully visible before easing in. When
+        False (the camera-tracking tick), only targets are updated and _ease_label_space()
+        smoothly moves current values toward them, so the effect tracks the view with
+        weight instead of teleporting.
+        """
+        mode = str(getattr(self, 'label_space_mode', "None"))
+        gap = int(getattr(self, 'label_space_gap', 25))
+        cmap = getattr(self, 'cohort_label_map', {}) or {}
+
+        # Fresh target sets for this pass (populated below per mode).
+        self._ls_target_alpha = {}
+        self._ls_target_offset = {}
+
+        if mode == "None" or not cmap:
+            # Snap everything back to base and stop easing.
+            from PySide6.QtGui import QColor
+            base_rgba = getattr(self, '_label_base_rgba', {}) or {}
+            for cid, item in cmap.items():
+                try:
+                    item.screen_offset = QPointF(0, 0)
+                except Exception:
+                    pass
+                if base_rgba.get(cid):
+                    r, g, b, a = base_rgba[cid]
+                    item.color = QColor(r, g, b, a)
+            self._ls_target_alpha = {}
+            return
+
+        boxes = self._label_screen_boxes()  # BASE positions (offset ignored) -> stable targets
+        cids = list(boxes.keys())
+
+        if mode == "Fade":
+            base_rgba = getattr(self, '_label_base_rgba', {}) or {}
+            for cid in cmap:
+                full_a = base_rgba.get(cid, (255, 255, 255, 255))[3]
+                self._ls_target_alpha[cid] = full_a
+            if len(cids) >= 2:
+                for cid in cids:
+                    if cid == selected_cid:
+                        continue  # selection always keeps priority
+                    collides = any(self._boxes_overlap(boxes[cid], boxes[o], gap)
+                                   for o in cids if o != cid and o in boxes)
+                    if collides:
+                        self._ls_target_alpha[cid] = 0
+
+        elif mode == "Move":
+            # Order: selected first (anchor), then the rest by size desc so big labels
+            # settle before small ones. Each non-selected label is pushed away from its
+            # nearest colliding neighbor via a spiral search until clear or max radius.
+            order = sorted(cids, key=lambda c: (c != selected_cid, -len(boxes[c])))
+            placed = {}  # cid -> box at the target position
+            for cid in order:
+                if cid == selected_cid:
+                    self._ls_target_offset[cid] = QPointF(0.0, 0.0)
+                    placed[cid] = boxes[cid]
+                    continue
+                cur_box = list(boxes.get(cid, (0, 0, 0, 0)))
+                max_r = 260.0
+                step = 14.0
+                r = 0.0
+                found = False
+                while r <= max_r:
+                    candidates = [(0.0, 0.0)] if r == 0 else []
+                    n_pts = max(8, int(r / step))
+                    for k in range(n_pts):
+                        ang = 2 * np.pi * k / n_pts
+                        candidates.append((r * np.cos(ang), r * np.sin(ang)))
+                    # Prefer pushing downward (labels read top-to-bottom).
+                    candidates.sort(key=lambda d: (abs(d[0]), d[1]))
+                    for dx, dy in candidates:
+                        trial = [cur_box[0] + dx, cur_box[1] + dy, cur_box[2] + dx, cur_box[3] + dy]
+                        if all(not self._boxes_overlap(trial, placed[o], gap) for o in placed):
+                            self._ls_target_offset[cid] = QPointF(dx, dy)
+                            placed[cid] = trial
+                            found = True
+                            break
+                    if found:
+                        break
+                    r += step
+                # If nothing fit within max radius, leave it at the best-effort last try.
+
+        if immediate:
+            # Fresh rebuild: snap straight to targets so new labels don't flash fully
+            # visible before easing in (the continuous tick handles smoothing after).
+            from PySide6.QtGui import QColor
+            for cid, item in cmap.items():
+                base = getattr(self, '_label_base_rgba', {}).get(cid)
+                if mode == "Fade" and base:
+                    r, g, b, _a0 = base
+                    item.color = QColor(r, g, b, int(getattr(self, '_ls_target_alpha', {}).get(cid, _a0)))
+                elif mode == "Move":
+                    t_off = getattr(self, '_ls_target_offset', {}).get(cid)
+                    if t_off is not None:
+                        item.screen_offset = QPointF(t_off.x(), t_off.y())
+
+    def _ease_label_space(self):
+        """Ease current label alpha/offsets toward their targets (smooth fade + drift).
+
+        Returns True once everything has converged (deltas below threshold) so the
+        camera-tracking timer can stop until something changes again.
+        """
+        from PySide6.QtGui import QColor
+        cmap = getattr(self, 'cohort_label_map', {}) or {}
+        base_rgba = getattr(self, '_label_base_rgba', {}) or {}
+        mode = str(getattr(self, 'label_space_mode', "None"))
+        if mode == "None" or not cmap:
+            return True
+
+        converged = True
+        for cid, item in cmap.items():
+            r, g, b, a0 = base_rgba.get(cid, (255, 255, 255, 255))
+            if mode == "Fade":
+                target_a = int(getattr(self, '_ls_target_alpha', {}).get(cid, a0))
+                cur_a = item.color.alpha()
+                if abs(cur_a - target_a) > 1:
+                    converged = False
+                    new_a = cur_a + (target_a - cur_a) * self._LS_FADE_EASE
+                    item.color = QColor(r, g, b, int(round(new_a)))
+            elif mode == "Move":
+                t_off = getattr(self, '_ls_target_offset', {}).get(cid, QPointF(0.0, 0.0))
+                cur_x, cur_y = float(item.screen_offset.x()), float(item.screen_offset.y())
+                dx, dy = float(t_off.x()) - cur_x, float(t_off.y()) - cur_y
+                if abs(dx) > 0.5 or abs(dy) > 0.5:
+                    converged = False
+                    item.screen_offset = QPointF(cur_x + dx * self._LS_MOVE_EASE,
+                                                 cur_y + dy * self._LS_MOVE_EASE)
+
+        # We mutated screen_offset / color (custom attrs pyqtgraph doesn't watch).
+        for item in cmap.values():
+            try:
+                item.update()
+            except Exception:
+                pass
+        return converged
 
     def _remove_cohort_labels(self, keep_ids=None):
         """Remove cohort label items from the 3D view.

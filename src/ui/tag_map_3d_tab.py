@@ -65,6 +65,13 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         self.low_memory = True
         self.n_jobs = os.cpu_count() or 4
         self.use_direct_db = False
+        # Reserved parallel-load thread counts (benchmarks/benchmark_api_io.py):
+        # API loads are network-bound and benefit from ~4 concurrent requests;
+        # direct-DB is local/disk-bound where >2 connections start to contend.
+        # Not consumed by the loader yet — will be wired in when the threaded
+        # DataLoader implementation lands.
+        self.api_load_threads = 4
+        self.direct_load_threads = 2
         self.client_db_paths = {}
         self.tokenize = True
         self.drop_universal = True  # Drop universal tags (managed in settings dialog)
@@ -131,8 +138,15 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
 
         # Default before load_settings (which may set it from the saved state)
         self._restore_media_viewer_open = False
-        self.auto_deorphan = "Never"  # "Never", "After Load and Compute", "After Regroup"
+        # Auto-Deorphan: per-operation flags (see Settings -> DBSCAN Optimizer).
+        # Each start_* op records which operation it was via _last_op; the
+        # completion handler fires Deorphan only if that op's flag is checked.
+        self.auto_deorphan_ops = {"load": False, "regroup": False, "split": False}
+        # Set to False by Recompute (all-noise result) so on_loading_finished skips
+        # starting a fresh auto-split cycle; reset after the completion is consumed.
+        self._auto_split_allowed = True
         self._pending_deorphan = False  # True while a deorphan worker is in flight
+        self._last_op = None            # "load" | "regroup" | "split" | None
 
         # Session auto-save: instead of writing sessions/latest.npz immediately
         # after every operation (costly when iterating settings), each change
@@ -142,8 +156,12 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         self.session_save_delay = 60  # seconds (managed in settings dialog)
 
         # Chunk Size default before load_settings. Plain int attribute — its
-        # spinbox lives in the Settings window -> Clients tab, not on this tree.
-        self.chunk_size = 8192
+        # spinboxes live in the Settings window -> Clients tab, not on this tree.
+        # Path-specific chunk sizes (benchmarks/benchmark_api_io.py): API is
+        # network-bound so bigger requests win (~8192); direct-DB is local and flat/fast >= 512.
+        self.chunk_size = 8192          # legacy single value; kept for back-compat + fallback
+        self.api_chunk_size = 8192      # files per HTTP request (API path)
+        self.direct_chunk_size = 4096   # files per SQLite query (direct-DB path)
 
         # Node sizing mode default before load_settings. "Distance" is the legacy
         # behavior (pxMode=False, perspective scaling with camera distance). The
@@ -232,6 +250,23 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         # instead of vanishing instantly, which is less disorienting.
         self.label_fade_enabled = True  # master toggle (managed in the label panel)
         self._label_fade_items = []  # list of [item, base_rgba] currently fading
+
+        # Label Space (overlap handling): None / Fade / Move + gap. Defaults set
+        # BEFORE load_settings() so saved values aren't clobbered; widgets sync there.
+        self.label_space_mode = "Fade"
+        self.label_space_gap = 25
+        # Per-label eased targets (populated by _apply_label_space, consumed by
+        # _ease_label_space). Kept as plain dicts so they survive label rebuilds.
+        self._ls_target_alpha = {}   # cid -> target alpha (0..255) for Fade mode
+        self._ls_target_offset = {}  # cid -> QPointF target screen offset for Move mode
+        # Label Space re-apply timer: Fade/Move must track the camera, so while a mode
+        # is active we re-solve overlaps on a light tick (cheap when nothing changed).
+        # _apply_label_space resets offsets/alphas each call, so this also fades labels
+        # back in once occlusion clears and keeps them separated as you orbit.
+        self._label_space_timer = QTimer(self)
+        self._label_space_timer.setInterval(60)  # ~16 fps is plenty for label nudging
+        self._label_space_timer.timeout.connect(self._tick_label_space)
+
         self._label_fade_timer = QTimer(self)
         self._label_fade_timer.setInterval(16)  # ~60 fps
         self._label_fade_timer.timeout.connect(self._update_label_fade)
@@ -626,7 +661,17 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             "min_samples": self.min_samples_spin.value(),
             "node_size": float(self.min_size_spin.value()) / 10.0,
             "spread": float(self.spread_spin.value()),
-            "min_doc_freq": self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3,
+            # Unit-aware Min Tag Frequency (n / %): store both values + active unit.
+            **(self._min_doc_freq_state() if hasattr(self, '_min_doc_freq_state')
+               else {"min_doc_freq": self.min_doc_freq_spin.value()}),
+            # Visual state that must survive a session load: without the scheme in
+            # the snapshot, loading a session re-rendered with whatever scheme was
+            # active at app startup (settings.json), not the one used when saving.
+            "color_scheme": self.color_scheme_combo.currentText() if hasattr(self, 'color_scheme_combo') else "Pastel",
+            # User-generated color schemes must survive a session save/load: without
+            # them in the snapshot, restoring a session that used a custom scheme would
+            # fall back to Pastel (the combo wouldn't contain the name).
+            "custom_color_schemes": getattr(self, 'custom_color_schemes', {}),
             "drop_universal_tags": getattr(self, 'drop_universal', True),
             "tokenized": bool(self.tag_interner),
         }
@@ -1018,15 +1063,33 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             if isinstance(view_meta, dict):
                 from PySide6.QtGui import QVector3D
                 center = view_meta.get("center")
+                # Sanity check the saved camera distance: a value far beyond the data's
+                # extent means the view was zoomed out so far that every node is
+                # sub-pixel — restoring it shows an empty scene. Fall back to fit-to-data.
+                dist_ok = True
+                try:
+                    d_saved = float(view_meta.get("distance"))
+                    pos_arr_chk = np.asarray(scene.positions, dtype=float)
+                    diag = float(np.linalg.norm(pos_arr_chk.max(axis=0) - pos_arr_chk.min(axis=0))) if len(pos_arr_chk) else 0.0
+                    dist_ok = d_saved <= max(diag * 50.0, 100.0)
+                except (TypeError, ValueError):
+                    pass
                 if center and len(center) == 3:
                     self.gl_view.opts['center'] = QVector3D(float(center[0]), float(center[1]), float(center[2]))
                 for k in ("distance", "elevation", "azimuth"):
                     v = view_meta.get(k)
-                    if v is not None:
+                    if v is not None and (k != "distance" or dist_ok):
                         try:
                             self.gl_view.opts[k] = float(v)
                         except (TypeError, ValueError):
                             pass
+                if not dist_ok:
+                    # Bad saved distance -> fit the camera to this scene's data.
+                    print("[Session] Saved camera distance was unreasonable; fitting view to data.")
+                    pos_arr = np.asarray(scene.get_node_positions(), dtype=float)
+                    c = (pos_arr.max(axis=0) + pos_arr.min(axis=0)) / 2 if len(pos_arr) else None
+                    if c is not None:
+                        self._set_camera_fit(c, max(float(np.linalg.norm(pos_arr.max(axis=0) - pos_arr.min(axis=0))) * 1.5, 10.0))
                 self.gl_view.update()
 
                 # Restore the selected cohort (if it still exists in this scene).
@@ -1115,8 +1178,33 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             node_size_actual = settings_meta.get("node_size", settings_meta.get("min_size", 0.02))
             self.min_size_spin.setValue(node_size_actual * 10.0)
             self.spread_spin.setValue(settings_meta.get("spread", 1.0))
-            if hasattr(self, 'min_doc_freq_spin'):
+            # Unit-aware Min Tag Frequency (n / %): restore both values + unit.
+            if hasattr(self, '_apply_min_doc_freq_state') and settings_meta:
+                self._apply_min_doc_freq_state({
+                    "min_doc_freq": settings_meta.get("min_doc_freq", 3),
+                    "min_doc_freq_pct": settings_meta.get("min_doc_freq_pct", 1),
+                    "min_doc_freq_unit": settings_meta.get("min_doc_freq_unit", "n"),
+                })
+            elif hasattr(self, 'min_doc_freq_spin'):
                 self.min_doc_freq_spin.setValue(settings_meta.get("min_doc_freq", 3))
+            # Restore the color scheme used when this session was saved. Block
+            # signals: _on_color_scheme_changed would rebuild a scatter that doesn't
+            # exist yet (render_scene runs right after and picks up the combo value).
+            # Restore user-generated color schemes first so the dropdown contains them.
+            _custom = settings_meta.get("custom_color_schemes") or {}
+            if isinstance(_custom, dict):
+                self.custom_color_schemes = {k: [list(c) for c in v] for k, v in _custom.items()}
+            if hasattr(self, 'color_scheme_combo'):
+                _cs_name = settings_meta.get("color_scheme", "Pastel")
+                # Ephemeral "Generated" isn't persisted; fall back to Pastel.
+                if hasattr(self, '_rebuild_color_scheme_combo'):
+                    self._rebuild_color_scheme_combo(select=_cs_name if _cs_name != "Generated" else "Pastel")
+                else:
+                    cs_idx = self.color_scheme_combo.findText(_cs_name)
+                    if cs_idx >= 0:
+                        self.color_scheme_combo.blockSignals(True)
+                        self.color_scheme_combo.setCurrentIndex(cs_idx)
+                        self.color_scheme_combo.blockSignals(False)
             self.drop_universal = settings_meta.get("drop_universal_tags", True)
         except Exception as e:
             print(f"Error applying session settings: {e}")
@@ -1190,6 +1278,11 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         if was_recluster:
             self._pending_recluster = False
             self.node_list = scene.get_file_ids()
+            # build_from_data always assigns Pastel colors; sync the active scheme
+            # into scene.colors BEFORE _build_base_scatter caches them, otherwise a
+            # later size/spread/transparency rebuild (which reads scene.colors) would
+            # silently revert to Pastel.
+            self._sync_scene_colors_to_scheme(scene)
             self._build_base_scatter()
             self._apply_highlight_colors(self._base_colors_rgba)
             self._update_cohort_labels()
@@ -1210,7 +1303,12 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         if self._auto_split_active:
             self._auto_split_step()
         else:
-            self._start_auto_split()
+            # Only start a FRESH cycle after ops that produce clusters (Load &
+            # Compute, Regroup, Optimize). Recompute deliberately leaves every node
+            # as noise (-1) so the user can tune clustering via Regroup — running
+            # auto-split there just logs "No cohorts to split" for nothing.
+            if getattr(self, '_auto_split_allowed', True):
+                self._start_auto_split()
 
         # Auto-Deorphan: optionally assign noise (-1) nodes to their nearest
         # cohort after the chosen operation. Skip when this completion IS a
@@ -1221,17 +1319,23 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         if was_deorphan:
             self._pending_deorphan = False
         else:
-            mode = getattr(self, 'auto_deorphan', "Never")
+            op = getattr(self, '_last_op', None)
+            ops_flags = getattr(self, 'auto_deorphan_ops', {}) or {}
             # Don't let deorphan steal the worker slot while an auto-split cycle
-            # is in flight (each split is a re-cluster round-trip).
+            # is in flight (each split is a re-cluster round-trip); it fires once
+            # after the final round instead. Pop sets no _last_op on purpose:
+            # removing a cohort creates no new orphans, so never trigger there.
             should_deorphan = (
-                not self._auto_split_active and (
-                    (mode == "After Load and Compute" and not was_recluster) or
-                    (mode == "After Regroup" and was_recluster)
-                )
+                not self._auto_split_active and op is not None and bool(ops_flags.get(op))
             )
             if should_deorphan:
                 self.start_deorphan()
+        # Consume the operation tag once; Deorphan's own completion must not
+        # re-trigger itself (its flags are set by start_deorphan, but clearing
+        # here also prevents a stale op from firing on an unrelated later run).
+        self._last_op = None
+        # Recompute suppressed this cycle only; allow fresh cycles again.
+        self._auto_split_allowed = True
 
         # Show basic scene stats in the status bar now that we're idle. If a new
         # worker (auto-split / deorphan) was just started, skip — its completion
@@ -1328,6 +1432,17 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             # Store file IDs for click handling (node_list == file ids, same index order)
             self.file_ids = scene.get_file_ids()
             self.node_list = scene.get_file_ids()
+
+            # Persist the scheme colors into the scene so every later rebuild path
+            # that reads scene.colors (size/spread/transparency changes, session
+            # save/restore) keeps the active color scheme instead of reverting to
+            # the Pastel default assigned by build_from_data. `colors` above was
+            # just computed for exactly this purpose — reuse it (no second pass).
+            try:
+                if len(colors) == len(scene.colors):
+                    scene.colors[:] = np.asarray(colors, dtype=np.uint8)
+            except Exception as e:
+                print(f"Error syncing scheme colors to scene: {e}")
 
             # Build base scatter cache for efficient highlight updates
             self._build_base_scatter()
@@ -1590,8 +1705,12 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         
         # Set camera distance to 1.5x the diagonal for a nice overview
         distance = max(diagonal * 1.5, 10)  # Minimum distance of 10
-        
-        # Move camera to look at the center of the data
+
+        self._set_camera_fit(center, distance)
+
+    def _set_camera_fit(self, center, distance):
+        """Point the camera at ``center`` (np.array(3)) from ``distance`` away."""
+        from PySide6.QtGui import QVector3D
         # Use QVector3D for center (required by PyQtGraph)
         self.gl_view.opts['center'] = QVector3D(float(center[0]), float(center[1]), float(center[2]))
         self.gl_view.opts['distance'] = float(distance)
@@ -1611,6 +1730,13 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
 
     def _sync_split_window(self):
         """Sync the split window display based on current selection state."""
+        # Refresh color-scheme button enablement (pipette/save/trash) — this runs at
+        # the end of every selection change, so it's a single reliable hook. Must run
+        # BEFORE any early-return below since the buttons exist regardless of whether
+        # the split window is open.
+        if hasattr(self, '_refresh_scheme_buttons'):
+            self._refresh_scheme_buttons()
+
         if self.split_window is None or not self.split_window.isVisible():
             return
         if not hasattr(self, 'node_list') or not self.node_list:
@@ -2617,6 +2743,16 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             colors = SceneGraph.SCIFI_COLORS
             return colors[cluster_id % len(colors)]
 
+        # Ephemeral palette generated from a node image via the pipette button.
+        if scheme == "Generated" and getattr(self, '_generated_palette', None):
+            colors = [tuple(int(c) for c in rgb) for rgb in self._generated_palette]
+            return colors[cluster_id % len(colors)]
+
+        # Stored custom color schemes (saved via the diskette button).
+        if scheme in getattr(self, 'custom_color_schemes', {}):
+            colors = [tuple(int(c) for c in rgb) for rgb in self.custom_color_schemes[scheme]]
+            return colors[cluster_id % len(colors)]
+
         # Matplotlib-based colormaps (Viridis, Plasma, Inferno, Coolwarm)
         try:
             import matplotlib.cm as cm
@@ -2643,6 +2779,37 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             from src.core.models import SceneGraph
             colors = SceneGraph.CLUSTER_COLORS
             return colors[cluster_id % len(colors)]
+
+    def _sync_scene_colors_to_scheme(self, scene=None):
+        """Write the active color scheme's per-cluster colors into ``scene.colors``.
+
+        SceneGraph.build_from_data always assigns Pastel (CLUSTER_COLORS), so any
+        other selected scheme is lost on every rebuild until something re-syncs it.
+        Called from render_scene and the in-place recluster path, both before the
+        base-scatter cache reads scene.colors.
+        """
+        import numpy as np
+
+        if scene is None:
+            scene = self.scene_graph
+        if scene is None or len(getattr(scene, 'file_ids', [])) == 0:
+            return
+        try:
+            cluster_ids_arr = np.asarray(scene.cluster_ids)
+            total_clusters = max(1, int(np.unique(cluster_ids_arr).size))
+            # Resolve one color per UNIQUE cohort (a LUT), not per node — at 500k
+            # nodes a per-node Python loop would stall the GUI thread. The gather
+            # via return_inverse is fully vectorized; only ~100-500 unique cohorts
+            # go through the Python resolver.
+            unique_cids, inverse = np.unique(cluster_ids_arr, return_inverse=True)
+            lut_colors = np.array(
+                [self._get_color_for_cluster(int(cid), total_clusters) for cid in unique_cids],
+                dtype=np.uint8)
+            colors = lut_colors[inverse]
+            if len(colors) == len(scene.colors):
+                scene.colors[:] = colors
+        except Exception as e:
+            print(f"Error syncing scheme colors to scene: {e}")
 
     def _on_color_scheme_changed(self):
         """Handle color scheme dropdown change - recolor all nodes."""
@@ -2688,6 +2855,10 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             pass
         self.gl_view.addItem(self.gl_scatter)
         self._build_base_scatter()
+
+        # Button enablement depends on which scheme is active (save/trash).
+        if hasattr(self, '_refresh_scheme_buttons'):
+            self._refresh_scheme_buttons()
 
     def _on_bg_color_changed(self):
         """Apply the chosen 3D view background color (live)."""
@@ -2754,7 +2925,15 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             self.query_edit.setText(settings.get("query", ""))
             self.whitelist_edit.setText(settings.get("whitelist", ""))
             self.blacklist_edit.setText(settings.get("blacklist", ""))
-            self.min_doc_freq_spin.setValue(settings.get("min_doc_freq", 3))
+            # Unit-aware Min Tag Frequency (n / %): restore both values + unit.
+            if hasattr(self, '_apply_min_doc_freq_state'):
+                self._apply_min_doc_freq_state({
+                    "min_doc_freq": settings.get("min_doc_freq", 3),
+                    "min_doc_freq_pct": settings.get("min_doc_freq_pct", 1),
+                    "min_doc_freq_unit": settings.get("min_doc_freq_unit", "n"),
+                })
+            else:
+                self.min_doc_freq_spin.setValue(settings.get("min_doc_freq", 3))
             self.drop_universal = settings.get("drop_universal_tags", True)
 
             self.status_label.setText("Loaded last settings, starting data load...")
@@ -2927,7 +3106,8 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             if hasattr(self, 'selection_timer'):
                 self.selection_timer.stop()
 
-            self.time_travel_button.setText("Stop")
+            # Icon-style button: swap play triangle for a stop square (same glyph family).
+            self.time_travel_button.setText("\u25A0")  # ■ stop
             self.time_travel_button.setToolTip("Stop the Explore helicopter-orbit animation.")
             self.time_travel_timer.start(33)  # ~30 fps
 
@@ -2948,9 +3128,10 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         self.time_travel_timer.stop()
         self._remove_explore_marker()
         self._explore_clear_path_preview()
-        self.time_travel_button.setText("Explore")
+        # Restore the play triangle icon (not a word — this is an icon-style button).
+        self.time_travel_button.setText("\u25B6")  # ▶ play
         self.time_travel_button.setToolTip(
-            "Fly the camera around random cohorts (helicopter orbit).")
+            "Explore: fly the camera around random cohorts (helicopter orbit).\nClick again to stop.")
         # Re-enable the selection blink if a cohort is still selected.
         if hasattr(self, 'selection_timer') and self.selected_cluster_id not in (None, -1):
             self.selection_timer.start(500)
@@ -3537,9 +3718,29 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
             f"Auto-split cycle {self._auto_split_cycles_done + 1}/{max_cycles}: "
             f"splitting cohort {largest_id} ({largest_size:,} files)...")
 
-        # Select it (drives _recluster_selection, which reads selected_cluster_id).
-        member_idx = int(np.where(cluster_ids == largest_id)[0][0])
-        self.show_cluster_info(member_idx)
+        # Don't start a split if another worker is already running (e.g. deorphan);
+        # otherwise _recluster_selection would no-op and we'd get stuck below.
+        try:
+            if self._is_worker_busy():
+                print("[AutoSplit] Worker busy; aborting cycle.")
+                self.status_label.setText("Auto-split skipped - another process is running.")
+                self._auto_split_active = False
+                return
+        except Exception:
+            pass
+
+        # Select it directly (drives _recluster_selection, which reads selected_cluster_id).
+        # We deliberately do NOT call show_cluster_info() here: building the full info
+        # panel + tag grid for a very large cohort can throw or stall, and any failure
+        # would leave no worker running -> on_loading_finished never fires again ->
+        # _auto_split_active stuck True with nothing happening (the "silent trap").
+        try:
+            self.selected_cluster_id = int(largest_id)
+            self.selection_visible = True
+        except Exception as e:
+            print(f"[AutoSplit] Failed to select cohort {largest_id}: {e}")
+            self._auto_split_active = False
+            return
 
         # Record membership by file_id so the early-stop check can measure how
         # much the target shrank after re-cluster remaps its labels.
@@ -3550,7 +3751,24 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
 
         # _recluster_selection sets _pending_recluster and starts the worker;
         # on_loading_finished will call _auto_split_step() again when done.
-        self._recluster_selection()
+        try:
+            self._recluster_selection()
+        except Exception as e:
+            print(f"[AutoSplit] Re-cluster failed to start: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # Safety net: if no worker actually started (a guard inside _recluster_selection
+        # fired, or it threw), on_loading_finished will never fire again and we'd be
+        # stuck with _auto_split_active True. Detect that and abort cleanly.
+        try:
+            w = getattr(self, 'worker', None)
+            if not (w is not None and w.isRunning()):
+                print("[AutoSplit] No worker running after re-cluster; aborting cycle.")
+                self.status_label.setText("Auto-split stopped - could not start a split.")
+                self._auto_split_active = False
+        except Exception:
+            pass
 
     def _start_auto_split(self):
         """Begin an auto-split cycle (called after Load & Compute / Regroup)."""
@@ -3832,12 +4050,16 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         positions = scene.positions * spread
 
         persistent = getattr(self, 'wasd_persistent_labels', False)
+        sel_cid = getattr(self, 'selected_cluster_id', None)
         anchor_cid = None
-        if persistent and (self.selected_cluster_id is None or self.selected_cluster_id == -1):
-            # No selection: use the largest cohort as the arrow origin.
-            sizes = np.bincount(scene.cluster_ids[scene.cluster_ids != -1])
+        if persistent and (sel_cid is None or sel_cid == -1):
+            # No selection: use the largest cohort as the arrow origin. Guarded —
+            # after a Recompute every node is noise (-1), so there may be NO cohorts;
+            # np.bincount([]) returns an empty array whose argmax() raises
+            # "index 0 out of bounds for axis 0 with size 0".
             non_noise = scene.cluster_ids[scene.cluster_ids != -1]
-            if len(non_noise) > 0 and len(sizes) > 0:
+            if len(non_noise) > 0:
+                sizes = np.bincount(non_noise)
                 anchor_cid = int(np.argmax(sizes))
 
         import pyqtgraph.opengl as gl
@@ -3848,7 +4070,7 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         if not targets:
             return
 
-        origin_cid = anchor_cid if (persistent and anchor_cid is not None) else self.selected_cluster_id
+        origin_cid = anchor_cid if (persistent and anchor_cid is not None) else sel_cid
         sel_idx = np.where(scene.cluster_ids == origin_cid)[0]
         if len(sel_idx) == 0:
             return
@@ -3895,7 +4117,9 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         """
         try:
             persistent = getattr(self, 'wasd_persistent_labels', False)
-            has_selection = self.selected_cluster_id not in (None, -1)
+            # selected_cluster_id is initialized later than this method can be
+            # called from (label rebuild during early session load), so guard it.
+            has_selection = getattr(self, 'selected_cluster_id', None) not in (None, -1)
             if persistent or (getattr(self, '_wasd_mode', False) and has_selection):
                 self._wasd_draw_paths()
         except Exception as e:
@@ -3957,7 +4181,7 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
         # "Keep WASD labels visible": don't fade on a non-WASD selection change — the
         # arrows are redrawn from the new centroid instead (see show_cluster_info).
         if getattr(self, 'wasd_persistent_labels', False) and \
-                self.selected_cluster_id not in (None, -1):
+                getattr(self, 'selected_cluster_id', None) not in (None, -1):
             return
         if getattr(self, '_wasd_items', []):
             self._wasd_mode = False
@@ -4015,8 +4239,9 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                         d = float(np.linalg.norm(c - cur))
                         if d < best_d:
                             best_d, best_cid = d, int(cid)
-                    member_idx = int(np.where(scene.cluster_ids == best_cid)[0][0])
-                    self.show_cluster_info(member_idx)
+                    _mi = np.where(scene.cluster_ids == best_cid)[0]
+                    if len(_mi) > 0:
+                        self.show_cluster_info(int(_mi[0]))
                     # Record the starting point of the travel trail.
                     self._wasd_history_add(best_cid)
 
@@ -4024,8 +4249,9 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
                 targets = self._wasd_pick_targets()
                 target_cid = targets.get(key)
                 if target_cid is not None:
-                    member_idx = int(np.where(scene.cluster_ids == target_cid)[0][0])
-                    self.show_cluster_info(member_idx)  # selects the new cohort
+                    _mi = np.where(scene.cluster_ids == target_cid)[0]
+                    if len(_mi) > 0:
+                        self.show_cluster_info(int(_mi[0]))  # selects the new cohort
                     # Optionally recenter the camera on the newly selected cohort.
                     if getattr(self, 'auto_center_on_selection', False):
                         self._recenter_camera_on_cohort(target_cid)
@@ -4042,7 +4268,8 @@ class TagMap3DTab(CohortOpsMixin, DataPipelineMixin, PickingHighlightMixin, Coho
 
     def _on_camera_moved(self):
         """Refresh WASD preview paths when the camera moves (arrow-key orbit)."""
-        if getattr(self, '_wasd_mode', False) and self.selected_cluster_id not in (None, -1):
+        if getattr(self, '_wasd_mode', False) and \
+                getattr(self, 'selected_cluster_id', None) not in (None, -1):
             self._wasd_draw_paths()
 
     # ------------------------------------------------------------------

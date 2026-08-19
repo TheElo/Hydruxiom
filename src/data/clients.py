@@ -14,7 +14,8 @@ Shape of clients.json::
         "api_key": "<64-char hex>",
         "db_dir": "<path to Hydrus client db folder>",
         "files_dir": "<path to files>",
-        "thumbs_dir": "<path to thumbs>"
+        "thumbs_dir": "<path to thumbs>",
+        "tls_verify": false
       },
       ...
     }
@@ -119,6 +120,61 @@ def get_client_db_dir(client_id: str) -> Optional[str]:
     return db_dir
 
 
+def normalize_api_url(api_url: str) -> str:
+    """Normalize a user-entered Hydrus API base URL.
+
+    Users may type the endpoint however their setup uses it, e.g.:
+      - bare host+port:        ``192.168.1.40:16609``
+      - with middleware path:  ``192.168.1.40:16609/hyapi``   (reverse proxy)
+      - full URL:              ``http://127.0.0.1:45869/``
+
+    This adds a scheme when missing (defaults to http, which covers local and
+    LAN Hydrus instances / gateways) so that requests never fail with
+    "Invalid URL '/get_services': No scheme supplied". Path prefixes are kept
+    intact — hydrus-api appends endpoint paths by plain string concatenation.
+
+    Returns the normalized base URL (no trailing slash; hydrus-api strips it).
+    """
+    import re
+    from urllib.parse import urlsplit, urlunsplit
+
+    u = (api_url or "").strip()
+    if not u:
+        return ""
+
+    # Full URL with scheme — just clean up the path.
+    m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", u)
+    if m:
+        parts = urlsplit(u)
+        path = parts.path.rstrip("/")
+        return urlunsplit((parts.scheme.lower(), parts.netloc or "localhost", path, "", ""))
+
+    # No scheme — assume http. Split host[:port] from any trailing path manually
+    # (urlsplit would misparse a bare "host:port" as path+query).
+    head, _, tail = u.partition("/")
+    netloc = head.strip() or "localhost"
+    path = "/" + "/".join(p for p in tail.split("/") if p)  # drop empties/dupes
+    return f"http://{netloc}{path}"
+
+
+def make_session(tls_verify: bool = True):
+    """Create a ``requests.Session`` for Hydrus API calls.
+
+    When ``tls_verify`` is False, certificate verification is disabled and the
+    urllib3 InsecureRequestWarning spam is suppressed. This exists because some
+    users run behind MITM proxies or with self-signed certs; it defaults to ON
+    so normal users keep full TLS security.
+    """
+    import requests
+
+    session = requests.Session()
+    if not tls_verify:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        session.verify = False
+    return session
+
+
 def connect_to_client(client_id: str):
     """Create a Hydrus API client for the given ID.
 
@@ -136,4 +192,8 @@ def connect_to_client(client_id: str):
         raise KeyError(f"Client '{client_id}' not found in clients.json")
 
     import hydrus_api
-    return hydrus_api.Client(access_key=cfg["api_key"], api_url=cfg["api_url"])
+    base = normalize_api_url(cfg["api_url"])
+    session = make_session(cfg.get("tls_verify", True))
+    # hydrus-api appends endpoint paths by string concatenation to api_url, so a
+    # normalized base (scheme + optional path prefix like /hyapi) is all we need.
+    return hydrus_api.Client(access_key=cfg["api_key"], api_url=base, session=session)

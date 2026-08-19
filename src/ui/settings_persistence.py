@@ -28,10 +28,21 @@ class SettingsPersistenceMixin:
                 self.client_combo.setCurrentIndex(client_idx)
             # Chunk Size is now a plain int attribute (its spinbox lives in the
             # Settings window -> Clients tab, not on this widget tree).
+            # Path-specific chunk sizes. Back-compat: pre-split settings only have a
+            # single "chunk_size" — use it for the API path and default direct-DB to 4096.
             try:
-                self.chunk_size = int(settings.get("chunk_size", 8192))
+                _legacy_chunk = int(settings.get("chunk_size", 8192))
             except (TypeError, ValueError):
-                self.chunk_size = 8192
+                _legacy_chunk = 8192
+            self.chunk_size = _legacy_chunk
+            try:
+                self.api_chunk_size = int(settings.get("api_chunk_size", _legacy_chunk))
+            except (TypeError, ValueError):
+                self.api_chunk_size = _legacy_chunk
+            try:
+                self.direct_chunk_size = int(settings.get("direct_chunk_size", 4096))
+            except (TypeError, ValueError):
+                self.direct_chunk_size = 4096
             self.max_files_spin.setValue(settings.get("max_files", 20000))
             # Populate tag services dynamically for the selected client, then
             # restore the saved tag service selection.
@@ -64,6 +75,23 @@ class SettingsPersistenceMixin:
             # Advanced settings (low RAM, CPU cores)
             self.low_memory = settings.get("low_memory", True)
             self.n_jobs = settings.get("n_jobs", os.cpu_count() or 4)
+            # Reserved parallel-load thread counts (applied once the threaded loader lands).
+            self.api_load_threads = int(settings.get("api_load_threads", 4))
+            self.direct_load_threads = int(settings.get("direct_load_threads", 2))
+            # Chunked transform toggle (subsample path); sync the checkbox if present.
+            self.chunked_transform = bool(settings.get("chunked_transform", True))
+            _ct_cb = getattr(self, 'chunked_transform_checkbox', None)
+            if _ct_cb is not None:
+                _ct_cb.setChecked(self.chunked_transform)
+            # Pre-SVD toggle (performance); sync the checkbox if present.
+            self.pre_svd_enabled = bool(settings.get("pre_svd_enabled", False))
+            self.pre_svd_components = int(settings.get("pre_svd_components", 64))
+            _ps_cb = getattr(self, 'pre_svd_checkbox', None)
+            if _ps_cb is not None:
+                _ps_cb.setChecked(self.pre_svd_enabled)
+            _ps_spin = getattr(self, 'pre_svd_components_spin', None)
+            if _ps_spin is not None:
+                _ps_spin.setValue(self.pre_svd_components)
 
             # Cluster settings
             self.eps_spin.setValue(settings.get("eps", 12))
@@ -79,10 +107,22 @@ class SettingsPersistenceMixin:
             self.normalize_positions = settings.get("normalize_positions", True)
             # Sync the inline checkbox so the UI reflects the saved value
             self.normalize_checkbox.setChecked(self.normalize_positions)
-            # Auto-Deorphan behavior (validated against known values below)
-            _ad = settings.get("auto_deorphan", "Never")
-            if _ad in ("Never", "After Load and Compute", "After Regroup"):
-                self.auto_deorphan = _ad
+            # Auto-Deorphan per-operation flags. Migrate the legacy single-mode
+            # string ("Never" / "After Load and Compute" / "After Regroup") so
+            # existing settings files keep working unchanged.
+            if isinstance(settings.get("auto_deorphan_ops"), dict):
+                _ad = settings["auto_deorphan_ops"]
+                self.auto_deorphan_ops = {k: bool(_ad.get(k)) for k in ("load", "regroup", "split")}
+            else:
+                _legacy = settings.get("auto_deorphan", "Never")
+                if _legacy not in ("Never", "After Load and Compute", "After Regroup"):
+                    _legacy = "Never"
+                self.auto_deorphan_ops = {
+                    "load": _legacy == "After Load and Compute",
+                    # Old "After Regroup" also fired after Optimize (full re-cluster).
+                    "regroup": _legacy == "After Regroup",
+                    "split": False,
+                }
             # Auto-split oversized cohorts after Load & Compute
             self.auto_split_enabled = bool(settings.get("auto_split_enabled", True))
             self.auto_split_threshold = int(settings.get("auto_split_threshold", 5000))
@@ -161,7 +201,15 @@ class SettingsPersistenceMixin:
                 self.wasd_persistent_checkbox.setChecked(self.wasd_persistent_labels)
             self.smooth_center_transition = bool(settings.get("smooth_center_transition", False))
             self.smooth_center_speed = float(settings.get("smooth_center_speed", 1.0))
-            self.min_doc_freq_spin.setValue(settings.get("min_doc_freq", 5))
+            # Unit-aware Min Tag Frequency (n / %). Restore both stored values + unit.
+            if hasattr(self, '_apply_min_doc_freq_state'):
+                self._apply_min_doc_freq_state({
+                    "min_doc_freq": settings.get("min_doc_freq", 5),
+                    "min_doc_freq_pct": settings.get("min_doc_freq_pct", 1),
+                    "min_doc_freq_unit": settings.get("min_doc_freq_unit", "n"),
+                })
+            else:
+                self.min_doc_freq_spin.setValue(settings.get("min_doc_freq", 5))
             self.drop_universal = settings.get("drop_universal_tags", True)
 
             # Visualization settings (node_size is stored as actual value, displayed x10)
@@ -218,10 +266,21 @@ class SettingsPersistenceMixin:
             # Toggle last: _on_twinkle_toggle will no-op if no scene loaded yet
             self.twinkle_checkbox.setChecked(settings.get("twinkle_enabled", False))
 
-            # V5: Color scheme setting
-            color_scheme_idx = self.color_scheme_combo.findText(settings.get("color_scheme", "Pastel"))
-            if color_scheme_idx >= 0:
-                self.color_scheme_combo.setCurrentIndex(color_scheme_idx)
+            # V5: Color scheme setting (+ user-generated custom schemes + palette size).
+            _custom_schemes = settings.get("custom_color_schemes") or {}
+            if isinstance(_custom_schemes, dict):
+                self.custom_color_schemes = {k: [list(c) for c in v] for k, v in _custom_schemes.items()}
+            if hasattr(self, 'palette_colors_spin'):
+                self.palette_colors_spin.setValue(int(settings.get("palette_colors", 19)))
+            # Rebuild the dropdown with stored schemes included, then select active.
+            if hasattr(self, '_rebuild_color_scheme_combo'):
+                _cs = settings.get("color_scheme", "Pastel")
+                # A previously-active ephemeral "Generated" scheme isn't persisted; fall back to Pastel.
+                self._rebuild_color_scheme_combo(select=_cs if _cs != "Generated" else "Pastel")
+            else:
+                color_scheme_idx = self.color_scheme_combo.findText(settings.get("color_scheme", "Pastel"))
+                if color_scheme_idx >= 0:
+                    self.color_scheme_combo.setCurrentIndex(color_scheme_idx)
 
             # Node sizing mode (Distance is the legacy default). Set directly so we
             # don't trigger a scatter rebuild during load (no scene exists yet).
@@ -271,6 +330,26 @@ class SettingsPersistenceMixin:
             )
             if smart_mode_idx >= 0:
                 self.smart_label_mode_combo.setCurrentIndex(smart_mode_idx)
+
+            # Label Space (overlap handling): mode + gap. Set the attributes first so
+            # _apply_label_space() can read them, then sync the widgets without firing
+            # a redundant re-apply during load.
+            _lsm = settings.get("label_space_mode", "Fade")
+            self.label_space_mode = _lsm if _lsm in ("None", "Fade", "Move") else "Fade"
+            try:
+                self.label_space_gap = int(settings.get("label_space_gap", 25))
+            except (TypeError, ValueError):
+                self.label_space_gap = 25
+            if hasattr(self, 'label_space_combo'):
+                _ls_idx = self.label_space_combo.findText(self.label_space_mode)
+                if _ls_idx >= 0:
+                    self.label_space_combo.blockSignals(True)
+                    self.label_space_combo.setCurrentIndex(_ls_idx)
+                    self.label_space_combo.blockSignals(False)
+            if hasattr(self, 'label_gap_spin'):
+                self.label_gap_spin.blockSignals(True)
+                self.label_gap_spin.setValue(max(0, min(200, self.label_space_gap)))
+                self.label_gap_spin.blockSignals(False)
 
             # Split window settings (image preview)
             if hasattr(self, 'split_window') and self.split_window:
@@ -338,6 +417,7 @@ class SettingsPersistenceMixin:
             'sub_eps_spin': 'valueChanged',
             'sub_min_samples_spin': 'valueChanged',
             'min_doc_freq_spin': 'valueChanged',
+            'min_doc_freq_unit_combo': 'currentTextChanged',
             'min_size_spin': 'valueChanged',
             'spread_spin': 'valueChanged',
             'orbit_speed_spin': 'valueChanged',
@@ -405,12 +485,32 @@ class SettingsPersistenceMixin:
             settings = dict(existing)
             settings.update({
                 "client": self.client_combo.currentText(),
-                "chunk_size": int(getattr(self, 'chunk_size', 8192)),
+                # Path-specific chunk sizes (legacy single key kept in sync for back-compat).
+                "api_chunk_size": int(getattr(self, 'api_chunk_size', getattr(self, 'chunk_size', 8192))),
+                "direct_chunk_size": int(getattr(self, 'direct_chunk_size', 4096)),
+                "chunk_size": int(getattr(self, 'api_chunk_size', getattr(self, 'chunk_size', 8192))),
                 "max_files": self.max_files_spin.value(),
                 "tag_service": self.tag_service_combo.currentText(),
                 "use_direct_db": self.use_direct_db,
                 "low_memory": self.low_memory,
                 "n_jobs": self.n_jobs,
+                # Reserved parallel-load thread counts (see benchmarks/benchmark_api_io.py).
+                "api_load_threads": int(getattr(self, 'api_load_threads', 4)),
+                "direct_load_threads": int(getattr(self, 'direct_load_threads', 2)),
+                # Read live widget state (attributes can be stale if the user
+                # toggled the checkbox without opening the Settings dialog).
+                "chunked_transform": bool(
+                    self.chunked_transform_checkbox.isChecked()
+                    if hasattr(self, 'chunked_transform_checkbox') else getattr(self, 'chunked_transform', True)
+                ),
+                "pre_svd_enabled": bool(
+                    self.pre_svd_checkbox.isChecked()
+                    if hasattr(self, 'pre_svd_checkbox') else getattr(self, 'pre_svd_enabled', False)
+                ),
+                "pre_svd_components": int(
+                    self.pre_svd_components_spin.value()
+                    if hasattr(self, 'pre_svd_components_spin') else getattr(self, 'pre_svd_components', 64)
+                ),
                 "algorithm": self.algorithm_combo.currentText(),
                 "n_neighbors": self.n_neighbors_spin.value(),
                 "min_dist": self.min_dist_spin.value(),
@@ -432,7 +532,7 @@ class SettingsPersistenceMixin:
                 "opt_min_samples_min": getattr(self, 'opt_min_samples_min', 2),
                 "opt_min_samples_max": getattr(self, 'opt_min_samples_max', 30),
                 "normalize_positions": getattr(self, 'normalize_positions', True),
-                "auto_deorphan": getattr(self, 'auto_deorphan', "Never"),
+                "auto_deorphan_ops": {k: bool(v) for k, v in (getattr(self, 'auto_deorphan_ops', None) or {}).items()},
                 "auto_split_enabled": bool(getattr(self, 'auto_split_enabled', True)),
                 "auto_split_threshold": int(getattr(self, 'auto_split_threshold', 5000)),
                 "auto_split_max_cycles": int(getattr(self, 'auto_split_max_cycles', 3)),
@@ -469,7 +569,9 @@ class SettingsPersistenceMixin:
                 "wasd_persistent_labels": bool(getattr(self, 'wasd_persistent_labels', False)),
                 "smooth_center_transition": bool(getattr(self, 'smooth_center_transition', False)),
                 "smooth_center_speed": float(getattr(self, 'smooth_center_speed', 1.0)),
-                "min_doc_freq": self.min_doc_freq_spin.value(),
+                # Unit-aware Min Tag Frequency (n / %): store both values + active unit.
+                **(self._min_doc_freq_state() if hasattr(self, '_min_doc_freq_state')
+                   else {"min_doc_freq": self.min_doc_freq_spin.value()}),
                 # Tag query grid layout (columns x rows; max tags = cols * rows)
                 "tag_query_columns": int(getattr(self, 'tag_query_columns', 3)),
                 "tag_query_rows": int(getattr(self, 'tag_query_rows', 14)),
@@ -498,8 +600,10 @@ class SettingsPersistenceMixin:
                 "twinkle_lifespan_max": self.twinkle_lifespan_max_spin.value(),
                 "twinkle_freq": self.twinkle_freq_spin.value(),
                 "twinkle_brightness": self.twinkle_brightness_spin.value(),
-                # Color scheme
+                # Color scheme (+ user-generated custom schemes + palette size).
                 "color_scheme": self.color_scheme_combo.currentText(),
+                "custom_color_schemes": getattr(self, 'custom_color_schemes', {}),
+                "palette_colors": int(getattr(self, 'palette_colors_spin').value()) if hasattr(self, 'palette_colors_spin') else 19,
                 # Cohort label settings
                 "cohort_threshold": self.cohort_threshold_spin.value(),
                 "show_cohort_labels": self.show_cohort_labels_checkbox.isChecked(),
@@ -517,6 +621,9 @@ class SettingsPersistenceMixin:
                 "label_fade_duration_ms": int(self.label_fade_duration_spin.value()) if hasattr(self, 'label_fade_duration_spin') else 2000,
                 # Smart labels settings (merged into mode combo; "Raw" = disabled)
                 "smart_label_mode": self.smart_label_mode_combo.currentText(),
+                # Label Space (overlap handling): mode + gap
+                "label_space_mode": getattr(self, 'label_space_mode', "None"),
+                "label_space_gap": int(getattr(self, 'label_space_gap', 8)),
                 # Media viewer open/closed state (restored on startup)
                 "media_viewer_open": bool(getattr(self, 'split_window', None)),
                 # Split window settings (image preview)
@@ -581,6 +688,33 @@ class SettingsPersistenceMixin:
             pass
 
     @staticmethod
+    def _frame_margins(widget):
+        """Return (left, top, right, bottom) window-frame margins in logical px.
+
+        ``geometry()`` is the CLIENT area; on Windows the WM draws the title bar
+        ABOVE it and borders around it. We need those margins so a clamped window
+        keeps its caption visible instead of getting "stuck at the top". When the
+        widget isn't decorated yet (not shown) Qt reports zero frame, so fall back
+        to an estimate for the caption height — better slightly too much than none.
+        """
+        try:
+            fg = widget.frameGeometry()
+            g = widget.geometry()
+            left = max(0, g.x() - fg.x())
+            top = max(0, g.y() - fg.y())
+            right = max(0, (fg.x() + fg.width()) - (g.x() + g.width()))
+            bottom = max(0, (fg.y() + fg.height()) - (g.y() + g.height()))
+        except Exception:
+            left = top = right = bottom = 0
+        if not widget.isVisible():
+            # Not decorated yet -> frame margins are unreliable; estimate caption.
+            top = max(top, 32)
+            left = max(left, 8)
+            right = max(right, 8)
+            bottom = max(bottom, 8)
+        return left, top, right, bottom
+
+    @staticmethod
     def _clamp_widget_to_screens(widget):
         """Keep a window's size + position within the available screen area.
 
@@ -588,8 +722,9 @@ class SettingsPersistenceMixin:
         than the current screen (UI scale multiplies logical sizes at startup),
         leaving e.g. the bottom status bar off-screen and the window feeling
         "unresizable". The size is capped to the available area of the screen it
-        sits on; if it intersects no screen at all (e.g. a monitor was unplugged)
-        it is moved onto the primary one so the title bar is always reachable.
+        sits on, RESERVING room for the window frame so the title bar stays
+        visible (not pushed above the top edge). If it intersects no screen at all
+        (e.g. a monitor was unplugged) it is moved onto the primary one.
         """
         from PySide6.QtGui import QGuiApplication
         # NOTE: screens() is a static of QGuiApplication (QCoreApplication has no such method).
@@ -602,13 +737,19 @@ class SettingsPersistenceMixin:
         primary = QGuiApplication.primaryScreen() or screens[0]
         avail = (host or primary).availableGeometry()
 
+        left, top, right, bottom = SettingsPersistenceMixin._frame_margins(widget)
+        max_w = max(1, avail.width() - left - right)
+        max_h = max(1, avail.height() - top - bottom)
+
         w, h = geo.width(), geo.height()
-        if w > avail.width():
-            w = max(1, avail.width())
-        if h > avail.height():
-            h = max(1, avail.height())
-        x = min(max(geo.x(), avail.left()), avail.right() - w)
-        y = min(max(geo.y(), avail.top()), avail.bottom() - h)
+        if w > max_w:
+            w = max_w
+        if h > max_h:
+            h = max_h
+        # Client-area origin; the caption sits `top` px above it, so keep x/y at
+        # least one frame margin inside the available area.
+        x = min(max(geo.x(), avail.left() + left), avail.right() - right - w)
+        y = min(max(geo.y(), avail.top() + top), avail.bottom() - bottom - h)
         widget.setGeometry(x, y, w, h)
 
     @staticmethod

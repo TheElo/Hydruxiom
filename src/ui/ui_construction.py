@@ -12,13 +12,13 @@ import tempfile
 import numpy as np
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QToolButton,
     QSpinBox, QComboBox, QProgressBar, QGroupBox, QFormLayout,
     QTextEdit, QSplitter, QScrollArea, QLineEdit, QDoubleSpinBox, QCheckBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QGridLayout, QFileDialog, QTabWidget,
-    QStyledItemDelegate, QStyleOptionViewItem, QApplication
+    QStyledItemDelegate, QStyleOptionViewItem, QApplication, QInputDialog, QMessageBox
 )
-from PySide6.QtCore import Qt, QTimer, QEvent
+from PySide6.QtCore import Qt, QTimer, QEvent, QThread, Signal
 from PySide6.QtGui import (
     QCloseEvent, QMouseEvent, QVector3D, QFont, QPainter, QColor, QFontMetrics,
 )
@@ -35,9 +35,58 @@ from src.ui.panels.tag_query import (
     query_to_api_tags, parse_query_tag_states,
 )
 from src.ui.tag_map_utils import (
-    compile_tag_patterns, ease_in_out, SETTINGS_FILE, clamp_scroll_page_width,
+    compile_tag_patterns, ease_in_out, SETTINGS_FILE,
+    clamp_scroll_page_width, install_wheel_guard,
 )
 from src.ui.gl_text_items import get_multiline_text_item_class as _get_multiline_text_item_class
+from src.pipeline.color_schemes import extract_palette_from_image, sanitize_scheme_name
+
+
+class _PaletteWorker(QThread):
+    """Background worker: fetch a node's image from Hydrus + run KMeans extraction.
+
+    Only network I/O and CPU-bound palette math happen here; the resulting list of
+    (r,g,b) tuples is emitted to the main thread which applies it as the active scheme.
+    Mirrors SingleFileLoader in media_viewer.py: bytes are fetched on this thread,
+    but no QPixmap/Qt-GUI objects are created off-thread.
+    """
+    palette_ready = Signal(list)   # list of (r,g,b) tuples 0-255
+    error = Signal(str)
+
+    def __init__(self, client_name, file_id, n_colors, parent=None):
+        super().__init__(parent)
+        self.client_name = client_name
+        self.file_id = file_id
+        self.n_colors = int(n_colors)
+
+    def run(self):
+        try:
+            from src.utils.utility_functions import ConnectToClient
+            client = ConnectToClient(self.client_name)
+            # Prefer full-res (same path the media viewer's SingleFileLoader uses);
+            # fall back to thumbnail if get_file fails for this file type.
+            image_bytes = None
+            try:
+                resp = client.get_file(file_id=self.file_id)
+                if resp is not None and getattr(resp, 'content', None):
+                    image_bytes = bytes(resp.content)
+            except Exception as e:
+                print(f"[PaletteWorker] get_file failed ({e}); trying thumbnail")
+            if not image_bytes:
+                try:
+                    resp = client.get_thumbnail(file_id=self.file_id)
+                    if resp is not None and getattr(resp, 'content', None):
+                        image_bytes = bytes(resp.content)
+                except Exception as e:
+                    print(f"[PaletteWorker] get_thumbnail failed ({e})")
+            if not image_bytes:
+                self.error.emit("No image data returned by Hydrus for this file.")
+                return
+            palette = extract_palette_from_image(image_bytes, n_colors=self.n_colors)
+            self.palette_ready.emit(palette)
+        except Exception as e:
+            print(f"[PaletteWorker] error: {e}")
+            self.error.emit(str(e))
 
 
 def _scheme_preview_colors(name):
@@ -192,6 +241,10 @@ class UIConstructionMixin:
 
         # Reorganize: right sidebar into tabs, move wobble/status/tag-grid.
         self._reorganize_sidebars()
+
+        # Wheel over a spin box / combo should scroll the panel, not change its value.
+        install_wheel_guard(self.left_sidebar)
+        install_wheel_guard(self.right_sidebar)
 
         main_splitter.setStretchFactor(0, 0)  # Left panel - fixed
         main_splitter.setStretchFactor(1, 1)  # Center - stretches
@@ -421,9 +474,12 @@ class UIConstructionMixin:
         # UMAP Subsampling (for large datasets)
         self.subsample_checkbox = QCheckBox("Subsample")
         self.subsample_checkbox.setChecked(False)
-        self.subsample_checkbox.setToolTip("Fit UMAP on a random subset, then transform all points.\n"
-                                           "Essential for 1M+ files to avoid memory allocation failures.\n"
-                                           "The subset size controls accuracy vs. speed tradeoff.")
+        self.subsample_checkbox.setToolTip(
+            "Fit UMAP on a random subset, then project ALL points into that fixed space.\n\n"
+            "PERFORMANCE: caps peak RAM at any scale (essential for 1M+ files), but is SLOWER\n"
+            "than plain UMAP when the full fit would have fit in memory — projection cost grows\n"
+            "with files x subset size. The [RAM check] console line tells you which case applies.\n\n"
+            "The subset size controls layout fidelity vs. speed tradeoff.")
         algo_layout.addRow("Subsample:", self.subsample_checkbox)
 
         self.subsample_size_spin = QSpinBox()
@@ -435,6 +491,40 @@ class UIConstructionMixin:
                                             "Higher = more accurate layout, more memory.\n"
                                             "Default: 70000")
         algo_layout.addRow("Subset Size:", self.subsample_size_spin)
+
+        # Chunked transform (only relevant when Subsample is on): project all rows
+        # in bounded chunks instead of one giant call. Keeps peak RAM ~2 GB at any
+        # scale; uncheck to use the legacy single-call path for A/B comparison.
+        self.chunked_transform_checkbox = QCheckBox("Chunked Transform")
+        self.chunked_transform_checkbox.setChecked(True)
+        self.chunked_transform_checkbox.setToolTip(
+            "Transform all points in bounded row chunks (peak RAM stays ~2 GB)\n"
+            "instead of one giant call that densifies the full matrix at once.\n"
+            "Only used when Subsample is enabled. Uncheck to compare against\n"
+            "the legacy single-call path on your real data.")
+        algo_layout.addRow("Chunked Transform:", self.chunked_transform_checkbox)
+
+        # Pre-SVD (performance): collapse tag dims to a low-dim dense space before
+        # UMAP. umap-learn densifies internally and NN-descent cost scales with
+        # dimensionality, so 20k+ tag dims -> ~64 makes the non-subsampled path
+        # dramatically faster + lighter on RAM. Toggleable off for A/B comparison.
+        self.pre_svd_checkbox = QCheckBox("Pre-SVD")
+        self.pre_svd_checkbox.setChecked(False)
+        self.pre_svd_checkbox.setToolTip(
+            "Run TruncatedSVD before UMAP to collapse tag dimensions (e.g. 20k -> 64).\n"
+            "UMAP densifies its input internally and neighbor-search cost scales with\n"
+            "dimensionality, so this makes the non-subsampled path much faster and uses\n"
+            "far less RAM. Local structure is well preserved (standard for TF-IDF data).\n"
+            "Uncheck to compare against plain UMAP on your real data.")
+        algo_layout.addRow("Pre-SVD:", self.pre_svd_checkbox)
+
+        self.pre_svd_components_spin = QSpinBox()
+        self.pre_svd_components_spin.setRange(16, 512)
+        self.pre_svd_components_spin.setValue(64)
+        self.pre_svd_components_spin.setToolTip("Number of SVD components to keep before UMAP.\n"
+                                                "32-64 is the usual sweet spot for TF-IDF-like data.\n"
+                                                "Higher = more structure kept, slower. Default: 64")
+        algo_layout.addRow("SVD Components:", self.pre_svd_components_spin)
 
         algo_group.setLayout(algo_layout)
 
@@ -511,11 +601,36 @@ class UIConstructionMixin:
         # "Drop empty files" moved to the Settings window (Performance group),
         # backed by the self.drop_empty_files attribute.
 
+        # Min Tag Frequency now has a unit selector ("n" absolute file count, or
+        # "%" fraction of the loaded collection). A single numeric field is reused;
+        # each unit remembers its own value and it is swapped in on switch. The two
+        # stored values live on self._min_doc_freq_n / self._min_doc_freq_pct.
+        self._min_doc_freq_n = 5      # absolute file-count threshold (unit "n")
+        self._min_doc_freq_pct = 1    # percent-of-collection threshold (unit "%")
+
         self.min_doc_freq_spin = QSpinBox()
-        self.min_doc_freq_spin.setRange(0, 100)
-        self.min_doc_freq_spin.setValue(5)
-        self.min_doc_freq_spin.setToolTip("Vectorizer: Minimum documents a tag must appear in\nto be included in the vocabulary.\nHigher = fewer rare tags, faster UMAP.\nLower = more tags, slower but more detailed.\n0 = disabled (keep every tag).\nDefault: 5")
-        filter_layout.addRow("Min Doc Freq:", self.min_doc_freq_spin)
+        self.min_doc_freq_spin.setRange(0, 100000)
+        self.min_doc_freq_spin.setValue(self._min_doc_freq_n)
+        self.min_doc_freq_spin.setToolTip("Vectorizer: minimum frequency a tag must reach to be kept.\n"
+            "Unit 'n' = number of files the tag appears in (0 disables).\n"
+            "Unit '%' = percent of the loaded collection; tags appearing in fewer\n"
+            "than that fraction of files are dropped. Each unit keeps its own value.")
+
+        self.min_doc_freq_unit_combo = QComboBox()
+        self.min_doc_freq_unit_combo.addItems(["n", "%"])
+        self.min_doc_freq_unit_combo.setCurrentText("n")
+        self.min_doc_freq_unit_combo.setFixedWidth(48)
+        self.min_doc_freq_unit_combo.setToolTip("Unit for Min Tag Frequency.\n"
+            "n  = absolute number of files a tag must appear in (0 disables).\n"
+            "%  = percentage of the loaded collection; tags appearing in fewer than\n"
+            "     that fraction of files are dropped. Switching keeps each unit's value.")
+        self.min_doc_freq_unit_combo.currentTextChanged.connect(self._on_min_doc_freq_unit_changed)
+
+        _mdf_row = QHBoxLayout()
+        _mdf_row.setSpacing(4)
+        _mdf_row.addWidget(self.min_doc_freq_spin, 1)
+        _mdf_row.addWidget(self.min_doc_freq_unit_combo)
+        filter_layout.addRow("Min Tag Frequency:", _mdf_row)
 
         # Tag query builder is reparented here from the right sidebar after both
         # panels are built (see setup_ui). Store the layout for that step.
@@ -569,7 +684,9 @@ class UIConstructionMixin:
         wl_layout.addRow("Label Size:", self.wasd_label_spin)
 
         wasd_group.setLayout(wl_layout)
-        layout.addWidget(wasd_group)
+        # Built here (so its widgets exist before load_settings syncs them) but placed
+        # in the right sidebar "Visuals" tab by _reorganize_sidebars().
+        self.wasd_group = wasd_group
 
         self._algo_group = algo_group
         self._cluster_group = cluster_group
@@ -832,6 +949,220 @@ class UIConstructionMixin:
         for w in (self.progress_bar, self.phase_label, self.status_label):
             outer.addWidget(w)
         return panel
+
+    # ------------------------------------------------------------------ min tag frequency (unit-aware)
+
+    def _on_min_doc_freq_unit_changed(self, *_args):
+        """Swap the single numeric field between the 'n' and '%' stored values.
+
+        The currently displayed number is committed to the unit being LEFT before
+        the range/value are switched to the unit being ENTERED, so each unit keeps
+        its own value across switches (and reloads).
+        """
+        combo = getattr(self, 'min_doc_freq_unit_combo', None)
+        spin = getattr(self, 'min_doc_freq_spin', None)
+        if combo is None or spin is None:
+            return
+        unit = combo.currentText()
+        # Commit the live value to the unit we are leaving.
+        self._min_doc_freq_n = int(spin.value()) if unit == "n" else getattr(self, '_min_doc_freq_n', 5)
+        self._min_doc_freq_pct = int(spin.value()) if unit == "%" else getattr(self, '_min_doc_freq_pct', 1)
+        # Switch range + display to the entered unit.
+        spin.blockSignals(True)
+        if unit == "%":
+            spin.setRange(0, 100)
+            spin.setValue(int(getattr(self, '_min_doc_freq_pct', 1)))
+        else:
+            spin.setRange(0, 100000)
+            spin.setValue(int(getattr(self, '_min_doc_freq_n', 5)))
+        spin.blockSignals(False)
+
+    def _resolve_min_doc_freq(self, n_documents):
+        """Resolve the unit-aware Min Tag Frequency to an absolute file-count threshold.
+
+        'n' returns the value as-is (0 disables). '%' converts a percent of the
+        loaded collection into a file count (tags appearing in fewer files are
+        dropped); 0% or no documents disables filtering. This is the single source
+        of truth passed to Vectorizer(min_doc_freq=...).
+        """
+        spin = getattr(self, 'min_doc_freq_spin', None)
+        if spin is None:
+            return 3
+        combo = getattr(self, 'min_doc_freq_unit_combo', None)
+        val = int(spin.value())
+        unit = combo.currentText() if combo is not None else "n"
+        if unit == "%":
+            if val <= 0 or not n_documents:
+                return 0
+            return max(1, (int(n_documents) * val) // 100)
+        return val
+
+    def _min_doc_freq_state(self):
+        """Return a serializable dict of the unit + both stored values.
+
+        Captures the live spin value into the active unit first so persistence is
+        never stale, then returns all three keys (back-compat 'min_doc_freq' holds
+        the absolute 'n' value).
+        """
+        combo = getattr(self, 'min_doc_freq_unit_combo', None)
+        if combo is None:
+            return {"min_doc_freq": int(getattr(self, 'min_doc_freq_spin').value())}
+        unit = combo.currentText()
+        live = int(self.min_doc_freq_spin.value())
+        if unit == "%":
+            self._min_doc_freq_pct = live
+        else:
+            self._min_doc_freq_n = live
+        return {
+            "min_doc_freq": int(getattr(self, '_min_doc_freq_n', 5)),
+            "min_doc_freq_pct": int(getattr(self, '_min_doc_freq_pct', 1)),
+            "min_doc_freq_unit": unit,
+        }
+
+    def _apply_min_doc_freq_state(self, state):
+        """Restore the unit + both values from a dict (settings or session)."""
+        if not isinstance(state, dict) or 'min_doc_freq' not in state:
+            return
+        self._min_doc_freq_n = int(state.get("min_doc_freq", 5))
+        self._min_doc_freq_pct = int(state.get("min_doc_freq_pct", 1))
+        unit = state.get("min_doc_freq_unit", "n")
+        combo = getattr(self, 'min_doc_freq_unit_combo', None)
+        if combo is not None:
+            combo.blockSignals(True)
+            idx = combo.findText(unit)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+        spin = self.min_doc_freq_spin
+        spin.blockSignals(True)
+        if unit == "%":
+            spin.setRange(0, 100)
+            spin.setValue(self._min_doc_freq_pct)
+        else:
+            spin.setRange(0, 100000)
+            spin.setValue(self._min_doc_freq_n)
+        spin.blockSignals(False)
+
+    # ------------------------------------------------------------------ color schemes (generate from node image)
+
+    def _rebuild_color_scheme_combo(self, select=None):
+        """Repopulate the Color Scheme dropdown.
+
+        Order: hardcoded schemes -> ephemeral "Generated" (only while a generated
+        palette exists in memory) -> stored custom schemes (sorted by name).
+        Signals are blocked; selection is restored to ``select`` if present.
+        """
+        combo = self.color_scheme_combo
+        current = select if select is not None else combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        items = ["Pastel", "Nature", "Sci-Fi", "Viridis", "Plasma", "Inferno", "Coolwarm"]
+        if getattr(self, '_generated_palette', None):
+            items.append("Generated")
+        for name in sorted(getattr(self, 'custom_color_schemes', {}).keys()):
+            items.append(name)
+        combo.addItems(items)
+        idx = combo.findText(current)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _single_node_selected(self):
+        """True iff exactly one node (not a cohort, not nothing) is selected."""
+        return (getattr(self, 'selected_node_index', None) is not None
+                and getattr(self, 'selected_cluster_id', None) is None)
+
+    def _refresh_scheme_buttons(self):
+        """Enable/disable the pipette / save-diskette / trash buttons per their preconditions."""
+        if not hasattr(self, 'pipette_btn'):
+            return
+        self.pipette_btn.setEnabled(self._single_node_selected())
+        # Save: a generated palette exists and is currently applied (not yet stored under this name).
+        cur = self.color_scheme_combo.currentText()
+        gen_active = bool(getattr(self, '_generated_palette', None)) and \
+            (cur == "Generated" or cur in getattr(self, 'custom_color_schemes', {}))
+        self.save_scheme_btn.setEnabled(gen_active)
+        # Delete: the selected entry is a stored custom scheme.
+        self.delete_scheme_btn.setEnabled(cur in getattr(self, 'custom_color_schemes', {}))
+
+    def _on_pipette_clicked(self):
+        """Fetch the selected node's image from Hydrus and generate a palette (background)."""
+        if not hasattr(self, '_palette_worker') or self._palette_worker is None or not self._palette_worker.isRunning():
+            scene = getattr(self, 'scene_graph', None)
+            idx = getattr(self, 'selected_node_index', None)
+            if scene is None or idx is None or not (0 <= idx < len(scene.file_ids)):
+                QMessageBox.warning(self, "Generate Color Scheme",
+                                    "Select exactly one node first.")
+                return
+            file_id = scene.file_ids[idx]
+            client_name = self.client_combo.currentText()
+            n_colors = int(self.palette_colors_spin.value())
+            if hasattr(self, 'phase_label'):
+                self.phase_label.setText("Phase: Generating color scheme...")
+            worker = _PaletteWorker(client_name, file_id, n_colors)
+            worker.palette_ready.connect(self._on_palette_generated)
+            worker.error.connect(self._on_palette_error)
+            worker.finished.connect(lambda: None)  # keep a reference until done
+            self._palette_worker = worker
+            worker.start()
+
+    def _on_palette_generated(self, palette):
+        """Main-thread: apply the freshly generated palette as the active scheme."""
+        if hasattr(self, 'phase_label'):
+            self.phase_label.setText("Phase: Idle")
+        self._generated_palette = [tuple(int(c) for c in rgb) for rgb in palette]
+        self._rebuild_color_scheme_combo(select="Generated")
+        # currentTextChanged was blocked during rebuild; recolor manually.
+        if hasattr(self, '_on_color_scheme_changed'):
+            self._on_color_scheme_changed()
+
+    def _on_palette_error(self, message):
+        """Main-thread: report a failed image fetch / extraction."""
+        if hasattr(self, 'phase_label'):
+            self.phase_label.setText("Phase: Idle")
+        QMessageBox.warning(self, "Generate Color Scheme", f"Could not generate a color scheme:\n{message}")
+
+    def _on_save_scheme_clicked(self):
+        """Store the current generated palette under a user-chosen name."""
+        if not getattr(self, '_generated_palette', None):
+            return
+        existing = list(getattr(self, 'custom_color_schemes', {}).keys())
+        cur = self.color_scheme_combo.currentText()
+        default_name = "" if cur == "Generated" else cur
+        name, ok = QInputDialog.getText(
+            self, "Save Color Scheme",
+            f"Name for this {len(self._generated_palette)}-color palette:",
+            text=default_name)
+        if not ok:
+            return
+        clean, err = sanitize_scheme_name(name, existing + ["Generated"])
+        if err:
+            QMessageBox.warning(self, "Save Color Scheme", err)
+            return
+        self.custom_color_schemes[clean] = [list(c) for c in self._generated_palette]
+        # The stored entry now represents this palette; drop the ephemeral one so
+        # the dropdown shows a single (named) entry instead of two identical ones.
+        self._generated_palette = None
+        self._rebuild_color_scheme_combo(select=clean)
+        if hasattr(self, '_schedule_settings_save'):
+            self._schedule_settings_save()
+
+    def _on_delete_scheme_clicked(self):
+        """Delete the currently selected stored color scheme."""
+        cur = self.color_scheme_combo.currentText()
+        schemes = getattr(self, 'custom_color_schemes', {})
+        if cur not in schemes:
+            return
+        ret = QMessageBox.question(
+            self, "Delete Color Scheme",
+            f"Delete saved color scheme '{cur}'? This cannot be undone.")
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        del schemes[cur]
+        fallback = "Pastel"
+        self._rebuild_color_scheme_combo(select=fallback)
+        if hasattr(self, '_on_color_scheme_changed'):
+            self._on_color_scheme_changed()  # recolor with the fallback scheme
+        if hasattr(self, '_schedule_settings_save'):
+            self._schedule_settings_save()
 
     def create_3d_view(self):
         """Create the 3D view widget with right-click support."""
@@ -1474,18 +1805,22 @@ class UIConstructionMixin:
         self.twinkle_brightness_spin.setToolTip("Peak brightness multiplier when a node is at full blink.\n1.0 = no extra brightness, 3.0 = very bright.\nDefault: 1.5")
         vis_layout.addRow("Brightness:", self.twinkle_brightness_spin)
 
-        # V5: Color Scheme dropdown
+        # State for user-generated color schemes (see docs/features/generate-color-scheme-from-image.md).
+        # custom_color_schemes: name -> [[r,g,b], ...] persisted in settings.json.
+        # _generated_palette: ephemeral palette from the last pipette run (not saved until diskette hit).
+        self.custom_color_schemes = {}
+        self._generated_palette = None
+        self._active_scheme_is_generated = False
+
+        # V5: Color Scheme dropdown + generate/save/delete controls.
         self.color_scheme_combo = QComboBox()
         # Render each option's letters in its own scheme colors (popup + closed display).
         _cs_delegate = _ColorSchemeDelegate(self)
         self.color_scheme_combo.setItemDelegate(_cs_delegate)
         self.color_scheme_combo.view().setItemDelegate(_cs_delegate)
+        # Hardcoded schemes first; stored custom ones are appended by _rebuild_color_scheme_combo().
         self.color_scheme_combo.addItems(["Pastel", "Nature", "Sci-Fi", "Viridis", "Plasma", "Inferno", "Coolwarm"])
-        _cs_idx = self.color_scheme_combo.findText(getattr(self, 'color_scheme', "Pastel"))
-        if _cs_idx >= 0:
-            self.color_scheme_combo.setCurrentIndex(_cs_idx)
-        else:
-            self.color_scheme_combo.setCurrentText("Pastel")
+        self._rebuild_color_scheme_combo(getattr(self, 'color_scheme', "Pastel"))
         self.color_scheme_combo.currentTextChanged.connect(self._on_color_scheme_changed)
         self.color_scheme_combo.setToolTip(
             "Color scheme for cluster nodes:\n"
@@ -1494,7 +1829,45 @@ class UIConstructionMixin:
             "- Sci-Fi: cool clean blues, cyans and purples.\n"
             "- Viridis/Plasma/Inferno/Coolwarm: Matplotlib colormaps."
         )
-        vis_layout.addRow("Color Scheme:", self.color_scheme_combo)
+        # Palette size for image extraction (how many distinct colors the scheme gets).
+        self.palette_colors_spin = QSpinBox()
+        self.palette_colors_spin.setRange(2, 64)
+        self.palette_colors_spin.setValue(int(getattr(self, 'palette_colors', 19)))
+        self.palette_colors_spin.setToolTip("Palette Colors: how many distinct colors to extract from the node image\nwhen generating a color scheme.\nDefault 19 matches the built-in palettes so up to 19 cohorts stay distinguishable.")
+
+        # Pipette: generate a palette from the selected node's image (fetched from
+        # Hydrus like the media viewer does — a node IS a file, no picker needed).
+        self.pipette_btn = QToolButton()
+        self.pipette_btn.setText("\U0001F58B")  # 🖋 pipette
+        self.pipette_btn.setFixedSize(26, 24)
+        self.pipette_btn.setToolTip("Generate a color scheme from this node's image.\nSelect exactly one node first (not a cohort).")
+        self.pipette_btn.clicked.connect(self._on_pipette_clicked)
+
+        # Save diskette: store the current generated palette under a name.
+        self.save_scheme_btn = QToolButton()
+        self.save_scheme_btn.setText("\U0001F4BE")  # 💾 floppy disk
+        self.save_scheme_btn.setFixedSize(26, 24)
+        self.save_scheme_btn.setToolTip("Save the current generated color scheme under a name.\nEnabled after generating from an image.")
+        self.save_scheme_btn.clicked.connect(self._on_save_scheme_clicked)
+
+        # Trash: delete a stored (non-hardcoded) color scheme.
+        self.delete_scheme_btn = QToolButton()
+        self.delete_scheme_btn.setText("\U0001F5D1")  # 🗑 trash can
+        self.delete_scheme_btn.setFixedSize(26, 24)
+        self.delete_scheme_btn.setToolTip("Delete this saved color scheme.\nHardcoded schemes (Pastel/Nature/Sci-Fi/colormaps) cannot be deleted.")
+        self.delete_scheme_btn.clicked.connect(self._on_delete_scheme_clicked)
+
+        _cs_row = QHBoxLayout()
+        _cs_row.setSpacing(4)
+        _cs_row.addWidget(self.color_scheme_combo, 1)
+        _cs_row.addWidget(QLabel("Colors:"))
+        _cs_row.addWidget(self.palette_colors_spin)
+        _cs_row.addWidget(self.pipette_btn)
+        _cs_row.addWidget(self.save_scheme_btn)
+        _cs_row.addWidget(self.delete_scheme_btn)
+        vis_layout.addRow("Color Scheme:", _cs_row)
+
+        self._refresh_scheme_buttons()
 
         # Anti-noise / quality settings
         self.supersample_checkbox = QCheckBox("4x Snapshot")
@@ -1671,6 +2044,44 @@ class UIConstructionMixin:
         self.dynamic_label_size_checkbox.stateChanged.connect(self._on_dynamic_label_size_toggled)
         cohort_layout.addWidget(self.dynamic_label_size_checkbox)
 
+        # Label Space: how overlapping neighbor labels are handled. The selected
+        # cohort's label always keeps priority; the others yield to it.
+        ls_row = QHBoxLayout()
+        ls_label = QLabel("Label Space:")
+        ls_label.setStyleSheet(f"color: {RED_A};")
+        self.label_space_combo = QComboBox()
+        self.label_space_combo.addItems(["None", "Fade", "Move"])
+        _ls_idx = self.label_space_combo.findText(getattr(self, 'label_space_mode', "Fade"))
+        if _ls_idx >= 0:
+            self.label_space_combo.setCurrentIndex(_ls_idx)
+        else:
+            self.label_space_combo.setCurrentIndex(1)  # Fade default
+        self.label_space_combo.currentTextChanged.connect(self._on_label_space_changed)
+        self.label_space_combo.setToolTip(
+            "How to handle overlapping cohort labels:\n"
+            "- None: no handling (labels may overlap).\n"
+            "- Fade: a label that overlaps another fades out; the selected\n"
+            "  cohort's label always wins, so anything in front of or behind it\n"
+            "  is faded to give it priority.\n"
+            "- Move: overlapping labels are nudged apart (screen space) until they\n"
+            "  no longer collide. The selected cohort's label stays put; the others\n"
+            "  move around it and each other."
+        )
+        ls_row.addWidget(ls_label)
+        ls_row.addWidget(self.label_space_combo, 1)
+
+        # Gap used by Move mode (minimum screen-space padding between labels).
+        self.label_gap_spin = QSpinBox()
+        self.label_gap_spin.setRange(0, 200)
+        try:
+            self.label_gap_spin.setValue(int(getattr(self, 'label_space_gap', 25)))
+        except (TypeError, ValueError):
+            self.label_gap_spin.setValue(11)
+        self.label_gap_spin.valueChanged.connect(self._on_label_space_changed)
+        self.label_gap_spin.setToolTip("Minimum gap in pixels kept between labels in Move mode.")
+        ls_row.addWidget(self.label_gap_spin)
+        cohort_layout.addLayout(ls_row)
+
         # Label color row (two colors: the selected cohort's label blinks
         # between Color 1 and Color 2)
         label_color_row = QHBoxLayout()
@@ -1762,7 +2173,7 @@ class UIConstructionMixin:
         Called from setup_ui after both sidebars are built:
         - Right sidebar gets a tab bar (Stats | Visuals); each tab page is
           scrollable so content scrolls instead of squishing on small screens.
-        - Camera Settings group (orbit speed + wobble) moves to the Visuals tab.
+        - WASD Navigation + Camera Settings groups move to the Visuals tab.
         - Tag query grid moves from "Selected File Info" into Filter Settings (left).
         - Status label + progress bar are pinned to the left sidebar bottom.
         - "Send to Tab" is pinned to the right sidebar bottom (below the tabs).
@@ -1780,7 +2191,7 @@ class UIConstructionMixin:
             lay.addStretch()
             return self._make_scrollable(page)
 
-        visuals_tab = _tab_page(self._vis_group, self.wobble_group, self._cohort_group)
+        visuals_tab = _tab_page(self._vis_group, self.wasd_group, self.wobble_group, self._cohort_group)
         actions_tab = _tab_page(self._info_group, self._selection_tags_group,
                                 self._importance_group)  # importance under cohort tags
         # Algorithm + Cluster groups moved here from the left sidebar.

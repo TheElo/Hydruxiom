@@ -25,7 +25,7 @@ from PySide6.QtGui import QFont, QIntValidator
 from src.ui.smart_scale import (
     SMART_SCALE_SETTINGS, SMART_SCALE_KEYS, default_profiles, read_current_values,
 )
-from src.ui.tag_map_utils import clamp_scroll_page_width
+from src.ui.tag_map_utils import clamp_scroll_page_width, install_wheel_guard
 
 
 class _ClientTestWorker(QThread):
@@ -118,8 +118,30 @@ class TagMap3DSettingsDialog(QDialog):
         self.c_thumbs_dir_edit = QLineEdit()
 
         cform.addRow("Label:", self.c_label_edit)
-        cform.addRow("API URL:", self.c_api_url_edit)
+        url_row = QWidget()
+        _url_lay = QHBoxLayout(url_row)
+        _url_lay.setContentsMargins(0, 0, 0, 0)
+        _url_lay.addWidget(QLabel("API URL:"))
+        _url_lay.addWidget(self.c_api_url_edit)
+        cform.addRow(url_row)
+        self.c_api_url_edit.setToolTip(
+            "Base URL of the Hydrus API. Scheme is optional (http assumed),\n"
+            "and a path prefix works for middleware, e.g.\n"
+            "  192.168.1.40:16609/hyapi   or   http://127.0.0.1:45869/"
+        )
         cform.addRow("API Key:", self.c_api_key_edit)
+
+        # TLS verification toggle (default ON). Disable for MITM proxies /
+        # self-signed certs — the app then skips cert validation and silences
+        # urllib3's InsecureRequestWarning.
+        self.c_tls_verify_check = QCheckBox()
+        self.c_tls_verify_check.setChecked(True)
+        self.c_tls_verify_check.setToolTip(
+            "Verify TLS certificates when connecting over https.\n"
+            "Uncheck only if you run behind a MITM proxy or use\n"
+            "self-signed certs (less secure)."
+        )
+        cform.addRow("TLS Verify:", self.c_tls_verify_check)
 
         # DB Dir: only used by Direct DB mode (reads tags straight from Hydrus's
         # SQLite files). Hidden until then it would just confuse users.
@@ -153,16 +175,28 @@ class TagMap3DSettingsDialog(QDialog):
         cg_layout.addWidget(self._client_dirs_hidden)
         cg_layout.addLayout(cform)
 
-        # Chunk Size (moved here from the left panel). Stored on the tab as a
-        # plain int attribute; written back in apply_settings().
-        self.chunk_size_spin = QSpinBox()
+        # Chunk sizes (moved here from the left panel). Stored on the tab as plain
+        # int attributes; written back in apply_settings(). Path-specific because
+        # benchmarks/benchmark_api_io.py showed different optima per path:
+        # API is network-bound (bigger requests win, ~8192) while direct-DB is local
+        # and flat/fast from ~512 up.
+        self.chunk_size_spin = QSpinBox()  # kept as the API chunk size widget name for back-compat
         self.chunk_size_spin.setRange(50, 100000000)
         try:
-            self.chunk_size_spin.setValue(int(getattr(self.tab, 'chunk_size', 8192)))
+            self.chunk_size_spin.setValue(int(getattr(self.tab, 'api_chunk_size', getattr(self.tab, 'chunk_size', 8192))))
         except (TypeError, ValueError):
             self.chunk_size_spin.setValue(8192)
-        self.chunk_size_spin.setToolTip("Number of files to fetch per API request.\nLarger = faster but may timeout.\nSmaller = more requests but more reliable.\nDefault: 8192")
-        cform.addRow("Chunk Size:", self.chunk_size_spin)
+        self.chunk_size_spin.setToolTip("Files per HTTP request on the API path.\nLarger = fewer requests but bigger payloads; benchmark optimum ~8192.\nSmaller = more requests but more reliable under timeouts.\nDefault: 8192")
+        cform.addRow("API Chunk Size:", self.chunk_size_spin)
+
+        self.direct_chunk_size_spin = QSpinBox()
+        self.direct_chunk_size_spin.setRange(50, 100000000)
+        try:
+            self.direct_chunk_size_spin.setValue(int(getattr(self.tab, 'direct_chunk_size', 4096)))
+        except (TypeError, ValueError):
+            self.direct_chunk_size_spin.setValue(4096)
+        self.direct_chunk_size_spin.setToolTip("Files per SQLite query on the direct-DB path.\nBenchmark: flat/fast from ~512 up; default 4096.\nOnly used when Direct DB mode is enabled for a client.")
+        cform.addRow("Direct-DB Chunk Size:", self.direct_chunk_size_spin)
 
         # Action buttons
         btns = QHBoxLayout()
@@ -210,6 +244,31 @@ class TagMap3DSettingsDialog(QDialog):
             "Number of CPU cores to use for UMAP parallel NN-descent.\nHigher = faster but uses more CPU.\nDefault: all cores."
         )
         perf_layout.addRow("CPU Cores:", self.n_jobs_spin)
+
+        # Reserved parallel-load thread counts (see benchmarks/benchmark_api_io.py).
+        # The loader is still sequential; these values are persisted now so the
+        # threaded implementation can pick them up without a settings migration.
+        self.api_load_threads_spin = QSpinBox()
+        self.api_load_threads_spin.setRange(1, 32)
+        self.api_load_threads_spin.setValue(getattr(self.tab, 'api_load_threads', 4))
+        self.api_load_threads_spin.setToolTip(
+            "Concurrent API requests when loading file tags (Hydrus HTTP path).\n"
+            "Benchmarked sweet spot: ~4 threads (~1.8x faster than sequential);\n"
+            "beyond that the server saturates and it gets slower.\n"
+            "(Reserved — applied once parallel API loading is implemented.)\nDefault: 4."
+        )
+        perf_layout.addRow("API Load Threads:", self.api_load_threads_spin)
+
+        self.direct_load_threads_spin = QSpinBox()
+        self.direct_load_threads_spin.setRange(1, 32)
+        self.direct_load_threads_spin.setValue(getattr(self.tab, 'direct_load_threads', 2))
+        self.direct_load_threads_spin.setToolTip(
+            "Concurrent SQLite connections when loading tags via direct-DB mode.\n"
+            "Benchmarked sweet spot: ~2 threads (~1.7x faster); more connections\n"
+            "contend on the local DB and get slower.\n"
+            "(Reserved — applied once parallel direct-DB loading is implemented.)\nDefault: 2."
+        )
+        perf_layout.addRow("Direct-DB Load Threads:", self.direct_load_threads_spin)
 
         self.tokenize_checkbox = QCheckBox("Tokenize tags")
         self.tokenize_checkbox.setChecked(self.tokenize)
@@ -366,7 +425,9 @@ class TagMap3DSettingsDialog(QDialog):
             "Applied at app startup — restart Hydruxiom after changing it.\n"
             "Note: this multiplies on top of Windows display scaling."
         )
-        scale_layout.addRow("Scale:", self.ui_scale_combo)
+        # Scale goes at the TOP of the UI group (it's the most-used control and
+        # affects everything, so it should be first rather than buried last).
+        scale_layout.insertRow(0, "Scale:", self.ui_scale_combo)
         scale_group.setLayout(scale_layout)
         ui_tab_layout.addWidget(scale_group)
 
@@ -437,26 +498,41 @@ class TagMap3DSettingsDialog(QDialog):
         self.opt_min_samples_max_spin.setToolTip("Upper bound of the Min Samples search range.")
         opt_layout.addRow("Min Samples Max:", self.opt_min_samples_max_spin)
 
-        # Auto-Deorphan: when to automatically assign noise (-1) nodes to their
-        # nearest cohort after a clustering operation.
-        self.auto_deorphan_combo = QComboBox()
-        for label in ("Never", "After Load and Compute", "After Regroup"):
-            self.auto_deorphan_combo.addItem(label)
-        _ad_idx = self.auto_deorphan_combo.findText(
-            getattr(self.tab, 'auto_deorphan', "Never")
-        )
-        if _ad_idx >= 0:
-            self.auto_deorphan_combo.setCurrentIndex(_ad_idx)
-        else:
-            self.auto_deorphan_combo.setCurrentIndex(0)
-        self.auto_deorphan_combo.setToolTip(
-            "Automatically run Deorphan (assign every noise/-1 node to the cohort\n"
-            "of its nearest non-noise node) after the chosen operation.\n"
-            "- Never: only when you click the Deorphan button manually.\n"
-            "- After Load and Compute: deorphan once a fresh load finishes.\n"
-            "- After Regroup: deorphan every time DBSCAN re-clustering runs."
-        )
-        opt_layout.addRow("Auto-Deorphan:", self.auto_deorphan_combo)
+        # Auto-Deorphan: per-operation checkboxes. Each op that can create new
+        # orphans (noise/-1 nodes) gets its own toggle so the user decides when
+        # Deorphan runs automatically and when it doesn't. Pop is excluded on
+        # purpose: removing a cohort creates no new orphans.
+        _ad_ops = getattr(self.tab, 'auto_deorphan_ops', None)
+        if not isinstance(_ad_ops, dict):  # legacy "Never"/"After ..." string value
+            _legacy = str(getattr(self.tab, 'auto_deorphan', "Never"))
+            _ad_ops = {
+                "load": _legacy == "After Load and Compute",
+                "regroup": _legacy in ("After Regroup",),  # old mode also covered Optimize
+                "split": False,
+            }
+
+        ad_group = QGroupBox("Auto-Deorphan (assign orphans to nearest cohort)")
+        ad_layout = QVBoxLayout()
+        self.ad_load_checkbox = QCheckBox("After Load and Compute")
+        self.ad_regroup_checkbox = QCheckBox("After Regroup / Optimize")
+        self.ad_split_checkbox = QCheckBox("After Split (incl. auto-split rounds)")
+        for cb, key in ((self.ad_load_checkbox, "load"),
+                        (self.ad_regroup_checkbox, "regroup"),
+                        (self.ad_split_checkbox, "split")):
+            cb.setChecked(bool(_ad_ops.get(key)))
+            ad_layout.addWidget(cb)
+        self.ad_load_checkbox.setToolTip(
+            "Run Deorphan automatically once a fresh Load & Compute finishes\n"
+            "(also covers Recompute, which re-runs UMAP/PCA on the same files).")
+        self.ad_regroup_checkbox.setToolTip(
+            "Run Deorphan after Regroup (DBSCAN re-applied to all positions)\n"
+            "and after Optimize (which ends with a full re-cluster).")
+        self.ad_split_checkbox.setToolTip(
+            "Run Deorphan after Split group / Cut out, and once per auto-split\n"
+            "round. Note: while an auto-split cycle is in flight deorphan waits;\n"
+            "it fires after the final round completes.")
+        ad_group.setLayout(ad_layout)
+        opt_layout.addRow("", ad_group)
 
         # Auto-split: after Load & Compute, repeatedly select + split the largest
         # cohort while it exceeds the threshold (up to max cycles). The master
@@ -713,6 +789,9 @@ class TagMap3DSettingsDialog(QDialog):
 
         self.setLayout(outer_layout)
         self.apply_dark_theme()
+
+        # Wheel over a spin box / combo should scroll the tab, not change its value.
+        install_wheel_guard(self)
 
     @staticmethod
     def _scroll_tab(content):
@@ -1067,18 +1146,65 @@ class TagMap3DSettingsDialog(QDialog):
             return 100
         return max(25, min(250, val))
 
+    def _persist_clients(self, tab=None):
+        """Sync the form into the working copy and write clients.json.
+
+        Called FIRST from apply_settings so client details are saved even if a
+        later settings step fails — previously an exception anywhere in
+        apply_settings silently skipped this save (the dialog had already
+        closed), which made it look like client entries were not stored.
+        """
+        self._sync_selected_client_to_dict()
+        try:
+            from src.data.clients import save_clients
+            ok = save_clients(self._clients)
+            if not ok:
+                QMessageBox.warning(self, "Clients", "Failed to save clients.json.")
+        except Exception as e:
+            print(f"Error saving clients: {e}")
+            QMessageBox.critical(self, "Clients", f"Failed to save clients.json:\n{e}")
+
+        # Refresh the tab's client combo + per-client DB path cache.
+        if tab is not None:
+            paths = {}
+            for cid, cfg in self._clients.items():
+                db_dir = (cfg.get("db_dir") or "").strip()
+                if db_dir:
+                    paths[cid] = db_dir
+            tab.client_db_paths = paths
+            if hasattr(tab, "_refresh_client_combo"):
+                try:
+                    tab._refresh_client_combo()
+                except Exception as e:
+                    print(f"Error refreshing client combo: {e}")
+
     def apply_settings(self):
         """Apply dialog values back to the tab and save settings."""
         tab = self.tab
 
-        # Chunk Size (edited in the Clients group; plain int on the tab)
+        # Persist clients FIRST (see _persist_clients) so a failure in any of
+        # the steps below can never lose the user's client entries.
         try:
-            tab.chunk_size = int(self.chunk_size_spin.value())
+            self._persist_clients(tab)
+        except Exception as e:
+            print(f"Error persisting clients: {e}")
+
+        # Chunk Size (edited in the Clients group; plain int on the tab)
+        # Path-specific chunk sizes (legacy single key kept in sync for back-compat).
+        try:
+            tab.api_chunk_size = int(self.chunk_size_spin.value())
+            tab.chunk_size = tab.api_chunk_size
+        except Exception:
+            pass
+        try:
+            tab.direct_chunk_size = int(self.direct_chunk_size_spin.value())
         except Exception:
             pass
 
         tab.low_memory = self.low_memory_checkbox.isChecked()
         tab.n_jobs = self.n_jobs_spin.value()
+        tab.api_load_threads = self.api_load_threads_spin.value()
+        tab.direct_load_threads = self.direct_load_threads_spin.value()
         tab.use_direct_db = self.direct_db_checkbox.isChecked()
         tab.tokenize = self.tokenize_checkbox.isChecked()
         tab.drop_universal = self.drop_universal_checkbox.isChecked()
@@ -1144,28 +1270,14 @@ class TagMap3DSettingsDialog(QDialog):
         tab.opt_min_samples_min = self.opt_min_samples_min_spin.value()
         tab.opt_min_samples_max = self.opt_min_samples_max_spin.value()
 
-        # Auto-Deorphan behavior
-        tab.auto_deorphan = self.auto_deorphan_combo.currentText()
+        # Auto-Deorphan per-operation flags (replaces the old single combo mode)
+        tab.auto_deorphan_ops = {
+            "load": bool(self.ad_load_checkbox.isChecked()),
+            "regroup": bool(self.ad_regroup_checkbox.isChecked()),
+            "split": bool(self.ad_split_checkbox.isChecked()),
+        }
 
-        # Persist the full clients working copy (Clients section is authoritative).
-        self._sync_selected_client_to_dict()
-        try:
-            from src.data.clients import save_clients
-            ok = save_clients(self._clients)
-            if not ok:
-                QMessageBox.warning(self, "Clients", "Failed to save clients.json.")
-        except Exception as e:
-            print(f"Error saving clients: {e}")
-
-        # Refresh the tab's client combo + per-client DB path cache.
-        paths = {}
-        for cid, cfg in self._clients.items():
-            db_dir = (cfg.get("db_dir") or "").strip()
-            if db_dir:
-                paths[cid] = db_dir
-        tab.client_db_paths = paths
-        if hasattr(tab, "_refresh_client_combo"):
-            tab._refresh_client_combo()
+        # (clients.json is already persisted at the top of apply_settings)
 
         # Optional tag-score weighting
         tab.score_db_path = self.score_db_edit.text().strip()
@@ -1223,6 +1335,8 @@ class TagMap3DSettingsDialog(QDialog):
         self.c_label_edit.setText(cfg.get("label", cid))
         self.c_api_url_edit.setText(cfg.get("api_url", ""))
         self.c_api_key_edit.setText(cfg.get("api_key", ""))
+        # Absent flag means "verify" (secure default).
+        self.c_tls_verify_check.setChecked(bool(cfg.get("tls_verify", True)))
         self.c_db_dir_edit.setText(cfg.get("db_dir", ""))
         self.c_files_dir_edit.setText(cfg.get("files_dir", ""))
         self.c_thumbs_dir_edit.setText(cfg.get("thumbs_dir", ""))
@@ -1236,6 +1350,7 @@ class TagMap3DSettingsDialog(QDialog):
         cfg["label"] = self.c_label_edit.text().strip() or cid
         cfg["api_url"] = self.c_api_url_edit.text().strip()
         cfg["api_key"] = self.c_api_key_edit.text().strip()
+        cfg["tls_verify"] = bool(self.c_tls_verify_check.isChecked())
         cfg["db_dir"] = self.c_db_dir_edit.text().strip()
         cfg["files_dir"] = self.c_files_dir_edit.text().strip()
         cfg["thumbs_dir"] = self.c_thumbs_dir_edit.text().strip()
@@ -1251,6 +1366,7 @@ class TagMap3DSettingsDialog(QDialog):
         self._sync_selected_client_to_dict()  # save current edits first
         self._clients[new_id] = {
             "label": new_id, "api_url": "", "api_key": "",
+            "tls_verify": True,
             "db_dir": "", "files_dir": "", "thumbs_dir": "",
         }
         idx = self.client_list.count()
@@ -1299,6 +1415,7 @@ class TagMap3DSettingsDialog(QDialog):
         cid = self._current_client_id() or "(new)"
         api_url = self.c_api_url_edit.text().strip()
         api_key = self.c_api_key_edit.text().strip()
+        tls_verify = bool(self.c_tls_verify_check.isChecked())
         if not api_url or not api_key:
             self.client_status.setText("Enter API URL and API Key first.")
             return
@@ -1307,7 +1424,12 @@ class TagMap3DSettingsDialog(QDialog):
         def _run():
             try:
                 import hydrus_api
-                client = hydrus_api.Client(access_key=api_key, api_url=api_url)
+                from src.data.clients import normalize_api_url, make_session
+                client = hydrus_api.Client(
+                    access_key=api_key,
+                    api_url=normalize_api_url(api_url),
+                    session=make_session(tls_verify),
+                )
                 # Light call to verify connectivity.
                 client.get_services()
                 return True, "Connected ✓"

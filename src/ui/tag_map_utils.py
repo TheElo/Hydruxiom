@@ -51,6 +51,50 @@ def clamp_scroll_page_width(scroll_area):
         page.setMaximumWidth(max(1, scroll_area.viewport().width()))
 
 
+def install_wheel_guard(container):
+    """Make the mouse wheel SCROLL a panel instead of changing values when the
+    cursor is over a spin box or combo box.
+
+    Qt delivers wheel events to the widget under the cursor and QAbstractSpinBox /
+    QComboBox consume them (stepping their value), which makes dense scrollable
+    panels nearly impossible to scroll without accidentally editing settings. This
+    filter consumes those wheel events and forwards the delta to the nearest
+    ancestor's vertical scrollbar, so scrolling works uniformly across the panel.
+
+    When the content actually fits (no scroll range) the event is left alone, so
+    wheel-to-adjust still works in that case.
+
+    Args:
+        container: A widget tree containing a QScrollArea and its spin boxes /
+            combo boxes. Call AFTER the widgets have been created — all current
+            descendants are guarded.
+    """
+    from PySide6.QtCore import QObject, QEvent
+    from PySide6.QtWidgets import QAbstractSpinBox, QComboBox, QScrollArea
+
+    class _WheelGuard(QObject):
+        def eventFilter(self, obj, ev):
+            if ev.type() != QEvent.Wheel:
+                return False
+            # Find the nearest enclosing scroll area.
+            node = obj.parentWidget()
+            while node is not None and not isinstance(node, QScrollArea):
+                node = node.parentWidget()
+            if node is None:
+                return False  # no scroll area -> keep default behavior
+            bar = node.verticalScrollBar()
+            if bar is None or bar.maximum() <= bar.minimum():
+                return False  # content fits -> allow normal spin/combo adjustment
+            bar.setValue(bar.value() - ev.angleDelta().y())
+            return True
+
+    guard = _WheelGuard(container)
+    # PySide6 findChildren() takes a single type only — query each separately.
+    for cls in (QAbstractSpinBox, QComboBox):
+        for w in container.findChildren(cls):
+            w.installEventFilter(guard)
+
+
 def compile_tag_patterns(tag_list):
     """Split a tag list into exact-match set and compiled wildcard patterns.
 

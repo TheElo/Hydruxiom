@@ -19,11 +19,10 @@ def ConnectToClient(arc):
     instead of the old external mydb.db ClientSettings table.
     """
     global client
-    from src.data.clients import get_client_config
-    cfg = get_client_config(arc)
-    if not cfg:
-        raise KeyError(f"Client '{arc}' not found in clients.json")
-    client = hydrus_api.Client(access_key=cfg["api_key"], api_url=cfg["api_url"])
+    from src.data.clients import connect_to_client
+    # Reuse the shared connector: normalizes the API URL (scheme / path prefix)
+    # and honors the per-client tls_verify flag.
+    client = connect_to_client(arc)
     return client
 
 def AvailableClients():

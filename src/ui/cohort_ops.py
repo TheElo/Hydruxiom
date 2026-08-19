@@ -42,6 +42,8 @@ class CohortOpsMixin:
 
         self.status_label.setText(f"Cutting out cohort {self.selected_cluster_id} ({len(idx)} files)...")
         self._set_cohort_action_buttons(False)
+        # Tag the operation for per-op auto-deorphan (Settings -> DBSCAN Optimizer).
+        self._last_op = "split"
 
         def worker_func():
             return self._split_compute(sub_tag_data)
@@ -71,7 +73,10 @@ class CohortOpsMixin:
         eps = self.eps_spin.value() / 100.0
         min_samples = self.min_samples_spin.value()
         node_size = float(self.min_size_spin.value()) / 10.0
-        min_doc_freq = self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3
+        # Unit-aware Min Tag Frequency (n / %); sub_tag_data is the loaded subset.
+        min_doc_freq = (self._resolve_min_doc_freq(len(sub_tag_data))
+                        if hasattr(self, '_resolve_min_doc_freq')
+                        else (self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3))
         drop_universal = getattr(self, 'drop_universal', True)
 
         # Vectorize the subset
@@ -94,7 +99,9 @@ class CohortOpsMixin:
             low_memory=low_memory,
             metric=metric,
             n_jobs=n_jobs,
-            subsample_size=subsample_size
+            subsample_size=subsample_size,
+            chunked_transform=self.chunked_transform_checkbox.isChecked(),
+            pre_svd_components=self._pre_svd(self)
         )
         _t_red = time.perf_counter()
         positions = red.fit_transform(sparse_matrix)
@@ -160,6 +167,8 @@ class CohortOpsMixin:
 
         self.status_label.setText(f"Popping cohort {cluster_id} ({removed_count} files)...")
         self._set_cohort_action_buttons(False)
+        # Pop removes a whole cohort; it creates no new orphans, so it never
+        # triggers auto-deorphan (no _last_op tag on purpose).
 
         def worker_func():
             return self._pop_compute(cluster_id, removed_count)
@@ -216,6 +225,9 @@ class CohortOpsMixin:
 
         self.status_label.setText(f"Re-clustering cohort {self.selected_cluster_id} ({len(cluster_nodes)} files)...")
         self._pending_recluster = True
+        # Tag the operation for per-op auto-deorphan (manual Split group and
+        # every auto-split round go through here).
+        self._last_op = "split"
         self._set_cohort_action_buttons(False)
 
         def worker_func():
@@ -352,6 +364,8 @@ class CohortOpsMixin:
         self.progress_bar.setValue(0)
         self.status_label.setText("Re-applying DBSCAN...")
         self._pending_recluster = True
+        # Tag the operation for per-op auto-deorphan.
+        self._last_op = "regroup"
 
         def worker_func():
             return self._recluster_all()
@@ -524,6 +538,9 @@ class CohortOpsMixin:
         self.progress_bar.setValue(0)
         self.status_label.setText("Optimizing DBSCAN parameters...")
         self._pending_recluster = True
+        # Optimize ends with a full re-cluster of all positions, so it counts
+        # as "regroup" for auto-deorphan purposes (matches the old mode).
+        self._last_op = "regroup"
 
         def worker_func():
             return self._optimize_dbscan()

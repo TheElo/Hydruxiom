@@ -3,6 +3,8 @@
 Implements UMAP and PCA dimensionality reduction.
 """
 
+import time
+
 import numpy as np
 
 
@@ -11,7 +13,8 @@ class Reducer:
 
     def __init__(self, algorithm='umap', n_components=3, n_neighbors=15, min_dist=0.1,
                  n_epochs=None, low_memory=False, learning_rate=1.0, metric='cosine',
-                 n_jobs=None, subsample_size=None):
+                 n_jobs=-1, subsample_size=None, chunked_transform=True,
+                 transform_chunk_bytes=1_500_000_000, pre_svd_components=None):
         """Initialize the reducer.
 
         Args:
@@ -23,10 +26,26 @@ class Reducer:
             low_memory: UMAP low memory mode to reduce peak memory (default: False)
             learning_rate: Initial learning rate for optimization (default: 1.0)
             metric: Distance metric for UMAP ('cosine' or 'euclidean', default: 'cosine')
-            n_jobs: Number of CPU cores for UMAP parallel NN-descent (default: None = auto)
+            n_jobs: Number of CPU cores for UMAP parallel NN-descent
+                (default: -1 = all cores). NOTE: umap-learn 0.5.x rejects
+                n_jobs=None, so the default must be a concrete int.
             subsample_size: If set, fit UMAP on a random subset of this size,
                 then transform all points. Reduces memory and time at scale.
                 (default: None = no subsampling)
+            chunked_transform: When subsampling, transform all points in bounded
+                row chunks instead of one giant call (default True). Set False to
+                use the legacy single-call path for A/B comparison on real data.
+            transform_chunk_bytes: Target dense-matrix byte budget per chunk when
+                transforming rows against a fitted model (subsample path). The
+                row count per chunk is derived from this so peak RAM stays ~2 GB
+                regardless of dataset size or tag vocabulary.
+            pre_svd_components: If set, run TruncatedSVD on the sparse matrix to
+                this many components BEFORE UMAP (default None = off). umap-learn
+                densifies its input internally and NN-descent cost scales with
+                dimensionality, so collapsing 20k+ tag dims to ~64 makes distance
+                computation hundreds of times cheaper per pair. Standard practice
+                for TF-IDF-like data; local structure is well preserved (UMAP only
+                needs neighborhoods). Toggleable off for A/B comparison on real data.
         """
         self.algorithm = algorithm.lower().replace(' ', '')
         # Normalize "gpu umap" -> "gpu"
@@ -39,8 +58,12 @@ class Reducer:
         self.low_memory = low_memory
         self.learning_rate = learning_rate
         self.metric = metric
-        self.n_jobs = n_jobs
+        # umap-learn 0.5.x raises TypeError on n_jobs=None; normalize defensively.
+        self.n_jobs = -1 if n_jobs is None else n_jobs
         self.subsample_size = subsample_size
+        self.chunked_transform = chunked_transform
+        self.transform_chunk_bytes = transform_chunk_bytes
+        self.pre_svd_components = pre_svd_components
         self.model = None
 
     def fit_transform(self, sparse_matrix):
@@ -86,6 +109,22 @@ class Reducer:
         except ImportError:
             raise ImportError("UMAP is not installed. Install with: pip install umap-learn")
 
+        # Optional pre-reduction: TruncatedSVD collapses the tag vocabulary to a
+        # low-dim dense space before UMAP. umap-learn densifies internally anyway,
+        # so this trades one cheap SVD pass for dramatically cheaper NN-descent
+        # (distance cost scales with dimensionality) and far lower peak RAM.
+        if self.pre_svd_components:
+            from sklearn.decomposition import TruncatedSVD
+            k = min(int(self.pre_svd_components), sparse_matrix.shape[1] - 1, sparse_matrix.shape[0] - 1)
+            print(f"Pre-reducing with TruncatedSVD to {k} components "
+                  f"(from {sparse_matrix.shape[1]:,} tag dims)...")
+            _t_svd = time.perf_counter()
+            svd = TruncatedSVD(n_components=k, random_state=42)
+            reduced = svd.fit_transform(sparse_matrix)
+            print(f"  SVD done in {time.perf_counter() - _t_svd:.1f}s "
+                  f"(explained variance: {svd.explained_variance_ratio_.sum():.1%})")
+            sparse_matrix = np.ascontiguousarray(reduced, dtype=np.float32)
+
         n_samples = sparse_matrix.shape[0]
         use_subsample = (self.subsample_size is not None and n_samples > self.subsample_size)
 
@@ -119,8 +158,25 @@ class Reducer:
             print(f"  Fitting UMAP on {self.subsample_size} samples...")
             reducer.fit(subset_matrix)
 
-            print(f"  Transforming all {n_samples} samples...")
-            positions = reducer.transform(sparse_matrix)
+            if self.chunked_transform:
+                # Chunked transform: umap-learn densifies each call internally, so a
+                # single transform() over all rows would allocate n_samples x n_tags
+                # float32 at once (e.g. 500k x 20k = ~40 GB). Transforming in row
+                # chunks keeps peak RAM bounded by transform_chunk_bytes; projection
+                # into a fitted space is order-independent, so results are identical.
+                # Works for both dense (post-SVD) and sparse matrices.
+                n_dims = sparse_matrix.shape[1]
+                chunk_rows = max(1_000, int(self.transform_chunk_bytes // (n_dims * 4)))
+                print(f"  Transforming all {n_samples} samples "
+                      f"(chunks of ~{chunk_rows:,} rows)...")
+                positions = np.empty((n_samples, self.n_components), dtype=np.float64)
+                for start in range(0, n_samples, chunk_rows):
+                    stop = min(start + chunk_rows, n_samples)
+                    positions[start:stop] = reducer.transform(sparse_matrix[start:stop])
+            else:
+                # Legacy single-call path (toggleable off for A/B comparison).
+                print(f"  Transforming all {n_samples} samples (single call)...")
+                positions = reducer.transform(sparse_matrix)
         else:
             # Standard path: fit_transform on full data
             positions = reducer.fit_transform(sparse_matrix)

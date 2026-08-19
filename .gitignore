@@ -55,6 +55,10 @@ sessions/
 *.npz
 screenshots/
 
+# Local caches + scratch files
+.cache/
+tmp_*.txt
+
 # Benchmarks (local perf experiments + generated reports, not for public repo)
 benchmarks/
 

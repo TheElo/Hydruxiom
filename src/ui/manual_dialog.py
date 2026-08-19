@@ -64,6 +64,7 @@ class ManualDialog(QDialog):
 
         tabs = QTabWidget()
         tabs.addTab(self._build_controls_tab(), "Controls & Interactions")
+        tabs.addTab(self._build_performance_tab(), "Performance")
         # Future tabs (e.g. "Pipeline", "Settings reference") go here.
         outer.addWidget(tabs)
 
@@ -174,6 +175,68 @@ class ManualDialog(QDialog):
             "set a value below 100% (e.g. 75%), then restart Hydruxiom."
         )
         lay.addWidget(side_te)
+
+        return page
+
+    def _build_performance_tab(self):
+        """Performance: what is slow and which setting fixes it."""
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(10)
+
+        lay.addWidget(_section_label("What Is Slow"))
+        intro_te = _body_text()
+        intro_te.setHtml(
+            "The <b>UMAP</b> step dominates load time. Two things make it expensive: the "
+            "<i>number of files</i> and, less obviously, the <i>tag vocabulary size</i> — UMAP "
+            "computes distances over all tag dimensions internally (it densifies sparse input), so a "
+            "50k-tag collection is ~10x more work per distance than a 5k-tag one even at the same file count.<br><br>"
+            "Before every Load & Compute / Recompute, Hydruxiom estimates peak RAM and prints it to the "
+            "console (<b>[RAM check]</b>). If the estimate exceeds what is safely available you get a status-bar "
+            "warning — execution continues either way (it never blocks)."
+        )
+        lay.addWidget(intro_te)
+
+        rows = [
+            ("Pre-SVD", "ON/OFF + components spinbox (Algorithm group)",
+             "Collapses tag dims to ~64 before UMAP. Makes the non-subsampled path dramatically faster and far lighter on RAM; layout quality is very close for TF-IDF-like data. Default OFF — enable it, compare your map, keep whichever you prefer."),
+            ("Subsample", "ON/OFF + subset size (Algorithm group)",
+             "Fit UMAP on a random subset, then project all points into that fixed space. Caps memory at any scale — but is SLOWER than plain UMAP when the full fit would have fit in RAM (projection cost grows with files × subset). Use it for very large loads or when the [RAM check] warns."),
+            ("Chunked Transform", "ON/OFF (Algorithm group)",
+             "Only relevant with Subsample ON: projects points in bounded chunks (~1.5 GB peak) instead of one giant call that would densify everything at once. Keep it on; uncheck only to compare against the legacy path."),
+            ("CPU Cores / Low RAM", "Settings → Performance",
+             "Cores parallelize UMAP's neighbor search (near-linear speedup). Low-RAM mode trades speed for lower peak memory — enable if you hit out-of-memory errors."),
+            ("Min Tag Frequency", "Filter Settings (left panel)",
+             "Drops rare tags from the vocabulary. Unit 'n' = absolute number of files a tag must appear in (0 disables); unit '%' = percent of the loaded collection — each unit remembers its own value. Fewer dimensions = faster UMAP and less noise; raise it on huge collections before reaching for the other knobs."),
+            ("API / Direct-DB Load Threads", "Settings → Performance",
+             "Concurrent connections used while loading file tags (defaults 4 API / 2 direct-DB, from benchmarks/benchmark_api_io.py: ~1.8x and ~1.7x faster than sequential). Set to 1 for the legacy single-request behavior."),
+            ("API / Direct-DB Chunk Size", "Settings → Clients",
+             "Files per request (API) or per query (direct-DB). Benchmarked optima: API ~8192 (network-bound, fewer bigger requests win); direct-DB flat/fast from ~512 up (default 4096). Local clients should use Direct DB mode (~30–55x faster than the API at scale)."),
+        ]
+        tbl = QTableWidget(len(rows), 3)
+        headers = ["Setting", "Where", "What it does"]
+        tbl.setHorizontalHeaderLabels(headers)
+        for r, (a, b, c) in enumerate(rows):
+            for col, text in enumerate((a, b, c)):
+                item = QTableWidgetItem(text)
+                if col == 0:
+                    item.setFont(QFont("Consolas", 10, QFont.Bold))
+                item.setFlags(Qt.ItemFlag.NoItemFlags)
+                tbl.setItem(r, col, item)
+        tbl.verticalHeader().setVisible(False)
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        lay.addWidget(tbl)
+
+        gpu_te = _body_text()
+        gpu_te.setHtml(
+            "<b>GPU UMAP:</b> the <i>GPU UMAP</i> algorithm option requires RAPIDS cuVS, which is "
+            "Linux-only — on Windows it silently falls back to CPU UMAP. See "
+            "<i>docs/gpu_umap_study.md</i> for options (WSL2 service / PyTorch-UMAP)."
+        )
+        lay.addWidget(gpu_te)
 
         return page
 

@@ -13,11 +13,72 @@ from src.ui.tag_map_utils import compile_tag_patterns
 
 
 class DataPipelineMixin:
+    @staticmethod
+    def _pre_svd(tab):
+        """Read the Pre-SVD toggle; return component count or None (off)."""
+        cb = getattr(tab, 'pre_svd_checkbox', None)
+        if cb is not None and cb.isChecked():
+            spin = getattr(tab, 'pre_svd_components_spin', None)
+            return int(spin.value()) if spin is not None else 64
+        return None
+
+    # ------------------------------------------------------------------
+    # Pre-flight RAM check (formulas in benchmarks/ram_simulator.py)
+    # ------------------------------------------------------------------
+    def _preflight_ram_check(self, n_files_estimate, n_tags_override=None):
+        """Estimate UMAP peak RAM before spawning the worker and warn if it
+        will likely OOM. Non-blocking: console print + status bar message only,
+        execution always continues. GUI-thread (status label access).
+
+        Tag vocabulary size is taken from the previous session's interner when
+        available (good proxy); otherwise 20k is assumed and flagged as such.
+        Pass n_tags_override for exact counts (recompute path).
+        """
+        try:
+            from benchmarks.ram_simulator import estimate_pipeline
+        except ImportError:
+            return  # never block a load on an optional check
+
+        algorithm = self.algorithm_combo.currentText().lower()
+        if not algorithm.startswith("umap"):
+            return  # PCA is cheap; GPU path handled separately (Linux-only)
+
+        if n_tags_override:
+            n_tags, assumed = int(n_tags_override), "exact"
+        else:
+            interner = getattr(self, 'tag_interner', None)
+            if interner is not None and len(getattr(interner, 'index_to_tag', [])) > 0:
+                n_tags, assumed = len(interner.index_to_tag), "prev session"
+            else:
+                n_tags, assumed = 20_000, "assumed (no previous load)"
+
+        subsample_size = self.subsample_size_spin.value() if (hasattr(self, 'subsample_checkbox') and self.subsample_checkbox.isChecked()) else None
+        est = estimate_pipeline(n_files=n_files_estimate, n_tags=n_tags, algorithm="umap", subsample_size=subsample_size)
+        full_est = estimate_pipeline(n_files=n_files_estimate, n_tags=n_tags, algorithm="umap")
+        budget = est.budget_gib or float("inf")
+
+        print(f"[RAM check] ~{n_files_estimate:,} files x {n_tags:,} tags ({assumed}): "
+              f"current settings peak ~{est.peak_cpu_gib:.1f} GiB, full fit ~{full_est.peak_cpu_gib:.1f} GiB, budget ~{budget:.0f} GiB")
+
+        # Non-blocking by design: warn via console + status bar, never stop the run.
+        if subsample_size is None and est.peak_cpu_gib > budget:
+            print(f"[RAM check] WARNING: likely OOM (~{est.peak_cpu_gib:.0f} GiB needed vs "
+                  f"~{budget:.0f} GiB safe). Enable Subsample to cap memory.")
+            self.status_label.setText(
+                f"RAM warning: ~{est.peak_cpu_gib:.0f} GiB expected, only ~{budget:.0f} GiB safe - "
+                f"consider enabling Subsample (continuing anyway)...")
+        elif subsample_size is not None and full_est.peak_cpu_gib <= budget:
+            print("[RAM check] Note: plain UMAP would fit in RAM; Subsample mode is slower "
+                  "(transform cost scales with rows x subset size). Uncheck it if you want speed.")
+
     def start_loading(self):
         """Start the data loading and computation process."""
         if self._is_worker_busy():
             self.status_label.setText("Please wait - a process is already running.")
             return
+        # Capture previous session's tag count BEFORE _release_session_data()
+        # clears the interner; used as a proxy for the RAM pre-flight estimate.
+        prev_n_tags = len(getattr(self.tag_interner, 'index_to_tag', [])) if self.tag_interner else None
         # Free the previous session's resources BEFORE starting the query so
         # old GPU buffers / node objects don't pile up on top of new data (OOM).
         self._release_session_data()
@@ -30,6 +91,8 @@ class DataPipelineMixin:
         self._set_cohort_action_buttons(False)
         self.progress_bar.setValue(0)
         self.status_label.setText("Starting...")
+        # Tag the operation for per-op auto-deorphan (Settings -> DBSCAN Optimizer).
+        self._last_op = "load"
         # Fresh full load produces new positions -> re-fit camera on next render
         self._camera_initialized = False
 
@@ -38,6 +101,9 @@ class DataPipelineMixin:
         # reflect it. Uses max_files as the size estimate (exact count is applied
         # again in on_loading_finished once known). No-op when disabled.
         self._smart_scale_apply_for_load(self.max_files_spin.value())
+
+        # Pre-flight RAM estimate (warns / offers Subsample before the heavy run)
+        self._preflight_ram_check(self.max_files_spin.value(), n_tags_override=prev_n_tags)
 
         # Create worker
         def worker_func():
@@ -69,10 +135,16 @@ class DataPipelineMixin:
 
         client_name = self.client_combo.currentText()
         # Chunk Size is a plain int attribute (edited in Settings -> Clients).
+        # Path-specific load tuning (benchmarks/benchmark_api_io.py). The legacy
+        # single self.chunk_size is the fallback for both paths.
         try:
-            chunk_size = int(getattr(self, 'chunk_size', 8192))
+            api_chunk_size = int(getattr(self, 'api_chunk_size', getattr(self, 'chunk_size', 8192)))
         except (TypeError, ValueError):
-            chunk_size = 8192
+            api_chunk_size = 8192
+        try:
+            direct_chunk_size = int(getattr(self, 'direct_chunk_size', getattr(self, 'chunk_size', 4096)))
+        except (TypeError, ValueError):
+            direct_chunk_size = 4096
         max_files = self.max_files_spin.value()
         tag_service = self.tag_service_combo.currentText()
         algorithm = self.algorithm_combo.currentText().lower()
@@ -92,7 +164,9 @@ class DataPipelineMixin:
         blacklist = [t.strip() for t in self.blacklist_edit.text().split(',') if t.strip()]
         drop_empty = getattr(self, 'drop_empty_files', False)
         query = self.query_edit.text().strip()
-        min_doc_freq = self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3
+        # Min Tag Frequency is unit-aware (n / %). The '%' threshold needs the final
+        # document count, which is only known after loading + filtering, so it is
+        # resolved right before Vectorizer construction below.
         drop_universal = getattr(self, 'drop_universal', True)
 
         # Connect to client
@@ -107,7 +181,14 @@ class DataPipelineMixin:
         # Load data
         self.worker.progress.emit(10, "Loading file data...")
         use_direct_db = self.use_direct_db
-        loader = DataLoader(client, chunk_size=chunk_size, client_name=client_name, use_direct_db=use_direct_db)
+        # Parallel loading (sweet spots from the benchmark): ~4 concurrent API
+        # requests (~1.8x), ~2 direct-DB connections (~1.7x). 1 = legacy sequential.
+        loader = DataLoader(
+            client, chunk_size=api_chunk_size, client_name=client_name, use_direct_db=use_direct_db,
+            api_chunk_size=api_chunk_size, direct_chunk_size=direct_chunk_size,
+            api_max_workers=int(getattr(self, 'api_load_threads', 4)),
+            direct_max_workers=int(getattr(self, 'direct_load_threads', 2)),
+        )
 
         def progress_callback(chunk, tags, total):
             pct = int(10 + 40 * total / max(len(loader.all_file_ids), 1))
@@ -215,6 +296,9 @@ class DataPipelineMixin:
         # Vectorize
         self.worker.progress.emit(50, "Vectorizing tags...")
         reverse_vocab = self.tag_interner.index_to_tag if self.tag_interner else None
+        min_doc_freq = (self._resolve_min_doc_freq(len(tag_data))
+                        if hasattr(self, '_resolve_min_doc_freq')
+                        else (self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3))
         vec = Vectorizer(min_doc_freq=min_doc_freq, tokenized=bool(self.tag_interner), reverse_vocab=reverse_vocab, drop_universal_tags=drop_universal)
         _t_vec = time.perf_counter()
         sparse_matrix, file_ids = vec.create_vectors(tag_data)
@@ -232,7 +316,9 @@ class DataPipelineMixin:
             low_memory=low_memory,
             metric=metric,
             n_jobs=n_jobs,
-            subsample_size=subsample_size
+            subsample_size=subsample_size,
+            chunked_transform=self.chunked_transform_checkbox.isChecked(),
+            pre_svd_components=self._pre_svd(self)
         )
         _t_red = time.perf_counter()
         positions = red.fit_transform(sparse_matrix)
@@ -287,10 +373,20 @@ class DataPipelineMixin:
         self.load_session_button.setEnabled(False)
         self.progress_bar.setValue(0)
         self.status_label.setText("Recomputing...")
+        # Recompute re-runs UMAP/PCA on the same files; tag it as "load" so the
+        # Load & Compute auto-deorphan checkbox covers both.
+        self._last_op = "load"
+        # Recompute leaves every node unclustered (noise) by design — skip the
+        # fresh auto-split cycle that would otherwise log "No cohorts to split".
+        self._auto_split_allowed = False
+
+        # Pre-flight RAM estimate with exact counts (tag_data + interner are known here)
+        n_tags_exact = len(getattr(self.tag_interner, 'index_to_tag', [])) if self.tag_interner else None
+        self._preflight_ram_check(len(self.tag_data), n_tags_override=n_tags_exact)
 
         def worker_func():
             return self._recompute()
-        
+
         self.worker = WorkerThread(worker_func)
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.on_loading_finished)
@@ -317,7 +413,10 @@ class DataPipelineMixin:
         eps = self.eps_spin.value() / 100.0
         min_samples = self.min_samples_spin.value()
         node_size = float(self.min_size_spin.value()) / 10.0
-        min_doc_freq = self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3
+        # Unit-aware Min Tag Frequency (n / %); tag_data is already loaded here.
+        min_doc_freq = (self._resolve_min_doc_freq(len(tag_data))
+                        if hasattr(self, '_resolve_min_doc_freq')
+                        else (self.min_doc_freq_spin.value() if hasattr(self, 'min_doc_freq_spin') else 3))
         drop_universal = getattr(self, 'drop_universal', True)
 
         if not tag_data:
@@ -343,7 +442,9 @@ class DataPipelineMixin:
             low_memory=low_memory,
             metric=metric,
             n_jobs=n_jobs,
-            subsample_size=subsample_size
+            subsample_size=subsample_size,
+            chunked_transform=self.chunked_transform_checkbox.isChecked(),
+            pre_svd_components=self._pre_svd(self)
         )
         _t_red = time.perf_counter()
         positions = red.fit_transform(sparse_matrix)
